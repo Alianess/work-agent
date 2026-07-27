@@ -65,6 +65,10 @@ export type AsrSettingsPayload = {
 };
 
 export type AgentSettingsPayload = {
+  nickname: string;
+  occupation: string;
+  details: string;
+  memory_enabled: boolean;
   work_background: string;
   company_document_format: string;
   message?: string;
@@ -72,14 +76,13 @@ export type AgentSettingsPayload = {
 
 export type CrossChatMemory = {
   id: string;
+  kind: "preference" | "identity" | "goal" | "project" | "fact";
   conversation_id: string;
   conversation_title: string;
   project_id: string;
   content: string;
-  source_summary: string;
-  summary_message_count: number;
-  conversation_updated_at: number;
-  state: "automatic" | "corrected";
+  source_excerpt: string;
+  state: "automatic" | "explicit" | "corrected";
   created_at: number;
   updated_at: number;
 };
@@ -88,7 +91,9 @@ export type CrossChatMemoriesPayload = {
   memories: CrossChatMemory[];
   count: number;
   automatic: boolean;
-  source: "conversation_summaries";
+  source: "automatic_memory";
+  enabled: boolean;
+  profile: { project_id: string; content: string; updated_at: number } | null;
   project_id: string | null;
 };
 

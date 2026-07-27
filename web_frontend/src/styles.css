@@ -1117,6 +1117,33 @@ a:focus-visible {
   padding: 8px 11px;
   font-size: 0.72rem;
 }
+
+.memory-profile {
+  margin: 14px 0;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  background: var(--color-shell);
+  padding: 14px;
+}
+
+.memory-profile header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memory-profile time {
+  color: var(--color-muted);
+  font-size: 0.75rem;
+}
+
+.memory-profile p {
+  margin: 8px 0 0;
+  color: var(--color-ink);
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
 .memory-structure-note strong { color: var(--color-ink); }
 .memory-structure-note > svg { width: 14px; height: 14px; color: var(--color-faint); }
 .memory-list { padding: 0 16px 6px; }

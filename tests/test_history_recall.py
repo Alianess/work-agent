@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from work_agent_core.cross_chat_memory import CrossChatMemoryStore
 from work_agent_core.history_recall import ChatHistoryRecall, extract_query_terms, register_history_recall_tool
 from work_agent_core.session_store import ConversationSession, SessionStore
 from work_agent_core.tools import ToolRegistry
@@ -185,14 +186,10 @@ class HistoryRecallTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["conversation_id"], "account-other")
 
     def test_cross_chat_summary_memory_is_returned_with_source_and_correction_state(self) -> None:
-        source = ConversationSession(
-            id="memory-source",
-            messages=[{"role": "user", "content": "预算讨论原文。"}],
-            summary="示例制造一期设备预算为 280 万元。",
-            summary_message_count=1,
-            metadata={"title": "预算讨论"},
+        CrossChatMemoryStore(self.store).upsert_many(
+            [{"kind": "fact", "content": "示例制造一期设备预算为 280 万元。"}],
+            conversation_id="memory-source", conversation_title="预算讨论", source_excerpt="预算讨论原文。",
         )
-        self.store.save(source)
         payload = json.loads(
             ChatHistoryRecall(self.store, self.session.id).search(
                 {"query": "示例制造 预算 280 万", "scope": "auto"}

@@ -75,13 +75,10 @@ class AuthStoreTests(unittest.TestCase):
                     "company_document_format": "标题：二号小标宋",
                 }
             )
-            first_sessions = web_server.get_session_store()
-            first_sessions.save(
-                ConversationSession(
-                    id="first-memory-chat",
-                    summary="仅属于第一个账户的自动记忆。",
-                    summary_message_count=1,
-                )
+            from work_agent_core.cross_chat_memory import CrossChatMemoryStore
+            CrossChatMemoryStore(web_server.get_session_store()).upsert_many(
+                [{"kind": "fact", "content": "仅属于第一个账户的自动记忆。"}],
+                conversation_id="first-memory-chat", conversation_title="first", source_excerpt="证据",
             )
             self.assertEqual(web_server.cross_chat_memories_payload()["count"], 1)
 

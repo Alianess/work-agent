@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from work_agent_core.cross_chat_memory import CrossChatMemoryStore
-from work_agent_core.session_store import ConversationSession, SessionStore
+from work_agent_core.session_store import SessionStore
 
 
 class CrossChatMemoryTests(unittest.TestCase):
@@ -19,98 +18,49 @@ class CrossChatMemoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def save_summary(
-        self,
-        conversation_id: str,
-        summary: str,
-        *,
-        project_id: str = "",
-        title: str = "来源聊天",
-    ) -> None:
-        self.session_store.save(
-            ConversationSession(
-                id=conversation_id,
-                messages=[{"role": "user", "content": "原始聊天内容"}],
-                summary=summary,
-                summary_message_count=1,
-                metadata={"project_id": project_id, "title": title},
-            )
-        )
+    def add(self, content: str, *, kind: str = "fact", project_id: str = "", state: str = "automatic"):
+        return self.memory_store.upsert_many(
+            [{"kind": kind, "content": content}], conversation_id="chat-one",
+            conversation_title="来源聊天", project_id=project_id, source_excerpt="原始聊天证据", state=state,
+        )[0]
 
-    def test_sync_creates_traceable_memories_from_summaries(self) -> None:
-        self.save_summary("chat-one", "已确认一期预算为 280 万元。", title="预算讨论")
-
-        memories = self.memory_store.list()
-
-        self.assertEqual(len(memories), 1)
-        self.assertEqual(memories[0]["conversation_id"], "chat-one")
-        self.assertEqual(memories[0]["conversation_title"], "预算讨论")
-        self.assertEqual(memories[0]["content"], "已确认一期预算为 280 万元。")
-        self.assertEqual(memories[0]["state"], "automatic")
-
-    def test_correction_survives_later_summary_sync(self) -> None:
-        self.save_summary("chat-one", "自动摘要第一版。")
-        memory = self.memory_store.list()[0]
-        corrected = self.memory_store.update(memory["id"], "用户纠正后的稳定表述。")
+    def test_records_are_source_backed_and_manageable(self) -> None:
+        memory = self.add("用户偏好中文且希望先给结论。", kind="preference")
+        self.assertEqual(memory["conversation_title"], "来源聊天")
+        self.assertEqual(memory["source_excerpt"], "原始聊天证据")
+        self.assertEqual(memory["kind"], "preference")
+        corrected = self.memory_store.update(memory["id"], "用户偏好中文，先给结论再展开。")
         self.assertEqual(corrected["state"], "corrected")
 
-        session = self.session_store.load("chat-one")
-        session.summary = "自动摘要第二版，增加了新进展。"
-        self.session_store.save(session)
-        refreshed = self.memory_store.list()[0]
-
-        self.assertEqual(refreshed["content"], "用户纠正后的稳定表述。")
-        self.assertEqual(refreshed["source_summary"], "自动摘要第二版，增加了新进展。")
+    def test_corrected_record_is_not_overwritten_by_automatic_refresh(self) -> None:
+        memory = self.add("用户偏好中文。", kind="preference")
+        self.memory_store.update(memory["id"], "用户偏好正式中文。")
+        refreshed = self.add("用户偏好中文。", kind="preference")
+        self.assertEqual(refreshed["content"], "用户偏好正式中文。")
         self.assertEqual(refreshed["state"], "corrected")
 
-    def test_deleted_memory_is_not_recreated_by_sync(self) -> None:
-        self.save_summary("chat-one", "稍后应被删除的摘要。")
-        memory = self.memory_store.list()[0]
+    def test_deleted_record_is_hidden(self) -> None:
+        memory = self.add("应删除的记忆。")
         self.memory_store.delete(memory["id"])
-
-        session = self.session_store.load("chat-one")
-        session.summary = "来源摘要后来又更新了。"
-        self.session_store.save(session)
-
         self.assertEqual(self.memory_store.list(), [])
-        deleted = self.memory_store.list(include_deleted=True)
-        self.assertEqual(deleted[0]["state"], "deleted")
+        self.assertEqual(self.memory_store.list(include_deleted=True)[0]["state"], "deleted")
 
     def test_project_and_account_scopes_are_isolated(self) -> None:
-        self.save_summary("account-chat", "普通聊天记忆。")
-        self.save_summary("project-a-chat", "项目 A 的记忆。", project_id="project-a")
-        self.save_summary("project-b-chat", "项目 B 的记忆。", project_id="project-b")
-
+        self.add("普通聊天记忆。")
+        self.add("项目 A 记忆。", project_id="project-a")
+        self.add("项目 B 记忆。", project_id="project-b")
         account = self.memory_store.active_for_scope(scope="account")
         project_a = self.memory_store.active_for_scope(scope="project", project_id="project-a")
+        self.assertEqual([item["content"] for item in account], ["普通聊天记忆。"])
+        self.assertEqual([item["content"] for item in project_a], ["项目 A 记忆。"])
 
-        self.assertEqual([item["conversation_id"] for item in account], ["account-chat"])
-        self.assertEqual([item["conversation_id"] for item in project_a], ["project-a-chat"])
-
-    def test_archive_only_summary_is_imported_with_source(self) -> None:
-        archive_path = self.session_store.session_dir.parent / "conversations.json"
-        archive_path.write_text(
-            json.dumps(
-                {
-                    "items": [
-                        {
-                            "id": "archive-chat",
-                            "title": "归档聊天",
-                            "projectId": "project-a",
-                            "contextSummary": "只存在于前端归档的摘要。",
-                            "contextSummaryMessageCount": 12,
-                        }
-                    ]
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-        memory = self.memory_store.list()[0]
-        self.assertEqual(memory["conversation_title"], "归档聊天")
-        self.assertEqual(memory["project_id"], "project-a")
-        self.assertEqual(memory["summary_message_count"], 12)
+    def test_relevant_retrieval_and_profile_are_separate(self) -> None:
+        self.add("用户在学习具身智能机器人。", kind="goal")
+        self.add("用户偏好正式中文。", kind="preference")
+        found = self.memory_store.relevant_for_scope(query="机器人学习", scope="account")
+        self.assertEqual(found[0]["kind"], "goal")
+        profile = self.memory_store.set_profile("## 学习\n用户正在学习具身智能。")
+        self.assertIn("具身智能", profile["content"])
 
 
 if __name__ == "__main__":

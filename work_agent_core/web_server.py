@@ -107,6 +107,10 @@ DEFAULT_ASR_SETTINGS: dict[str, Any] = {
     "hotwords": "",
 }
 DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
+    "nickname": "",
+    "occupation": "",
+    "details": "",
+    "memory_enabled": True,
     "work_background": "",
     "company_document_format": "",
 }
@@ -1387,6 +1391,12 @@ def load_agent_settings() -> dict[str, Any]:
         except json.JSONDecodeError:
             data = {}
     settings = {**DEFAULT_AGENT_SETTINGS, **data}
+    settings["nickname"] = normalize_multiline_text(str(settings.get("nickname") or ""))
+    settings["occupation"] = normalize_multiline_text(str(settings.get("occupation") or ""))
+    settings["details"] = normalize_multiline_text(
+        str(settings.get("details") or settings.get("work_background") or "")
+    )
+    settings["memory_enabled"] = bool(settings.get("memory_enabled", True))
     settings["work_background"] = normalize_multiline_text(str(settings.get("work_background") or ""))
     settings["company_document_format"] = normalize_multiline_text(
         str(settings.get("company_document_format") or "")
@@ -1439,6 +1449,10 @@ def agent_settings_payload(message: str | None = None) -> dict[str, Any]:
 def save_agent_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
     current = load_agent_settings()
     settings = {
+        "nickname": normalize_multiline_text(str(payload.get("nickname", current.get("nickname")) or "")),
+        "occupation": normalize_multiline_text(str(payload.get("occupation", current.get("occupation")) or "")),
+        "details": normalize_multiline_text(str(payload.get("details", current.get("details")) or "")),
+        "memory_enabled": bool(payload.get("memory_enabled", current.get("memory_enabled", True))),
         "work_background": normalize_multiline_text(
             str(payload.get("work_background", current.get("work_background")) or "")
         ),
@@ -1555,7 +1569,11 @@ def cross_chat_memories_payload(*, project_id: str | None = None, query: str = "
         "memories": memories,
         "count": len(memories),
         "automatic": True,
-        "source": "conversation_summaries",
+        "source": "automatic_memory",
+        "enabled": bool(load_agent_settings().get("memory_enabled", True)),
+        "profile": store.profile_for_scope(
+            scope="project" if project_id else "account", project_id=str(project_id or "")
+        ),
         "project_id": project_id,
     }
 
@@ -1680,18 +1698,20 @@ def tools_payload() -> dict[str, Any]:
 
 def agent_system_context() -> str:
     settings = load_agent_settings()
-    work_background = str(settings.get("work_background") or "").strip()
+    nickname = str(settings.get("nickname") or "").strip()
+    occupation = str(settings.get("occupation") or "").strip()
+    details = str(settings.get("details") or "").strip()
     company_document_format = str(settings.get("company_document_format") or "").strip()
-    if not work_background and not company_document_format:
+    if not nickname and not occupation and not details and not company_document_format:
         return ""
     blocks: list[str] = []
-    if work_background:
+    if nickname or occupation or details:
         blocks.append(
-            "用户长期工作背景/常用系统提示词：\n"
-            f"{work_background}\n\n"
-            "使用规则：该背景用于默认工作语境、称谓口径、专名纠错和文档写作风格；"
-            "它不是某一场会议已经发生或对方已经确认的事实。"
-            "生成正式材料时，仍必须以用户确认信息、会议转写和附件材料为依据。"
+            "用户主动填写的个性化资料（优先级高于自动记忆）：\n"
+            f"- 称呼：{nickname or '未设置'}\n"
+            f"- 职业：{occupation or '未设置'}\n"
+            f"- 详情：{details or '未设置'}\n\n"
+            "这是用户自己维护的长期偏好与背景，不等同于某次聊天或会议的事实。"
         )
     if company_document_format:
         blocks.append(
@@ -1704,6 +1724,81 @@ def agent_system_context() -> str:
             "不得为套格式虚构红头、文号、签发人、印章、密级或日期。"
         )
     return "\n\n".join(blocks)
+
+
+def memory_context_for_reply(*, query: str, project_id: str = "") -> str:
+    """Retrieve a small, relevant memory slice before each model call."""
+    if not load_agent_settings().get("memory_enabled", True):
+        return ""
+    store = CrossChatMemoryStore(get_session_store())
+    scope = "project" if project_id else "account"
+    profile = store.profile_for_scope(scope=scope, project_id=project_id)
+    items = store.relevant_for_scope(query=query, scope=scope, project_id=project_id, limit=6)
+    if not profile and not items:
+        return ""
+    blocks = ["自动记忆（由历史聊天提炼，仅在与当前问题相关时参考；不确定或冲突时先核验原文）："]
+    if profile:
+        blocks.append(f"记忆摘要：\n{profile['content']}")
+    if items:
+        blocks.append("相关记忆：\n" + "\n".join(f"- [{item['kind']}] {item['content']}" for item in items))
+    return "\n\n".join(blocks) + "\n"
+
+
+def schedule_memory_refresh(
+    *, client: OpenAICompatibleClient, profile: ModelProfile, session: SessionStore | Any,
+    conversation_id: str, conversation_title: str, project_id: str = "",
+) -> None:
+    """Refresh automatic memory after a reply without delaying that reply."""
+    if not load_agent_settings().get("memory_enabled", True):
+        return
+    messages = list(getattr(session, "messages", []) or [])
+    user_messages = [item for item in messages if isinstance(item, dict) and item.get("role") == "user"]
+    last_count = int(getattr(session, "metadata", {}).get("memory_extracted_user_count", 0) or 0)
+    if len(user_messages) < 3 or len(user_messages) <= last_count:
+        return
+    session.metadata["memory_extracted_user_count"] = len(user_messages)
+    get_session_store().save(session)
+    transcript = serialize_runtime_messages_for_context(messages[-24:])[:24_000]
+
+    def refresh() -> None:
+        try:
+            response = client.chat(
+                [
+                    {"role": "system", "content": (
+                        "从聊天中提炼未来跨聊天确实有帮助的信息。只保留稳定偏好、身份背景、"
+                        "持续目标、已确认项目事实；不要保存一次性闲聊、敏感推断、未经确认的时间状态。"
+                        "返回严格 JSON：{\"memories\":[{\"kind\":\"preference|identity|goal|project|fact\",\"content\":\"...\"}],\"profile\":\"简短分主题摘要\"}。"
+                    )},
+                    {"role": "user", "content": transcript},
+                ], profile=profile, max_tokens=1_200,
+            )
+            parsed = parse_memory_refresh_json(response.content)
+            memory_store = CrossChatMemoryStore(get_session_store())
+            memory_store.upsert_many(
+                parsed.get("memories", []), conversation_id=conversation_id,
+                conversation_title=conversation_title or conversation_id, project_id=project_id,
+                source_excerpt=transcript, state="automatic",
+            )
+            profile_text = str(parsed.get("profile") or "")
+            if profile_text:
+                memory_store.set_profile(profile_text, project_id=project_id)
+        except Exception:
+            # Automatic memory is best-effort and must never break a chat.
+            return
+
+    threading.Thread(target=refresh, name=f"memory-refresh-{conversation_id[:12]}", daemon=True).start()
+
+
+def parse_memory_refresh_json(raw: str) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 
@@ -3345,6 +3440,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         max_steps=max_steps,
         debug_trace=debug_trace,
         extra_system_context=agent_system_context()
+        + memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
         + project_context
         + render_history_recall_system_context(session.summary_message_count, project_id=project_id)
         + build_chat_session_system_context(
@@ -3370,6 +3466,10 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if session.messages and session.messages[-1].get("role") == "assistant":
             session.messages[-1]["content"] = final_content
     store.save(session)
+    schedule_memory_refresh(
+        client=client, profile=profile, session=session, conversation_id=conversation_id,
+        conversation_title=str(session.metadata.get("title") or ""), project_id=project_id,
+    )
     debug_trace.emit(
         "http_chat_final",
         steps_used=result.steps_used,
@@ -3567,6 +3667,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         cancel_check=turn_runtime.cancelled,
         reasoning_effort=reasoning_effort,
         extra_system_context=agent_system_context()
+        + memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
         + project_context
         + render_history_recall_system_context(session.summary_message_count, project_id=project_id)
         + build_chat_session_system_context(
@@ -3614,6 +3715,10 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 session.summary = prepared_context.summary
                 session.summary_message_count = prepared_context.summary_message_count
                 store.save(session)
+                schedule_memory_refresh(
+                    client=client, profile=profile, session=session, conversation_id=conversation_id,
+                    conversation_title=str(session.metadata.get("title") or ""), project_id=project_id,
+                )
                 session_saved_after_run = True
                 debug_trace.emit(
                     "http_chat_stream_final",

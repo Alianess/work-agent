@@ -365,6 +365,7 @@ export default function App() {
   const [agentSettings, setAgentSettings] = useState<AgentSettingsPayload | null>(null);
   const [meetingMinutesSettings, setMeetingMinutesSettings] = useState<MeetingMinutesSettingsPayload | null>(null);
   const [crossChatMemories, setCrossChatMemories] = useState<CrossChatMemory[]>([]);
+  const [memoryProfile, setMemoryProfile] = useState<{ content: string; updated_at: number } | null>(null);
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryScope, setMemoryScope] = useState<"all" | "account" | "projects">("all");
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
@@ -542,6 +543,10 @@ export default function App() {
     hotwords: ""
   });
   const [agentSettingsForm, setAgentSettingsForm] = useState({
+    nickname: "",
+    occupation: "",
+    details: "",
+    memory_enabled: true,
     work_background: "",
     company_document_format: ""
   });
@@ -997,6 +1002,10 @@ export default function App() {
       });
       setAgentSettings(nextAgentSettings);
       setAgentSettingsForm({
+        nickname: nextAgentSettings.nickname,
+        occupation: nextAgentSettings.occupation,
+        details: nextAgentSettings.details,
+        memory_enabled: nextAgentSettings.memory_enabled,
         work_background: nextAgentSettings.work_background,
         company_document_format: nextAgentSettings.company_document_format
       });
@@ -1006,6 +1015,7 @@ export default function App() {
         custom_instructions: nextMeetingMinutesSettings.custom_instructions
       });
       setCrossChatMemories(nextMemories.memories);
+      setMemoryProfile(nextMemories.profile ? { content: nextMemories.profile.content, updated_at: nextMemories.profile.updated_at } : null);
       setTools(nextTools);
       setSkills(nextSkills.skills);
       setFiles(nextFiles.files);
@@ -3446,6 +3456,10 @@ export default function App() {
       const payload = await api.saveAgentSettings(agentSettingsForm);
       setAgentSettings(payload);
       setAgentSettingsForm({
+        nickname: payload.nickname,
+        occupation: payload.occupation,
+        details: payload.details,
+        memory_enabled: payload.memory_enabled,
         work_background: payload.work_background,
         company_document_format: payload.company_document_format
       });
@@ -3461,7 +3475,8 @@ export default function App() {
     try {
       const payload = await api.memories();
       setCrossChatMemories(payload.memories);
-      setStatus({ tone: "success", text: `已同步 ${payload.count} 条跨聊天记忆` });
+      setMemoryProfile(payload.profile ? { content: payload.profile.content, updated_at: payload.profile.updated_at } : null);
+      setStatus({ tone: "success", text: `已载入 ${payload.count} 条自动记忆` });
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
     }
@@ -5878,24 +5893,28 @@ export default function App() {
     return (
       <div className="stack settings-page">
         <form className="panel settings-work-background" onSubmit={saveAgentSettings}>
-          <PanelHeader icon={<MessageCircle aria-hidden="true" />} title="工作背景与文件格式" />
+          <PanelHeader icon={<MessageCircle aria-hidden="true" />} title="关于你" />
           <p className="muted">
-            只保存已经确认、长期稳定的单位背景、岗位职责和写作要求。它会作为系统规则用于普通对话、工具调用和会议纪要；
-            临时项目进展和某次讨论不需要写在这里。
+            这是你主动填写的个性化资料，独立于系统自动生成的记忆。只写希望长期生效的称呼、身份与偏好。
           </p>
-          <Field label="稳定事实 / 默认口径" htmlFor="agent-work-background">
+          <div className="form-grid">
+            <Field label="昵称" htmlFor="agent-nickname">
+              <input id="agent-nickname" value={agentSettingsForm.nickname} onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, nickname: event.target.value })} placeholder="希望智能体如何称呼你？" />
+            </Field>
+            <Field label="职业" htmlFor="agent-occupation">
+              <input id="agent-occupation" value={agentSettingsForm.occupation} onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, occupation: event.target.value })} placeholder="例如：机器人产业研究员" />
+            </Field>
+          </div>
+          <Field label="你的详情" htmlFor="agent-details">
             <textarea
-              id="agent-work-background"
-              name="agent-work-background"
+              id="agent-details"
               rows={8}
-              value={agentSettingsForm.work_background}
-              onChange={(event) =>
-                setAgentSettingsForm({ ...agentSettingsForm, work_background: event.target.value })
-              }
-              placeholder="例如：我方单位、岗位职责、常用称谓、正式材料写作口径、常见业务方向等。"
+              value={agentSettingsForm.details}
+              onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, details: event.target.value })}
+              placeholder="需要长期记住的兴趣、价值观、偏好或固定表达要求。临时项目进展不要写在这里。"
             />
           </Field>
-          <Field label="公司标准文件格式" htmlFor="company-document-format">
+          <Field label="文档排版偏好" htmlFor="company-document-format">
             <textarea
               id="company-document-format"
               name="company-document-format"
@@ -5911,7 +5930,7 @@ export default function App() {
             />
           </Field>
           <p className="muted">
-            只写纯文字排版规则。普通正式材料由 Word 技能直接采用；请示、报告、通知、函、纪要等公文会先经过公文技能判断。
+            只写纯文字排版规则。它是文档偏好，不会被系统当作你的自动记忆。
           </p>
           <div className="form-actions">
             <button type="submit" className="primary-button" disabled={busy}>
@@ -5929,12 +5948,17 @@ export default function App() {
             <div className="panel-header">
               <span className="panel-icon"><Brain aria-hidden="true" /></span>
               <div>
-                <h3 id="cross-chat-memory-title">跨聊天记忆</h3>
-                <p>自动从历史聊天摘要中同步；不额外调用模型。</p>
+                <h3 id="cross-chat-memory-title">记忆</h3>
+                <p>系统从聊天中提炼长期信息，并在回答前按相关性取回；聊天原文仍可用于核验。</p>
               </div>
             </div>
             <div className="memory-manager-status">
-              <span><CheckCircle2 aria-hidden="true" />自动同步已开启</span>
+              <label className="skill-switch">
+                <input type="checkbox" checked={agentSettingsForm.memory_enabled} onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, memory_enabled: event.target.checked })} />
+                <span aria-hidden="true" />
+                <b>{agentSettingsForm.memory_enabled ? "启用记忆" : "关闭记忆"}</b>
+              </label>
+              <button type="button" className="text-button" onClick={() => void saveAgentSettings({ preventDefault() {} } as FormEvent<HTMLFormElement>)} disabled={busy}>保存开关</button>
               <button type="button" className="text-button" onClick={() => void refreshCrossChatMemories()} disabled={busy}>
                 <RefreshCw aria-hidden="true" />重新同步
               </button>
@@ -5972,12 +5996,21 @@ export default function App() {
           </div>
 
           <div className="memory-structure-note">
-            <span><strong>工作背景</strong> 保存稳定事实</span>
+            <span><strong>关于你</strong> 由你主动填写</span>
             <ChevronRight aria-hidden="true" />
-            <span><strong>跨聊天记忆</strong> 回想历史进展</span>
+            <span><strong>自动记忆</strong> 从聊天提炼</span>
             <ChevronRight aria-hidden="true" />
-            <span><strong>项目聊天</strong> 仅检索同项目聊天与资料</span>
+            <span><strong>原文回想</strong> 用于核验细节</span>
           </div>
+
+          {agentSettingsForm.memory_enabled ? null : <p className="muted">关闭后不会生成、更新或在回答中参考自动记忆；现有记忆不会被删除。</p>}
+          {crossChatMemories.length > 0 ? null : <p className="muted">记忆会在聊天达到一定信息量后后台整理；不会把每句闲聊都保存下来。</p>}
+          {memoryProfile ? (
+            <article className="memory-profile" aria-label="自动记忆摘要">
+              <header><strong>记忆摘要</strong><time>{formatProjectDate(memoryProfile.updated_at)}</time></header>
+              <p>{memoryProfile.content}</p>
+            </article>
+          ) : null}
 
           {filteredCrossChatMemories.length > 0 ? (
             <div className="memory-list" role="list">
@@ -5993,7 +6026,7 @@ export default function App() {
                         {memory.state === "corrected" ? <span className="memory-corrected-badge">已纠正</span> : null}
                         {projectName ? <span className="memory-project-badge">{projectName}</span> : null}
                       </div>
-                      <time>{formatProjectDate(memory.conversation_updated_at)}</time>
+                      <time>{formatProjectDate(memory.updated_at)}</time>
                     </header>
                     {editing ? (
                       <div className="memory-editor">
