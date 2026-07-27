@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="$WORKSPACE_ROOT/.venv/bin/python"
 BUNDLED_RUNTIME_ROOT="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies"
-WORK_AGENT_HOST="${WORK_AGENT_HOST:-0.0.0.0}"
+WORK_AGENT_HOST="${WORK_AGENT_HOST:-127.0.0.1}"
 
 # launchd supplies only /usr/bin:/bin:/usr/sbin:/sbin. Keep the service
 # deterministic while exposing already-installed Homebrew and bundled tools.
