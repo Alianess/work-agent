@@ -6003,8 +6003,8 @@ export default function App() {
             <span><strong>原文回想</strong> 用于核验细节</span>
           </div>
 
-          {agentSettingsForm.memory_enabled ? null : <p className="muted">关闭后不会生成、更新或在回答中参考自动记忆；现有记忆不会被删除。</p>}
-          {crossChatMemories.length > 0 ? null : <p className="muted">记忆会在聊天达到一定信息量后后台整理；不会把每句闲聊都保存下来。</p>}
+          {agentSettingsForm.memory_enabled ? null : <p className="memory-notice">关闭后不会生成、更新或在回答中参考自动记忆；现有记忆不会被删除。</p>}
+          {crossChatMemories.length > 0 ? null : <p className="memory-notice">记忆会在聊天达到一定信息量后后台整理；不会把每句闲聊都保存下来。</p>}
           {memoryProfile ? (
             <article className="memory-profile" aria-label="自动记忆摘要">
               <header><strong>记忆摘要</strong><time>{formatProjectDate(memoryProfile.updated_at)}</time></header>
