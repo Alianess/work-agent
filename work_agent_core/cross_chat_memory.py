@@ -83,6 +83,8 @@ class CrossChatMemoryStore:
             row = connection.execute(
                 "SELECT * FROM memory_profiles WHERE project_id = ?", (selected_project,)
             ).fetchone()
+        if row and str(row["content"] or "").startswith("历史聊天摘要（导入，建议后续核验）："):
+            return None
         return profile_payload(row) if row else None
 
     def active_for_scope(self, *, scope: str, project_id: str = "") -> list[dict[str, Any]]:
@@ -203,24 +205,12 @@ class CrossChatMemoryStore:
                 );
                 """
             )
-            # Preserve the old one-summary-per-chat store as a derived profile
-            # during upgrade.  It is intentionally not promoted to a fact.
-            legacy_table = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cross_chat_memories'"
-            ).fetchone()
-            profile_exists = connection.execute(
-                "SELECT 1 FROM memory_profiles WHERE project_id = ''"
-            ).fetchone()
-            if legacy_table and not profile_exists:
-                legacy_rows = connection.execute(
-                    "SELECT content FROM cross_chat_memories WHERE state <> 'deleted' ORDER BY updated_at DESC LIMIT 8"
-                ).fetchall()
-                imported = "\n\n".join(str(row["content"] or "").strip() for row in legacy_rows if str(row["content"] or "").strip())
-                if imported:
-                    connection.execute(
-                        "INSERT INTO memory_profiles(project_id, content, updated_at) VALUES ('', ?, ?)",
-                        (f"历史聊天摘要（导入，建议后续核验）：\n{normalize_profile(imported)}", int(time.time())),
-                    )
+            # Earlier releases stored one long session summary per chat. Those
+            # raw records remain available through chat-history recall, but are
+            # intentionally never exposed or injected as the new memory profile.
+            connection.execute(
+                "DELETE FROM memory_profiles WHERE content LIKE '历史聊天摘要（导入，建议后续核验）：%'"
+            )
             connection.execute(f"PRAGMA user_version = {MEMORY_SCHEMA_VERSION}")
 
 

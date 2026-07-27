@@ -6072,8 +6072,8 @@ export default function App() {
           ) : (
             <div className="memory-empty-state">
               <Brain aria-hidden="true" />
-              <strong>{crossChatMemories.length > 0 ? "没有匹配的记忆" : "还没有跨聊天记忆"}</strong>
-              <p>{crossChatMemories.length > 0 ? "换一个关键词或记忆范围试试。" : "聊天变长并生成摘要后，会自动在这里出现，并保留来源聊天。"}</p>
+              <strong>{crossChatMemories.length > 0 ? "没有匹配的记忆" : "还没有自动记忆"}</strong>
+              <p>{crossChatMemories.length > 0 ? "换一个关键词或记忆范围试试。" : "系统会在后续对话中提炼有长期价值的信息；聊天原文仍可随时回想和核验。"}</p>
             </div>
           )}
         </section>
