@@ -2297,9 +2297,24 @@ textarea:disabled {
 .skill-detail-panel {
   display: grid;
   gap: 12px;
-  margin-top: 14px;
-  border-top: 1px solid var(--color-line);
-  padding-top: 16px;
+  width: min(860px, calc(100vw - 40px));
+  max-height: min(780px, calc(100vh - 72px));
+  overflow: auto;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  padding: 20px;
+  box-shadow: 0 8px 28px oklch(0.205 0.018 250 / 0.22);
+}
+
+.skill-instructions-backdrop {
+  position: fixed;
+  z-index: 50;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: oklch(0.205 0.018 250 / 0.28);
 }
 
 .skill-detail-head {

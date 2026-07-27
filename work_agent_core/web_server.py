@@ -1999,9 +1999,9 @@ def load_conversations_payload() -> dict[str, Any]:
         return {"items": []}
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, dict) and isinstance(data.get("items"), list):
-        return {"items": sanitize_conversation_archive_items(data["items"])}
+        return {"items": hydrate_conversation_archive_projects(data["items"])}
     if isinstance(data, list):
-        return {"items": sanitize_conversation_archive_items(data)}
+        return {"items": hydrate_conversation_archive_projects(data)}
     return {"items": []}
 
 
@@ -2295,6 +2295,34 @@ def files_have_same_content(left: Path, right: Path) -> bool:
 
 def sanitize_conversation_archive_items(items: list[Any]) -> list[Any]:
     return [sanitize_conversation_archive_item(item) for item in items]
+
+
+def hydrate_conversation_archive_projects(items: list[Any]) -> list[Any]:
+    """Restore a missing display-level project id from the durable session metadata.
+
+    The session metadata is the source of truth used for project-scoped agent
+    context.  Older browser archives can be missing ``projectId`` after an
+    interrupted first-turn title save; returning a hydrated copy makes those
+    chats visible again without touching their message content.
+    """
+    hydrated = sanitize_conversation_archive_items(items)
+    session_dir = user_conversation_dir() / "sessions"
+    for item in hydrated:
+        if not isinstance(item, dict) or str(item.get("projectId") or "").strip():
+            continue
+        conversation_id = sanitize_conversation_id(str(item.get("id") or ""))
+        if not conversation_id:
+            continue
+        session_path = session_dir / f"{conversation_id}.json"
+        try:
+            session_data = json.loads(session_path.read_text(encoding="utf-8"))
+            metadata = session_data.get("metadata") if isinstance(session_data, dict) else None
+            project_id = str(metadata.get("project_id") or "").strip() if isinstance(metadata, dict) else ""
+            if PROJECT_ID_PATTERN.fullmatch(project_id):
+                item["projectId"] = project_id
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return hydrated
 
 
 def sanitize_conversation_archive_item(item: Any) -> Any:
@@ -3971,9 +3999,16 @@ def generate_chat_title_payload(payload: dict[str, Any]) -> dict[str, str]:
         ),
         "",
     )
-    title = request_conversation_title(client, profile, first_user, first_assistant)
+    try:
+        title = request_conversation_title(client, profile, first_user, first_assistant)
+    except Exception:
+        title = ""
     if not is_valid_generated_title(title, first_user):
-        title = PENDING_CONVERSATION_TITLE
+        # A naming request should never leave a completed chat permanently
+        # untitled just because the model produced an invalid short response.
+        # Keep the model-generated title when valid, otherwise use the same
+        # deterministic fallback already used for legacy/history flows.
+        title = fallback_conversation_title_from_messages(messages)
     return {"title": title or PENDING_CONVERSATION_TITLE, "model_profile": profile.name}
 
 

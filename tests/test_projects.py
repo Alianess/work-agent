@@ -75,6 +75,33 @@ class ProjectPayloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "项目不存在"):
             web_server.resolve_project_chat_context("project-aaaaaaaaaaaa", [])
 
+    def test_conversation_payload_restores_project_id_from_session_metadata(self) -> None:
+        project = web_server.create_project_payload({"name": "本轮科技"})["project"]
+        conversation_id = "local-project-restore"
+        conversation_dir = self.workspace / "conversation_history"
+        session_path = conversation_dir / "sessions" / f"{conversation_id}.json"
+        session_path.parent.mkdir(parents=True)
+        session_path.write_text(
+            json.dumps({"id": conversation_id, "metadata": {"project_id": project["id"]}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        history_path = conversation_dir / "conversations.json"
+        history_path.write_text(
+            json.dumps(
+                {"items": [{"id": conversation_id, "title": "项目进展", "group": "最近", "messages": []}]},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(web_server, "user_conversation_dir", return_value=conversation_dir),
+            patch.object(web_server, "user_conversation_history_path", return_value=history_path),
+        ):
+            payload = web_server.load_conversations_payload()
+
+        self.assertEqual(payload["items"][0]["projectId"], project["id"])
+
     def test_meeting_minutes_sync_is_idempotent_and_refreshes_changed_files(self) -> None:
         project = web_server.create_project_payload({"name": "会议成果项目"})["project"]
         archive_dir = self.workspace / "meet_files" / "会议项目" / "项目启动会"

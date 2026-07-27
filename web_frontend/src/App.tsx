@@ -376,6 +376,7 @@ export default function App() {
   const [skillInstructions, setSkillInstructions] = useState<SkillInstructionsPayload | null>(null);
   const [skillInstructionsDraft, setSkillInstructionsDraft] = useState("");
   const [skillInstructionsLoading, setSkillInstructionsLoading] = useState(false);
+  const [skillInstructionsOpen, setSkillInstructionsOpen] = useState(false);
   const [workspace, setWorkspace] = useState("");
   const [files, setFiles] = useState<FileItem[]>([]);
   const [temporarySync, setTemporarySync] = useState<TemporarySyncPayload | null>(null);
@@ -1046,6 +1047,7 @@ export default function App() {
   }
 
   async function openSkillInstructions(skill: SkillInfo) {
+    setSkillInstructionsOpen(true);
     setSkillInstructionsLoading(true);
     setSkillInstructions(null);
     try {
@@ -2737,6 +2739,7 @@ export default function App() {
       if (shouldNameConversation) {
         saveNamedConversation({
           id: conversationId,
+          projectId,
           messages: completedMessages,
           activities: finalActivityRecords,
           activeActivityIndex: assistantIndex,
@@ -3134,6 +3137,7 @@ export default function App() {
 
   function saveNamedConversation({
     id,
+    projectId,
     messages,
     activities,
     activeActivityIndex,
@@ -3141,6 +3145,7 @@ export default function App() {
     contextSummaryMessageCount
   }: {
     id: string;
+    projectId?: string;
     messages: ChatMessage[];
     activities: ActivityRecordMap;
     activeActivityIndex: number;
@@ -3156,7 +3161,11 @@ export default function App() {
         contextSummary,
         contextSummaryMessageCount,
         activities,
-        activeActivityIndex
+        activeActivityIndex,
+        // The first completed turn is saved through this branch.  Preserve the
+        // project association so the chat remains visible in its project and
+        // continues to render the project badge in the recent-chat list.
+        projectId: items.find((item) => item.id === id)?.projectId ?? projectId
       });
       conversationHistoryRef.current = next;
       return next;
@@ -5521,38 +5530,48 @@ export default function App() {
               </article>
             ))}
           </div>
-          {skillInstructionsLoading ? <p className="muted skill-detail-loading">正在读取技能说明…</p> : null}
-          {skillInstructions ? (
-            <section className="skill-detail-panel" aria-label={`${skillInstructions.skill_id} 技能说明`}>
-              <div className="skill-detail-head">
-                <div>
-                  <h3>{skills.find((item) => item.id === skillInstructions.skill_id)?.label || skillInstructions.skill_id}</h3>
-                  <p>路径：<code translate="no">{skillInstructions.path}</code></p>
-                </div>
-                <button type="button" className="text-button" onClick={() => setSkillInstructions(null)}>
-                  <X aria-hidden="true" />收起
-                </button>
-              </div>
-              {skillInstructions.editable ? (
-                <>
-                  <textarea
-                    className="skill-instructions-editor"
-                    value={skillInstructionsDraft}
-                    spellCheck={false}
-                    aria-label="技能 Markdown 说明"
-                    onChange={(event) => setSkillInstructionsDraft(event.target.value)}
-                  />
-                  <div className="form-actions">
-                    <span className="muted">保存后，新一轮调用会读取此规则；业务偏好请放到对应的专用设置中。</span>
-                    <button type="button" className="primary-button" disabled={busy} onClick={() => void saveSkillInstructions()}>
-                      <Check aria-hidden="true" />保存 SKILL.md
-                    </button>
+          {skillInstructionsOpen ? (
+            <div
+              className="skill-instructions-backdrop"
+              role="presentation"
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) setSkillInstructionsOpen(false);
+              }}
+            >
+              <section className="skill-detail-panel" role="dialog" aria-modal="true" aria-label="技能说明">
+                <div className="skill-detail-head">
+                  <div>
+                    <h3>{skillInstructions ? skills.find((item) => item.id === skillInstructions.skill_id)?.label || skillInstructions.skill_id : "正在读取技能说明"}</h3>
+                    {skillInstructions ? <p>路径：<code translate="no">{skillInstructions.path}</code></p> : null}
                   </div>
-                </>
-              ) : (
-                <pre className="skill-instructions-preview">{skillInstructions.content}</pre>
-              )}
-            </section>
+                  <button type="button" className="text-button" onClick={() => setSkillInstructionsOpen(false)}>
+                    <X aria-hidden="true" />关闭
+                  </button>
+                </div>
+                {skillInstructionsLoading ? <p className="muted skill-detail-loading">正在读取技能说明…</p> : null}
+                {skillInstructions ? (
+                  skillInstructions.editable ? (
+                    <>
+                      <textarea
+                        className="skill-instructions-editor"
+                        value={skillInstructionsDraft}
+                        spellCheck={false}
+                        aria-label="技能 Markdown 说明"
+                        onChange={(event) => setSkillInstructionsDraft(event.target.value)}
+                      />
+                      <div className="form-actions">
+                        <span className="muted">保存后，新一轮调用会读取此规则；业务偏好请放到对应的专用设置中。</span>
+                        <button type="button" className="primary-button" disabled={busy} onClick={() => void saveSkillInstructions()}>
+                          <Check aria-hidden="true" />保存 SKILL.md
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <pre className="skill-instructions-preview">{skillInstructions.content}</pre>
+                  )
+                ) : null}
+              </section>
+            </div>
           ) : null}
         </section>
       </div>
@@ -7653,7 +7672,17 @@ function mergeConversationHistories(
     byId.set(item.id, sanitizeConversationHistoryItem(item));
   }
   for (const item of localItems) {
-    byId.set(item.id, sanitizeConversationHistoryItem(item));
+    const local = sanitizeConversationHistoryItem(item);
+    const archived = byId.get(local.id);
+    // Browser state is normally newer, but older browser archives could be
+    // missing projectId after the first-turn title save.  Merge that durable
+    // server-side association back instead of hiding the chat from its project.
+    byId.set(
+      local.id,
+      archived && !local.projectId && archived.projectId
+        ? { ...local, projectId: archived.projectId }
+        : local
+    );
   }
   return orderConversationHistory(Array.from(byId.values()));
 }
