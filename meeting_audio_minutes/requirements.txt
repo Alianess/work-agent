@@ -1,0 +1,9 @@
+# Best-quality local meeting ASR chain:
+# - Qwen3-ASR MLX 8bit for transcription on Apple Silicon
+# - funasr package is used only to run the tiny FSMN VAD model for speech boundaries
+transformers>=5.0.0
+torch>=2.12.1
+torchaudio>=2.11.0
+funasr==1.3.14
+modelscope==1.38.1
+mlx-audio==0.4.4

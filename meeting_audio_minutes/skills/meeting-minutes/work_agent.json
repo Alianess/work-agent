@@ -1,0 +1,17 @@
+{
+  "id": "meeting-minutes",
+  "label": "会议纪要",
+  "mention": "@会议纪要",
+  "description": "接收会议录音、转写文本和补充材料，使用项目本地ASR环境生成转写与内部留档版，并按会议类型提炼决策、资源、责任主体和近期动作；正式公文判断交给公文技能，所有 Word 生成和编辑交给完整 Word 技能。",
+  "when_to_use": "处理会议录音、ASR转写、断点续跑、旁听记录、项目推进会、方案讨论会和正式会议纪要。",
+  "tool_name": "transcribe_meeting_audio",
+  "dependencies": {
+    "binaries": [
+      "ffmpeg"
+    ],
+    "paths": [
+      ".venv/bin/python",
+      "meeting_audio_minutes/model_cache/mlx-community/Qwen3-ASR-1.7B-8bit"
+    ]
+  }
+}

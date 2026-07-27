@@ -1,0 +1,135 @@
+version: 1
+description: "Schema contract for config/sources.yml. This is documentation-first, not a strict JSON Schema."
+
+required_top_level:
+  - version
+  - updated_at
+  - project
+  - domain
+  - access_modes
+  - source_tiers
+  - sources
+  - core_indicator_groups
+  - rules
+
+source_required_fields:
+  - id
+  - name
+  - tier
+  - access_mode
+  - priority
+  - status
+  - entry_urls
+  - retrieval_methods
+  - update_frequency
+  - evidence_policy
+
+source_field_definitions:
+  id:
+    type: string
+    rule: "Stable snake_case identifier. Never reuse for a different source."
+  name:
+    type: string
+    rule: "Human-readable source name."
+  owner:
+    type: string
+    rule: "Organization or platform owner when known."
+  tier:
+    type: enum
+    allowed:
+      - fact_base
+      - data_base
+      - interpretation
+      - signal
+  access_mode:
+    type: enum
+    allowed:
+      - public_crawl
+      - authorized_import
+      - manual_upload
+      - signal_only
+  priority:
+    type: enum
+    allowed:
+      - must_have
+      - high
+      - high_if_budget
+      - medium
+      - low
+  status:
+    type: enum_or_string
+    examples:
+      - ready
+      - candidate_purchase
+      - recommended_purchase
+      - choose_one
+      - partial_public
+      - discovery_only
+  entry_urls:
+    type: list[string]
+    rule: "Official entry URLs only. Do not put random search-result URLs here."
+  retrieval_methods:
+    type: list[object]
+    item_fields:
+      type:
+        allowed:
+          - public_crawl
+          - public_search
+          - api
+          - api_or_search
+          - authorized_export
+          - api_or_terminal_export
+          - source_trace
+          - manual_upload
+          - search_or_manual
+      description:
+        type: string
+      query_templates:
+        type: list[string]
+        optional: true
+  update_frequency:
+    type: enum_or_string
+    examples:
+      - daily
+      - weekly
+      - monthly_or_annual
+      - quarterly_or_annual
+      - annual
+      - irregular
+  coverage:
+    type: object
+    optional: true
+    fields:
+      geographies: list[string]
+      topics: list[string]
+  evidence_policy:
+    type: object
+    required_fields:
+      - use_as_key_metric
+    optional_fields:
+      - require_url
+      - require_doc_title
+      - require_doc_number
+      - require_page_or_table
+      - require_published_at
+      - require_scope_definition
+      - require_source_trace
+      - require_cross_check
+      - require_original_filing
+      - notes
+
+core_indicator_group_required_fields:
+  - id
+  - name
+  - preferred_sources
+  - required_fields
+
+rules_contract:
+  critical_metric_requires:
+    description: "Fields that must exist before any numeric claim can appear in a report."
+  never_use_as_sole_source:
+    description: "Sources that must not support a critical conclusion alone."
+  daily_monitor_sources:
+    description: "Sources included in the daily news/intelligence monitor."
+  first_purchase_candidates:
+    description: "Procurement shortlist, in priority order."

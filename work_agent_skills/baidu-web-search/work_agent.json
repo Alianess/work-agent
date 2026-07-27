@@ -1,0 +1,15 @@
+{
+  "id": "baidu-web-search",
+  "label": "百度搜索",
+  "mention": "@百度搜索",
+  "description": "通过百度千帆 AI Search 优先检索百度索引与中国大陆中文互联网来源，返回结构化标题、链接和摘要。查询词可使用中文或英文。",
+  "when_to_use": "需要中国大陆政策、中文媒体、国内企业/产品、百度索引结果或中文互联网语境时启用；不要仅按查询语言选择。",
+  "tool_name": "baidu_web_search",
+  "tools": [{
+    "name": "baidu_web_search",
+    "description": "Search Baidu-indexed and mainland-Chinese web sources through Baidu Qianfan AI Search. Choose it for source coverage, not merely because the query is Chinese. Requires BAIDU_API_KEY.",
+    "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "default": 5}}, "required": ["query"]},
+    "execution": {"type": "script", "script_path": "scripts/baidu_web_search.js", "timeout_seconds": 30, "arguments": ["--query", {"param": "query"}, {"flag": "--max-results", "param": "max_results", "default": 5}]}
+  }],
+  "outputs": ["结构化百度搜索结果"]
+}

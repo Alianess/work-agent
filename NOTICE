@@ -1,0 +1,21 @@
+# Third-party notices
+
+The root [MIT License](LICENSE) applies only to original Work Agent source and
+documentation in this repository. It does not replace terms in nested
+third-party directories.
+
+## Included components
+
+- `work_agent_skills/anysearch/` is distributed with its own Apache-2.0
+  license and NOTICE file. Preserve both when redistributing that directory.
+- Dependencies installed from `requirements-runtime.txt`,
+  `meeting_audio_minutes/requirements*.txt`, and `web_frontend/package*.json`
+  remain subject to their respective licenses.
+
+## Deliberately excluded local skill packs
+
+`work_agent_skills/docx/`, `pdf/`, `pptx/`, and `xlsx/` are ignored by Git.
+Their local license files prohibit redistribution, so this public source tree
+does not include them. The application discovers missing optional skills at
+runtime; install a compatible, separately licensed replacement locally if a
+workflow needs one of those capabilities.

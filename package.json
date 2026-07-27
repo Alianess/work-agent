@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@playwright/mcp": "0.0.78",
+    "pptxgenjs": "^4.0.1"
+  }
+}

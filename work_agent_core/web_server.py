@@ -82,6 +82,7 @@ CONFIG_PATH = DEFAULT_CONFIG_PATH
 STATIC_DIR = Path("web_frontend/dist")
 ASR_SETTINGS_PATH = Path("config/asr_settings.json")
 AGENT_SETTINGS_PATH = Path("config/agent_settings.json")
+MEETING_MINUTES_SETTINGS_PATH = Path("meeting_minutes_settings.json")
 AUTH_DATABASE_PATH = Path("config/auth.sqlite3")
 AUTH_COOKIE_NAME = "work_agent_session"
 USER_DATA_ROOT = Path("meet_files/users")
@@ -103,39 +104,11 @@ DEFAULT_ASR_SETTINGS: dict[str, Any] = {
     "profile": "qwen3-asr-mlx-8bit",
     "model_id": QWEN3_MLX_LOCAL_MODEL_ID,
     "backend": "mlx",
-    "hotwords": (
-        "会议 客户 产品 项目 技术 方案 数据 模型 合作 产业 平台 机器人 "
-        "具身智能 智能座舱 工业 教育 搬运 上料 SMT 料盘 断纱 接纱 "
-        "同执合 橡豫智能 国先控股 中科灵鉴"
-    ),
+    "hotwords": "",
 }
-DEFAULT_WORK_BACKGROUND = (
-    "我方为合肥国先控股有限公司机器人事业部，日常对接国先中心（合肥）/"
-    "国际先进技术应用推进中心（合肥）相关工作。国先控股是合肥市产业投资控股（集团）"
-    "有限公司体系内全资企业，承担国先中心（合肥）相关项目的市场化运营、产业资源导入、"
-    "场景拓展、平台建设运营和项目落地推进等工作。\n"
-    "会议纪要中，“我方”“平台方”通常指合肥国先控股有限公司、国先中心（合肥）及相关"
-    "机器人事业部工作口径。正式材料中应优先使用“国先控股”“合肥国先控股”“国先中心（合肥）”"
-    "等确认名称，不要将 ASR 相近词误写为国研、国元、国轩、国信、国现等。\n"
-    "当前重点工作围绕合肥具身智能和智能机器人产业推进展开，包括智能机器人公共服务平台、"
-    "具身智能机器人共性平台服务公司、机器人场景训练、零部件生产加工、产品测试验证、"
-    "真实场景应用、场景招商、场景实验室、产业生态协同、解决方案团队储备、二次开发团队对接、"
-    "平台化运营和项目落地等。\n"
-    "整理会议纪要时，内部留档版可以保留 ASR 不确定项、口述信息、待核验内容和材料差异；"
-    "工作提交版 DOCX 必须保守、简洁、正式，只写高置信和已确认内容，不写 ASR 痕迹、不写待确认事项、"
-    "不写不确定人名、地点、金额、股权、参数或合作条款。会议地点表述优先使用“赴X开展座谈沟通”"
-    "或“与X开展座谈沟通”，其中 X 应为确认的会议对象或项目名称。"
-)
 DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
-    "work_background": DEFAULT_WORK_BACKGROUND,
-    "company_document_format": (
-        "页面设置：上3.5厘米、下3.1厘米、左2.65厘米、右2.65厘米\n"
-        "行间距：固定值29.6磅\n"
-        "标题：2号字，方正小标宋简体\n"
-        "正文：3号字，仿宋_GB2312\n"
-        "一级标题：黑体\n"
-        "二级标题：楷体_GB2312"
-    ),
+    "work_background": "",
+    "company_document_format": "",
 }
 DEFAULT_DISABLED_SKILL_IDS = {"baidu-web-search", "tavily-search", "edge-browser"}
 
@@ -155,10 +128,19 @@ def get_auth_store() -> AuthStore:
     global AUTH_STORE
     if AUTH_STORE is None:
         store = AuthStore(WORKSPACE_ROOT / AUTH_DATABASE_PATH)
-        admin = store.ensure_admin(
-            os.getenv("WORK_AGENT_ADMIN_USERNAME", "admin"),
-            os.getenv("WORK_AGENT_ADMIN_PASSWORD", "admin123"),
-        )
+        username = os.getenv("WORK_AGENT_ADMIN_USERNAME", "").strip()
+        password = os.getenv("WORK_AGENT_ADMIN_PASSWORD", "")
+        if bool(username) != bool(password):
+            raise RuntimeError("首次管理员初始化必须同时设置 WORK_AGENT_ADMIN_USERNAME 和 WORK_AGENT_ADMIN_PASSWORD。")
+        if username:
+            admin = store.ensure_admin(username, password)
+        else:
+            admin = store.first_admin()
+            if admin is None:
+                raise RuntimeError(
+                    "首次启动必须设置 WORK_AGENT_ADMIN_USERNAME 和 WORK_AGENT_ADMIN_PASSWORD；"
+                    "拒绝创建默认管理员账户。"
+                )
         migrate_legacy_admin_data(admin)
         AUTH_STORE = store
     return AUTH_STORE
@@ -168,7 +150,7 @@ def current_auth_user() -> AuthUser:
     user = getattr(REQUEST_AUTH, "user", None)
     if isinstance(user, AuthUser):
         return user
-    admin = get_auth_store().get_user(os.getenv("WORK_AGENT_ADMIN_USERNAME", "admin"))
+    admin = get_auth_store().first_admin()
     if admin is None:
         raise RuntimeError("管理员账户尚未初始化")
     return admin
@@ -187,6 +169,10 @@ def user_conversation_dir(user: AuthUser | None = None) -> Path:
 
 def user_agent_settings_path(user: AuthUser | None = None) -> Path:
     return user_data_dir(user) / "agent_settings.json"
+
+
+def user_meeting_minutes_settings_path(user: AuthUser | None = None) -> Path:
+    return user_data_dir(user) / MEETING_MINUTES_SETTINGS_PATH
 
 
 def user_conversation_history_path(user: AuthUser | None = None) -> Path:
@@ -553,6 +539,9 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/settings/agent":
                 self._send_json(agent_settings_payload())
                 return
+            if parsed.path == "/api/settings/meeting-minutes":
+                self._send_json(meeting_minutes_settings_payload())
+                return
             if parsed.path == "/api/memories":
                 params = parse_qs(parsed.query)
                 project_values = params.get("project_id")
@@ -594,6 +583,10 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                     return
             if parsed.path == "/api/skills":
                 self._send_json(skill_catalog_payload())
+                return
+            skill_instruction_id = parse_skill_instruction_route(parsed.path)
+            if skill_instruction_id:
+                self._send_json(skill_instruction_payload(skill_instruction_id))
                 return
             if parsed.path == "/api/files":
                 params = parse_qs(parsed.query)
@@ -788,6 +781,9 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/settings/agent":
                 self._send_json(save_agent_settings_payload(payload))
                 return
+            if parsed.path == "/api/settings/meeting-minutes":
+                self._send_json(save_meeting_minutes_settings_payload(payload))
+                return
             if parsed.path == "/api/memories/update":
                 self._send_json(update_cross_chat_memory_payload(payload))
                 return
@@ -819,6 +815,12 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 if not self._require_admin():
                     return
                 self._send_json(run_meeting_minutes_payload(payload))
+                return
+            skill_instruction_id = parse_skill_instruction_route(parsed.path)
+            if skill_instruction_id:
+                if not self._require_admin():
+                    return
+                self._send_json(save_skill_instruction_payload(skill_instruction_id, payload))
                 return
             if parsed.path == "/api/skills/settings":
                 self._send_json(save_skill_enabled_payload(payload))
@@ -1453,6 +1455,97 @@ def save_agent_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return agent_settings_payload(message="Agent settings saved")
+
+
+DEFAULT_MEETING_MINUTES_SETTINGS = {
+    "default_output_dir": "meet_files",
+    "custom_instructions": "",
+}
+
+
+def load_meeting_minutes_settings() -> dict[str, Any]:
+    path = user_meeting_minutes_settings_path()
+    data: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except json.JSONDecodeError:
+            data = {}
+    settings = {**DEFAULT_MEETING_MINUTES_SETTINGS, **data}
+    settings["default_output_dir"] = str(settings.get("default_output_dir") or "meet_files").strip() or "meet_files"
+    settings["custom_instructions"] = normalize_multiline_text(str(settings.get("custom_instructions") or ""))
+    return settings
+
+
+def meeting_minutes_settings_payload(message: str | None = None) -> dict[str, Any]:
+    settings = load_meeting_minutes_settings()
+    if message:
+        settings["message"] = message
+    return settings
+
+
+def save_meeting_minutes_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    settings = {
+        "default_output_dir": str(payload.get("default_output_dir") or "meet_files").strip() or "meet_files",
+        "custom_instructions": normalize_multiline_text(str(payload.get("custom_instructions") or "")),
+    }
+    path = user_meeting_minutes_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return meeting_minutes_settings_payload(message="会议纪要设置已保存")
+
+
+def parse_skill_instruction_route(path: str) -> str | None:
+    prefix = "/api/skills/"
+    suffix = "/instructions"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return None
+    skill_id = path[len(prefix) : -len(suffix)].strip()
+    return skill_id or None
+
+
+def skill_instruction_path(skill_id: str) -> Path:
+    if skill_id == "meeting-minutes":
+        path = WORKSPACE_ROOT / "meeting_audio_minutes/skills/meeting-minutes/SKILL.md"
+    else:
+        manifest = next((item for item in load_skill_manifests(WORKSPACE_ROOT) if item.id == skill_id), None)
+        if manifest is None:
+            raise ValueError(f"未找到技能：{skill_id}")
+        path = WORKSPACE_ROOT / manifest.path / "SKILL.md"
+    resolved = path.resolve()
+    allowed_roots = (
+        (WORKSPACE_ROOT / "work_agent_skills").resolve(),
+        (WORKSPACE_ROOT / "meeting_audio_minutes/skills").resolve(),
+    )
+    if not any(resolved.is_relative_to(root) for root in allowed_roots) or not resolved.is_file():
+        raise ValueError(f"技能说明文件不可用：{skill_id}")
+    return resolved
+
+
+def skill_instruction_payload(skill_id: str, message: str | None = None) -> dict[str, Any]:
+    path = skill_instruction_path(skill_id)
+    result: dict[str, Any] = {
+        "skill_id": skill_id,
+        "path": str(path.relative_to(WORKSPACE_ROOT)),
+        "content": path.read_text(encoding="utf-8", errors="replace"),
+        "editable": current_auth_user().role == "admin",
+    }
+    if message:
+        result["message"] = message
+    return result
+
+
+def save_skill_instruction_payload(skill_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    content = payload.get("content")
+    if not isinstance(content, str):
+        raise ValueError("技能说明必须是 Markdown 文本。")
+    if len(content) > 120_000:
+        raise ValueError("技能说明不能超过 120000 个字符。")
+    path = skill_instruction_path(skill_id)
+    path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    return skill_instruction_payload(skill_id, message="技能说明已保存；下一轮调用会读取新规则。")
 
 
 def cross_chat_memories_payload(*, project_id: str | None = None, query: str = "") -> dict[str, Any]:
@@ -4292,15 +4385,15 @@ def render_chat_skill_catalog() -> str:
 
 
 def extract_workspace_paths(text: str) -> list[str]:
+    workspace_prefix = f"{WORKSPACE_ROOT.as_posix()}/"
     pattern = re.compile(
-        r"(?:/Users/alian/workspace/work_agent/)?"
+        rf"(?:{re.escape(workspace_prefix)})?"
         r"(?:meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|产出材料|分析材料|学习笔记)"
         r"/[^\s`'\"<>|\\\x00-\x1f]+",
         re.IGNORECASE,
     )
     seen: set[str] = set()
     paths: list[str] = []
-    workspace_prefix = "/Users/alian/workspace/work_agent/"
     for match in pattern.finditer(text):
         path = match.group(0).strip().rstrip("，。；;、,.!?！？:：)]}")
         if path.startswith(workspace_prefix):
@@ -4379,7 +4472,7 @@ def render_known_file_references(refs: list[dict[str, str]]) -> str:
 
 
 def normalize_workspace_reference_path(path: str) -> str:
-    workspace_prefix = "/Users/alian/workspace/work_agent/"
+    workspace_prefix = f"{WORKSPACE_ROOT.as_posix()}/"
     candidate = path.strip().strip("`'\"").rstrip("，。；;、,.!?！？:：)]}")
     if not candidate or any(ord(char) < 32 for char in candidate):
         return ""
@@ -4588,17 +4681,19 @@ def run_meeting_minutes_payload(payload: dict[str, Any]) -> dict[str, Any]:
     registry = load_registry()
     profile = registry.get(str(payload.get("profile") or registry.default_profile))
     client = OpenAICompatibleClient()
+    settings = load_meeting_minutes_settings()
     skill = MeetingMinutesSkill(workspace_root=WORKSPACE_ROOT, client=client, profile=profile)
     result = skill.run(
         {
             "input_path": str(payload.get("input_path") or payload.get("transcript_path") or payload.get("audio_path") or ""),
             "transcript_path": str(payload.get("transcript_path") or ""),
             "audio_path": str(payload.get("audio_path") or ""),
-            "output_dir": str(payload.get("output_dir") or "meet_files"),
+            "output_dir": str(payload.get("output_dir") or settings["default_output_dir"]),
             "meeting_name": required_string(payload, "meeting_name"),
             "confirmed_info": str(payload.get("confirmed_info") or ""),
             "supplemental_paths": payload.get("supplemental_paths") or [],
-            "spec_path": str(payload.get("spec_path") or "meeting_audio_minutes/ASR文本整理流程.md"),
+            "spec_path": str(payload.get("spec_path") or "meeting_audio_minutes/meeting_minutes_spec.md"),
+            "custom_instructions": settings["custom_instructions"],
         }
     )
     return {"result": json.loads(result)}

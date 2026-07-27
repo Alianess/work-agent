@@ -1,0 +1,59 @@
+.env
+.env.*
+!/.env.example
+# Local runtime configuration. Commit only the *.example files under config/.
+config/*.json
+!config/*.example.json
+config/*.local.json
+config/*.local.yml
+config/sources.yml
+config/auth.sqlite3
+__pycache__/
+*.py[cod]
+.DS_Store
+node_modules/
+.venv/
+.venv_agent/
+web_frontend/node_modules/
+web_frontend/dist/
+outputs/
+# Private user data, recordings, generated artifacts, traces, browser state, and caches.
+meet_files/
+tmp/
+.playwright-mcp/
+.codex_tmp/
+scratch/
+design-qa.md
+design-qa-*.png
+meeting_audio_minutes/model_cache/
+meeting_audio_minutes/outputs/
+meeting_audio_minutes/.work_agent_tmp/
+meeting_audio_minutes/ASR文本整理流程.md
+meeting_audio_minutes/MEETING_WORKFLOW.md
+meeting_audio_minutes/会议录音转写与纪要生成规范.md
+meeting_audio_minutes/skills/meeting-minutes/assets/
+meeting_audio_minutes/skills/meeting-minutes/references/work-submission-writing.md
+meeting_audio_minutes/scripts/backfill_meeting_archives.py
+meeting_audio_minutes/*.m4a
+meeting_audio_minutes/*.wav
+meeting_audio_minutes/*.mp3
+
+# This workspace can contain unrelated local projects and reference material.
+alianess-site/
+分析材料/
+学习笔记/
+产出材料/
+/*.m4a
+/*.docx
+/*.png
+
+# Local launchd registrations embed machine-specific absolute paths.
+launchd/*.plist
+!launchd/*.plist.template
+
+# These local skill packs carry third-party terms that do not allow redistribution.
+# Install compatible replacements locally when their document capabilities are needed.
+work_agent_skills/docx/
+work_agent_skills/pdf/
+work_agent_skills/pptx/
+work_agent_skills/xlsx/

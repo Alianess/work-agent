@@ -1,0 +1,15 @@
+{
+  "default_profile": "example-openai-compatible",
+  "profiles": [
+    {
+      "name": "example-openai-compatible",
+      "provider": "openai-compatible",
+      "base_url": "https://api.example.com/v1",
+      "model": "example-model",
+      "api_key_env": "EXAMPLE_MODEL_API_KEY",
+      "temperature": 0.6,
+      "max_tokens": 4096,
+      "timeout_seconds": 120
+    }
+  ]
+}

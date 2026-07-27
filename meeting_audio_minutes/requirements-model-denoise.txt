@@ -1,0 +1,13 @@
+# Legacy reference only. Do not install this file into Work Agent.
+#
+# DeepFilterNet 0.5.6 has macOS arm64 wheels for Python 3.10.
+# Keep torch/torchaudio at 2.4.1 because newer torchaudio versions removed
+# APIs still used by DeepFilterNet's Python CLI.
+#
+# The managed project runtime is Python 3.12 with the newer ASR torch stack.
+# The production workflow therefore uses FFmpeg denoise and keeps these pins
+# only to document why the former environment was retired.
+deepfilternet==0.5.6
+torch==2.4.1
+torchaudio==2.4.1
+soundfile==0.14.0

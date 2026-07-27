@@ -1,0 +1,25 @@
+[project]
+name = "meeting-audio-minutes"
+version = "0.1.0"
+description = "Noisy Chinese meeting audio transcription with Qwen3-ASR and VAD-boundary chunking."
+requires-python = ">=3.10"
+dependencies = [
+  "transformers>=5.0.0",
+  "torch>=2.12.1",
+  "torchaudio>=2.11.0",
+  "funasr==1.3.14",
+  "modelscope==1.38.1",
+  "mlx-audio==0.4.4",
+]
+
+[project.optional-dependencies]
+realtime-vad = [
+  "setuptools<81",
+  "webrtcvad==2.0.10",
+]
+
+[project.scripts]
+meeting-minutes = "meeting_minutes.cli:main"
+
+[tool.setuptools]
+packages = ["meeting_minutes"]

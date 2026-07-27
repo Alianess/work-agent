@@ -1,0 +1,8 @@
+.venv/
+.venv_project/
+.venv_deepfilter/
+.conda_env/
+__pycache__/
+*.py[cod]
+outputs/
+*.meeting_ready.wav

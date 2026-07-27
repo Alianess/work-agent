@@ -1,0 +1,4 @@
+interface:
+  display_name: "跨聊天记忆"
+  short_description: "检索可纠正的摘要记忆并核对来源聊天原文"
+  default_prompt: "Use $recall-chat-history to recall relevant managed memories and verify exact details in their source chats."

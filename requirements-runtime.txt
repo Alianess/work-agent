@@ -1,0 +1,23 @@
+# Work Agent's single managed Python environment.
+#
+# Create/update it only through:
+#   scripts/runtime_env.sh bootstrap
+#
+# Core ASR and realtime VAD
+-r meeting_audio_minutes/requirements.txt
+-r meeting_audio_minutes/requirements-realtime.txt
+
+# Document and office artifact support
+defusedxml==0.7.1
+lxml==6.0.2
+openpyxl==3.1.5
+pdfplumber==0.11.9
+pypdf==6.10.0
+python-docx==1.2.0
+python-pptx==1.0.2
+reportlab==4.4.9
+xlsxwriter==3.2.9
+
+# Skill/runtime helpers
+PyYAML==6.0.3
+requests==2.34.2

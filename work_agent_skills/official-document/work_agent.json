@@ -1,0 +1,13 @@
+{
+  "id": "official-document",
+  "label": "公文",
+  "mention": "@公文",
+  "description": "判断法定公文文种、组织公文要素和内容结构，应用现行公文规范或公司纯文字格式，并交由完整 Word 技能生成和验收。",
+  "when_to_use": "请示、报告、通知、通报、函、批复、意见、决定、公告、通告、纪要等公文，正式发文、红头文件、公文格式，以及公文式公司文字材料。",
+  "outputs": [
+    "公文内容定稿",
+    "交给 Word 技能的文档规格"
+  ],
+  "default_enabled": true,
+  "source_url": "https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=F3CC9BEF482524C895FDA7A08BB4A70E"
+}

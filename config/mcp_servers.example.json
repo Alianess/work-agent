@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "example-stdio-server": {
+      "type": "stdio",
+      "description": "Disabled example. Replace command/args with any MCP stdio server.",
+      "command": "python",
+      "args": ["path/to/server.py"],
+      "cwd": ".",
+      "env": {},
+      "enabled": false
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "profile": "qwen3-asr-mlx-8bit",
+  "model_id": "meeting_audio_minutes/model_cache/mlx-community/Qwen3-ASR-1.7B-8bit",
+  "backend": "mlx",
+  "hotwords": ""
+}

@@ -1,0 +1,3 @@
+display_name: 会议纪要
+short_description: 按会议类型提炼决策、资源、行动与研判，生成内部留档版和工作提交版纪要。
+default_prompt: 请使用 $meeting-minutes 根据会议录音或转写，先判断会议类型，再保留可靠的具体资源、共识、责任主体和下一步动作，生成内部留档版Markdown与紧凑正式的工作提交版Word纪要。

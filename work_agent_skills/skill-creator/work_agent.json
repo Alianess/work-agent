@@ -1,0 +1,14 @@
+{
+  "id": "skill-creator",
+  "label": "技能创建器",
+  "mention": "@技能创建",
+  "description": "创建、修改、评估和优化工作智能体技能。适用于把一段稳定流程沉淀成技能、改进已有技能、补充测试样例、校验技能元数据和优化触发描述。",
+  "when_to_use": "当用户说要新增技能、安装技能、改技能、把当前流程固化成技能、优化技能触发、评估技能效果时使用。",
+  "tool_name": "read_skill_instructions",
+  "outputs": [
+    "SKILL.md",
+    "work_agent.json",
+    "技能测试与评估材料"
+  ],
+  "source_url": "https://github.com/anthropics/skills/tree/main/skills/skill-creator"
+}

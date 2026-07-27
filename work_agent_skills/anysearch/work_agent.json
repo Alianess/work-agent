@@ -1,0 +1,149 @@
+{
+  "id": "anysearch",
+  "label": "联网搜索（AnySearch）",
+  "mention": "@AnySearch",
+  "description": "免费联网搜索、垂直领域检索、批量搜索和公开网页正文提取。通过 sys_skill 分层载入说明并调用技能工具。",
+  "when_to_use": "当用户提到联网、Web、网页、搜索、查询、查一下、最新资料、事实核验、读取URL，或需要金融、学术、法律、企业、社媒等垂直领域检索时使用。",
+  "tool_name": "anysearch_search",
+  "default_enabled": true,
+  "dependencies": {
+    "binaries": ["node"]
+  },
+  "tools": [
+    {
+      "name": "anysearch_search",
+      "description": "Use AnySearch to search current web information or a selected vertical domain. Call this directly for news, latest facts, public web lookup, or fact checking.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum results to return, 1-10.",
+            "default": 5
+          },
+          "domain": {
+            "type": "string",
+            "description": "Optional vertical domain, e.g. finance, academic, legal, health, business, security, code, social_media, travel, film, gaming, general."
+          },
+          "sub_domain": {
+            "type": "string",
+            "description": "Optional sub-domain returned by anysearch_get_sub_domains."
+          },
+          "sub_domain_params": {
+            "type": "object",
+            "description": "Optional required parameters for the selected sub_domain."
+          }
+        },
+        "required": ["query"]
+      },
+      "execution": {
+        "type": "script",
+        "script_path": "scripts/anysearch_cli.js",
+        "timeout_seconds": 60,
+        "arguments": [
+          "search",
+          { "param": "query" },
+          { "flag": "--domain", "param": "domain", "optional": true },
+          { "flag": "--sub_domain", "param": "sub_domain", "optional": true },
+          { "flag": "--sdp", "param": "sub_domain_params", "optional": true, "json": true },
+          { "flag": "--max_results", "param": "max_results", "default": 5 }
+        ]
+      }
+    },
+    {
+      "name": "anysearch_get_sub_domains",
+      "description": "Discover AnySearch vertical sub-domains and required parameters before a structured vertical search.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "Single domain to inspect, e.g. finance, academic, legal, health, social_media."
+          },
+          "domains": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Multiple domains to inspect. Provide either domain or domains."
+          }
+        }
+      },
+      "execution": {
+        "type": "script",
+        "script_path": "scripts/anysearch_cli.js",
+        "timeout_seconds": 60,
+        "arguments": [
+          "get_sub_domains",
+          { "flag": "--domain", "param": "domain", "optional": true },
+          { "flag": "--domains", "param": "domains", "optional": true, "join": "," }
+        ]
+      }
+    },
+    {
+      "name": "anysearch_extract",
+      "description": "Extract readable Markdown content from a public URL with AnySearch.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Public URL to extract."
+          }
+        },
+        "required": ["url"]
+      },
+      "execution": {
+        "type": "script",
+        "script_path": "scripts/anysearch_cli.js",
+        "timeout_seconds": 60,
+        "arguments": [
+          "extract",
+          { "param": "url" }
+        ]
+      }
+    },
+    {
+      "name": "anysearch_batch_search",
+      "description": "Run up to 5 AnySearch searches in one call. Use for multi-intent or hybrid general + vertical research.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "queries": {
+            "type": "array",
+            "description": "One to five query objects. Each object must include query and may include domain, sub_domain, sub_domain_params, or max_results.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "query": { "type": "string" },
+                "domain": { "type": "string" },
+                "sub_domain": { "type": "string" },
+                "sub_domain_params": { "type": "object" },
+                "max_results": { "type": "integer" }
+              },
+              "required": ["query"]
+            }
+          }
+        },
+        "required": ["queries"]
+      },
+      "execution": {
+        "type": "script",
+        "script_path": "scripts/anysearch_cli.js",
+        "timeout_seconds": 90,
+        "arguments": [
+          "batch_search",
+          { "flag": "--queries", "param": "queries", "json": true }
+        ]
+      }
+    }
+  ],
+  "outputs": [
+    "搜索结果摘要",
+    "网页Markdown提取内容",
+    "批量检索结果"
+  ],
+  "source_url": "https://github.com/anysearch-ai/anysearch-skill"
+}
