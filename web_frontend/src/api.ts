@@ -10,12 +10,14 @@ import type {
   CrossChatMemoriesPayload,
   CrossChatMemory,
   FilePayload,
+  FileItem,
   FilesPayload,
   MeetingArchivesPayload,
   MeetingResult,
   MeetingMinutesSettingsPayload,
   ModelsPayload,
   Project,
+  ProjectSummary,
   ProjectsPayload,
   ReasoningEffort,
   RealtimeTranscriptSavePayload,
@@ -283,10 +285,27 @@ export const api = {
       body: JSON.stringify(payload)
     }),
   conversations: () => requestJson<{ items: unknown[] }>("/api/conversations"),
+  conversationFiles: (conversationId: string) =>
+    requestJson<{ conversation_id: string; title: string; files: FileItem[] }>(
+      `/api/conversations/${encodeURIComponent(conversationId)}/files`
+    ),
   saveConversations: (payload: { items: unknown[] }) =>
     requestJson<{ ok: boolean; path: string; count: number }>("/api/conversations/save", {
       method: "POST",
       body: JSON.stringify(payload)
+    }),
+  moveConversationToProject: (conversationId: string, projectId: string | null) =>
+    requestJson<{
+      ok: boolean;
+      conversation_id: string;
+      project_id: string | null;
+      project: ProjectSummary | null;
+      files: FileItem[];
+      copied_count: number;
+      unchanged_count: number;
+    }>("/api/conversations/move-project", {
+      method: "POST",
+      body: JSON.stringify({ conversation_id: conversationId, project_id: projectId })
     }),
   projects: () => requestJson<ProjectsPayload>("/api/projects"),
   project: (projectId: string) =>

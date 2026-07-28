@@ -401,6 +401,12 @@ export default function App() {
   const [meetingSyncProjectId, setMeetingSyncProjectId] = useState("");
   const [meetingSyncMessage, setMeetingSyncMessage] = useState("");
   const [selectedFile, setSelectedFile] = useState<FilePayload | null>(null);
+  const [chatFilesOpen, setChatFilesOpen] = useState(false);
+  const [chatFilesLoading, setChatFilesLoading] = useState(false);
+  const [chatFilesError, setChatFilesError] = useState("");
+  const [chatFiles, setChatFiles] = useState<FileItem[]>([]);
+  const [chatFilesTitle, setChatFilesTitle] = useState("");
+  const [chatFilePreview, setChatFilePreview] = useState<FilePayload | null>(null);
   const [filesRoot, setFilesRoot] = useState("meet_files");
   const [fileQuery, setFileQuery] = useState("");
   const [fileFilter, setFileFilter] = useState<FileFilter>("all");
@@ -430,6 +436,7 @@ export default function App() {
   const [conversationSearch, setConversationSearch] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [historyMenu, setHistoryMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [historyProjectPickerOpen, setHistoryProjectPickerOpen] = useState(false);
   const [renamingConversationId, setRenamingConversationId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [deleteConfirmConversationId, setDeleteConfirmConversationId] = useState<string | null>(null);
@@ -708,6 +715,7 @@ export default function App() {
     if (!historyMenu) return;
     const closeMenu = () => {
       setHistoryMenu(null);
+      setHistoryProjectPickerOpen(false);
       setDeleteConfirmConversationId(null);
     };
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1312,6 +1320,50 @@ export default function App() {
     const opened = await openFile(path);
     if (!opened) return;
     setArtifactTabWithUrl("files");
+  }
+
+  async function openChatFiles(conversationId: string) {
+    setHistoryMenu(null);
+    setHistoryProjectPickerOpen(false);
+    setActivityOpen(false);
+    setChatFilesOpen(true);
+    setChatFilePreview(null);
+    setChatFilesLoading(true);
+    setChatFilesError("");
+    try {
+      const conversation = conversationHistoryRef.current.find(
+        (item) => item.id === conversationId
+      );
+      const syncResult = conversation?.projectId
+        ? await api.moveConversationToProject(conversationId, conversation.projectId)
+        : null;
+      const payload = await api.conversationFiles(conversationId);
+      setChatFiles(payload.files);
+      setChatFilesTitle(payload.title);
+      if (syncResult?.copied_count) {
+        setStatus({
+          tone: "success",
+          text: `已同步 ${syncResult.copied_count} 份聊天文件到当前项目`
+        });
+      }
+    } catch (error) {
+      setChatFiles([]);
+      setChatFilesError(explainError(error));
+    } finally {
+      setChatFilesLoading(false);
+    }
+  }
+
+  async function previewChatFile(path: string) {
+    setChatFilesLoading(true);
+    setChatFilesError("");
+    try {
+      setChatFilePreview(await api.file(path));
+    } catch (error) {
+      setChatFilesError(explainError(error));
+    } finally {
+      setChatFilesLoading(false);
+    }
   }
 
   function updateChatInput(value: string) {
@@ -2077,6 +2129,9 @@ export default function App() {
     setConversationSummary("");
     setConversationSummaryMessageCount(0);
     setHistoryMenu(null);
+    setHistoryProjectPickerOpen(false);
+    setChatFilesOpen(false);
+    setChatFilePreview(null);
     setRenamingConversationId(null);
     setDeleteConfirmConversationId(null);
     cancelEditingUserMessage();
@@ -2129,6 +2184,9 @@ export default function App() {
     setConversationSummary(item.contextSummary ?? "");
     setConversationSummaryMessageCount(item.contextSummaryMessageCount ?? 0);
     setHistoryMenu(null);
+    setHistoryProjectPickerOpen(false);
+    setChatFilesOpen(false);
+    setChatFilePreview(null);
     setRenamingConversationId(null);
     setDeleteConfirmConversationId(null);
     cancelEditingUserMessage();
@@ -2159,14 +2217,15 @@ export default function App() {
     event.preventDefault();
     event.stopPropagation();
     const rect = event.currentTarget.getBoundingClientRect();
-    const menuWidth = 184;
-    const menuHeight = 146;
+    const menuWidth = 236;
+    const menuHeight = 286;
     const x = Math.min(
       Math.max(12, rect.right - menuWidth),
       Math.max(12, window.innerWidth - menuWidth - 12)
     );
     const y = Math.min(rect.bottom + 8, Math.max(12, window.innerHeight - menuHeight - 12));
     setHistoryMenu({ id, x, y });
+    setHistoryProjectPickerOpen(false);
     setDeleteConfirmConversationId(null);
   }
 
@@ -2182,6 +2241,7 @@ export default function App() {
       )
     );
     setHistoryMenu(null);
+    setHistoryProjectPickerOpen(false);
     setDeleteConfirmConversationId(null);
     setStatus({ tone: "success", text: pinned ? "已置顶对话" : "已取消置顶" });
   }
@@ -2192,6 +2252,7 @@ export default function App() {
     setRenamingConversationId(id);
     setRenameDraft(item.title);
     setHistoryMenu(null);
+    setHistoryProjectPickerOpen(false);
     setDeleteConfirmConversationId(null);
   }
 
@@ -2213,11 +2274,59 @@ export default function App() {
     }
     setConversationHistory((items) => items.filter((item) => item.id !== id));
     setHistoryMenu(null);
+    setHistoryProjectPickerOpen(false);
     setDeleteConfirmConversationId(null);
     if (currentConversationId === id) {
       startNewChat();
     }
     setStatus({ tone: "success", text: "历史对话已删除" });
+  }
+
+  async function moveConversationToProject(id: string, projectId: string | null) {
+    if (busy && currentConversationId === id) {
+      setStatus({ tone: "error", text: "请等待当前回复完成后再移动对话" });
+      return;
+    }
+    const targetProject = projectId
+      ? projects.find((project) => project.id === projectId) ?? null
+      : null;
+    setStatus({
+      tone: "loading",
+      text: targetProject ? `正在移至“${targetProject.name}”…` : "正在移出项目…"
+    });
+    try {
+      const moveResult = await api.moveConversationToProject(id, projectId);
+      setConversationHistory((items) =>
+        items.map((item) =>
+          item.id === id
+            ? { ...item, projectId: projectId ?? undefined }
+            : item
+        )
+      );
+      if (currentConversationId === id) {
+        setActiveProjectId(projectId);
+        activeProjectIdRef.current = projectId;
+        if (projectId) {
+          const payload = await api.project(projectId);
+          setSelectedProject(payload.project);
+        } else {
+          setSelectedProject(null);
+        }
+      }
+      setHistoryMenu(null);
+      setHistoryProjectPickerOpen(false);
+      setDeleteConfirmConversationId(null);
+      setStatus({
+        tone: "success",
+        text: targetProject
+          ? moveResult.copied_count > 0
+            ? `已移至“${targetProject.name}”，同步 ${moveResult.copied_count} 份聊天文件`
+            : `已移至“${targetProject.name}”，聊天文件已同步`
+          : "已移出项目"
+      });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    }
   }
 
   async function restoreConversationArchive() {
@@ -3635,6 +3744,9 @@ export default function App() {
 
   const fileReaderOpen = view === "artifacts" && artifactTab === "files" && selectedFile !== null;
   const meetingArchiveOpen = view === "artifacts" && artifactTab === "meeting";
+  const activeConversation = conversationHistory.find(
+    (item) => item.id === currentConversationId
+  );
 
   return (
     <div
@@ -3900,6 +4012,19 @@ export default function App() {
                 <RefreshCw aria-hidden="true" className={busy ? "spin" : ""} />
                 刷新
               </button>
+              {view === "agent" && activeConversation ? (
+                <button
+                  type="button"
+                  className="topbar-more-button"
+                  aria-label="更多对话操作"
+                  title="更多对话操作"
+                  aria-haspopup="menu"
+                  aria-expanded={historyMenu?.id === activeConversation.id}
+                  onClick={(event) => openHistoryMenu(event, activeConversation.id)}
+                >
+                  <MoreHorizontal aria-hidden="true" />
+                </button>
+              ) : null}
             </div>
           </header>
         ) : null}
@@ -4287,29 +4412,103 @@ export default function App() {
     const confirmingDelete = deleteConfirmConversationId === item.id;
     return (
       <div
-        className="history-menu-popover"
+        className={`history-menu-popover ${historyProjectPickerOpen ? "is-project-picker" : ""}`}
         role="menu"
         aria-label={`${item.title} 的历史对话操作`}
         style={{ left: historyMenu.x, top: historyMenu.y }}
         onPointerDown={(event) => event.stopPropagation()}
       >
-        <button type="button" role="menuitem" onClick={() => toggleConversationPin(item.id)}>
-          {item.pinned ? <PinOff aria-hidden="true" /> : <Pin aria-hidden="true" />}
-          <span>{item.pinned ? "取消置顶" : "置顶"}</span>
-        </button>
-        <button type="button" role="menuitem" onClick={() => startRenameConversation(item.id)}>
-          <Pencil aria-hidden="true" />
-          <span>重命名</span>
-        </button>
-        <button
-          type="button"
-          role="menuitem"
-          className={`history-menu-danger ${confirmingDelete ? "is-confirming" : ""}`}
-          onClick={() => deleteConversation(item.id)}
-        >
-          <Trash2 aria-hidden="true" />
-          <span>{confirmingDelete ? "确认删除" : "删除"}</span>
-        </button>
+        {historyProjectPickerOpen ? (
+          <>
+            <button
+              type="button"
+              role="menuitem"
+              className="history-menu-back"
+              onClick={() => setHistoryProjectPickerOpen(false)}
+            >
+              <ChevronRight aria-hidden="true" />
+              <span>移至项目</span>
+            </button>
+            <div className="history-menu-divider" />
+            <div className="history-project-list" aria-label="可选项目">
+              {projects.length > 0 ? (
+                projects.map((project) => {
+                  const selected = item.projectId === project.id;
+                  return (
+                    <button
+                      key={project.id}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={selected}
+                      disabled={selected}
+                      onClick={() => void moveConversationToProject(item.id, project.id)}
+                    >
+                      <Folder aria-hidden="true" />
+                      <span>{project.name}</span>
+                      {selected ? <Check aria-hidden="true" /> : null}
+                    </button>
+                  );
+                })
+              ) : (
+                <p className="history-project-empty">还没有项目，请先在“项目”中创建。</p>
+              )}
+            </div>
+            {item.projectId ? (
+              <>
+                <div className="history-menu-divider" />
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => void moveConversationToProject(item.id, null)}
+                >
+                  <X aria-hidden="true" />
+                  <span>移出当前项目</span>
+                </button>
+              </>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                void openChatFiles(item.id);
+              }}
+            >
+              <Library aria-hidden="true" />
+              <span>查看聊天文件</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="history-menu-with-chevron"
+              onClick={() => setHistoryProjectPickerOpen(true)}
+            >
+              <FolderOpen aria-hidden="true" />
+              <span>{item.projectId ? "更换项目" : "移至项目"}</span>
+              <ChevronRight className="history-menu-chevron" aria-hidden="true" />
+            </button>
+            <button type="button" role="menuitem" onClick={() => toggleConversationPin(item.id)}>
+              {item.pinned ? <PinOff aria-hidden="true" /> : <Pin aria-hidden="true" />}
+              <span>{item.pinned ? "取消置顶" : "置顶"}</span>
+            </button>
+            <button type="button" role="menuitem" onClick={() => startRenameConversation(item.id)}>
+              <Pencil aria-hidden="true" />
+              <span>重命名</span>
+            </button>
+            <div className="history-menu-divider" />
+            <button
+              type="button"
+              role="menuitem"
+              className={`history-menu-danger ${confirmingDelete ? "is-confirming" : ""}`}
+              onClick={() => deleteConversation(item.id)}
+            >
+              <Trash2 aria-hidden="true" />
+              <span>{confirmingDelete ? "确认删除" : "删除"}</span>
+            </button>
+          </>
+        )}
       </div>
     );
   }
@@ -4365,7 +4564,7 @@ export default function App() {
 
   function renderAgent() {
     return (
-      <div className={`chat-page ${activityOpen ? "has-activity" : ""}`}>
+      <div className={`chat-page ${activityOpen || chatFilesOpen ? "has-side-panel" : ""}`}>
         <div className="chat-workarea">
           <section ref={chatThreadRef} className="chat-thread" aria-label="智能体对话">
             <div className="chat-messages" aria-live="polite">
@@ -4899,7 +5098,7 @@ export default function App() {
             </div>
           </section>
         </div>
-        {activityOpen ? renderActivityPanel() : null}
+        {chatFilesOpen ? renderChatFilesPanel() : activityOpen ? renderActivityPanel() : null}
       </div>
     );
   }
@@ -4917,6 +5116,8 @@ export default function App() {
         aria-expanded={isSelected}
         aria-controls="activity-panel"
         onClick={() => {
+          setChatFilesOpen(false);
+          setChatFilePreview(null);
           setActivityPanelMessageIndex(messageIndex);
           setActivityOpen((open) => (panelActivityIndex === messageIndex ? !open : true));
         }}
@@ -4968,6 +5169,105 @@ export default function App() {
           {activityRunning ? "等待本轮结束" : "确认执行"}
         </button>
       </div>
+    );
+  }
+
+  function renderChatFilesPanel() {
+    return (
+      <aside
+        className="activity-panel chat-files-panel"
+        id="chat-files-panel"
+        aria-label="当前聊天文件"
+        aria-busy={chatFilesLoading}
+      >
+        <header className="activity-header chat-files-header">
+          <div className="chat-files-heading">
+            {chatFilePreview ? (
+              <button
+                type="button"
+                className="chat-files-back"
+                onClick={() => setChatFilePreview(null)}
+                aria-label="返回聊天文件列表"
+              >
+                <ChevronRight aria-hidden="true" />
+              </button>
+            ) : null}
+            <div>
+              <h3>{chatFilePreview ? chatFilePreview.name : "聊天中的文件"}</h3>
+              <p>
+                {chatFilePreview
+                  ? formatBytes(chatFilePreview.size)
+                  : `${chatFilesTitle || "当前聊天"} · ${chatFiles.length} 个文件`}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setChatFilesOpen(false);
+              setChatFilePreview(null);
+            }}
+            aria-label="关闭聊天文件面板"
+          >
+            <X aria-hidden="true" />
+          </button>
+        </header>
+
+        <div className={`activity-body chat-files-body ${chatFilePreview ? "is-preview" : ""}`}>
+          {chatFilesError ? (
+            <div className="chat-files-error">
+              <AlertCircle aria-hidden="true" />
+              <span>{chatFilesError}</span>
+            </div>
+          ) : null}
+          {chatFilesLoading && !chatFilePreview ? (
+            <div className="activity-empty">
+              <Loader2 className="spin" aria-hidden="true" />
+              <span>正在整理当前聊天的文件…</span>
+            </div>
+          ) : chatFilePreview ? (
+            <div className="chat-file-preview">
+              <div className="chat-file-preview-actions">
+                <button type="button" onClick={() => copyPath(chatFilePreview.path)}>
+                  <Copy aria-hidden="true" />
+                  复制路径
+                </button>
+                <button type="button" onClick={() => openLocalFile(chatFilePreview.path)}>
+                  <ExternalLink aria-hidden="true" />
+                  系统打开
+                </button>
+              </div>
+              {renderFilePreview(chatFilePreview)}
+            </div>
+          ) : chatFiles.length > 0 ? (
+            <div className="chat-files-list">
+              {chatFiles.map((file) => (
+                <button
+                  type="button"
+                  key={file.path}
+                  className="chat-file-row"
+                  onClick={() => void previewChatFile(file.path)}
+                >
+                  <span className={`library-file-icon file-kind-${getLibraryKind(file)}`}>
+                    {iconForLibraryFile(file)}
+                  </span>
+                  <span className="chat-file-copy">
+                    <strong>{file.name}</strong>
+                    <small>{formatFileDate(file.modified)} · {formatBytes(file.size)}</small>
+                  </span>
+                  <ChevronRight aria-hidden="true" />
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="chat-files-empty">
+              <Library aria-hidden="true" />
+              <strong>这个聊天还没有文件</strong>
+              <p>上传的附件和智能体在聊天中生成的文档会显示在这里。</p>
+            </div>
+          )}
+        </div>
+      </aside>
     );
   }
 

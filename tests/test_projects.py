@@ -102,6 +102,90 @@ class ProjectPayloadTests(unittest.TestCase):
 
         self.assertEqual(payload["items"][0]["projectId"], project["id"])
 
+    def test_move_conversation_to_and_out_of_project_persists_archive_and_session(self) -> None:
+        project = web_server.create_project_payload({"name": "机器人项目"})["project"]
+        conversation_id = "local-project-move"
+        conversation_dir = self.workspace / "conversation_history"
+        history_path = conversation_dir / "conversations.json"
+        history_path.parent.mkdir(parents=True)
+        attachment_path = self.workspace / "meet_files" / "attachments" / "项目测算表.docx"
+        attachment_path.parent.mkdir(parents=True)
+        attachment_path.write_bytes(b"conversation-file")
+        unrelated_path = self.workspace / "meet_files" / "attachments" / "其他项目.docx"
+        unrelated_path.write_bytes(b"unrelated")
+        history_path.write_text(
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "id": conversation_id,
+                            "title": "项目讨论",
+                            "group": "最近",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "请分析附件\n\n参考附件：\n"
+                                        "- [文档] 项目测算表.docx: "
+                                        "meet_files/attachments/项目测算表.docx"
+                                    ),
+                                }
+                            ],
+                            "activities": {
+                                "2": {
+                                    "events": [
+                                        {
+                                            "event": "activity",
+                                            "phase": "observation",
+                                            "tool_name": "list_workspace_files",
+                                            "title": "列出文件",
+                                            "detail": (
+                                                "meet_files/attachments/项目测算表.docx\n"
+                                                "meet_files/attachments/其他项目.docx"
+                                            ),
+                                        }
+                                    ]
+                                }
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        session_store = web_server.SessionStore(
+            self.workspace,
+            session_dir=conversation_dir / "sessions",
+        )
+
+        with (
+            patch.object(web_server, "WORKSPACE_ROOT", self.workspace),
+            patch.object(web_server, "user_conversation_dir", return_value=conversation_dir),
+            patch.object(web_server, "user_conversation_history_path", return_value=history_path),
+            patch.object(web_server, "get_session_store", return_value=session_store),
+        ):
+            moved = web_server.move_conversation_to_project_payload(
+                {"conversation_id": conversation_id, "project_id": project["id"]}
+            )
+            archived = json.loads(history_path.read_text(encoding="utf-8"))
+            self.assertEqual(moved["project_id"], project["id"])
+            self.assertEqual(moved["copied_count"], 1)
+            self.assertEqual(len(moved["files"]), 1)
+            self.assertTrue((self.workspace / moved["files"][0]["path"]).is_file())
+            self.assertEqual(archived["items"][0]["projectId"], project["id"])
+            self.assertEqual(session_store.load(conversation_id).metadata["project_id"], project["id"])
+            chat_files = web_server.conversation_files_payload(conversation_id)
+            self.assertEqual([file["name"] for file in chat_files["files"]], ["项目测算表.docx"])
+
+            removed = web_server.move_conversation_to_project_payload(
+                {"conversation_id": conversation_id, "project_id": ""}
+            )
+            archived = json.loads(history_path.read_text(encoding="utf-8"))
+            self.assertIsNone(removed["project_id"])
+            self.assertNotIn("projectId", archived["items"][0])
+            self.assertEqual(session_store.load(conversation_id).metadata["project_id"], "")
+
     def test_meeting_minutes_sync_is_idempotent_and_refreshes_changed_files(self) -> None:
         project = web_server.create_project_payload({"name": "会议成果项目"})["project"]
         archive_dir = self.workspace / "meet_files" / "会议项目" / "项目启动会"

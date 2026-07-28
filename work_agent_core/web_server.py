@@ -604,6 +604,12 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/conversations":
                 self._send_json(load_conversations_payload())
                 return
+            conversation_files_match = re.fullmatch(r"/api/conversations/([^/]+)/files", parsed.path)
+            if conversation_files_match:
+                self._send_json(
+                    conversation_files_payload(decode_uri_path(conversation_files_match.group(1)))
+                )
+                return
             if parsed.path == "/api/projects":
                 self._send_json(list_projects_payload())
                 return
@@ -852,6 +858,9 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/conversations/save":
                 self._send_json(save_conversations_payload(payload))
+                return
+            if parsed.path == "/api/conversations/move-project":
+                self._send_json(move_conversation_to_project_payload(payload))
                 return
             if parsed.path == "/api/projects/create":
                 self._send_json(create_project_payload(payload), status=201)
@@ -2017,6 +2026,265 @@ def save_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
         encoding="utf-8",
     )
     return {"ok": True, "path": str(path.relative_to(WORKSPACE_ROOT)), "count": len(sanitized_items)}
+
+
+def move_conversation_to_project_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    conversation_id = sanitize_conversation_id(payload.get("conversation_id"))
+    raw_project_id = str(payload.get("project_id") or "").strip()
+    project_id = sanitize_project_id(raw_project_id) if raw_project_id else ""
+    project = read_project(project_id) if project_id else None
+
+    archive = load_conversations_payload()
+    items = archive.get("items", [])
+    matched = False
+    for item in items:
+        if not isinstance(item, dict) or item.get("id") != conversation_id:
+            continue
+        matched = True
+        if project_id:
+            item["projectId"] = project_id
+        else:
+            item.pop("projectId", None)
+        break
+    if not matched:
+        raise ValueError("未找到要移动的历史对话。")
+
+    file_sync = (
+        sync_conversation_files_to_project(item, project)
+        if project
+        else {"files": [], "copied_count": 0, "unchanged_count": 0}
+    )
+    session_store = get_session_store()
+    session = session_store.load(conversation_id)
+    session.metadata["project_id"] = project_id
+    session_store.save(session)
+    save_conversations_payload({"items": items})
+    return {
+        "ok": True,
+        "conversation_id": conversation_id,
+        "project_id": project_id or None,
+        "project": project_payload(project, include_files=False) if project else None,
+        "files": file_sync["files"],
+        "copied_count": file_sync["copied_count"],
+        "unchanged_count": file_sync["unchanged_count"],
+    }
+
+
+def conversation_files_payload(raw_conversation_id: Any) -> dict[str, Any]:
+    conversation_id = sanitize_conversation_id(raw_conversation_id)
+    if not conversation_id:
+        raise ValueError("对话标识无效。")
+    archive = load_conversations_payload()
+    item = next(
+        (
+            candidate
+            for candidate in archive.get("items", [])
+            if isinstance(candidate, dict) and candidate.get("id") == conversation_id
+        ),
+        None,
+    )
+    if item is None:
+        raise ValueError("未找到历史对话。")
+    return {
+        "conversation_id": conversation_id,
+        "title": str(item.get("title") or "未命名对话"),
+        "files": conversation_file_items(item),
+    }
+
+
+def conversation_file_items(item: dict[str, Any]) -> list[dict[str, Any]]:
+    storage_root = account_workspace_root()
+    workspace = WorkspaceFiles(storage_root)
+    raw_paths: list[str] = []
+    stored_paths = item.get("filePaths")
+    if isinstance(stored_paths, list):
+        raw_paths.extend(str(path) for path in stored_paths if isinstance(path, str))
+
+    messages = item.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                raw_paths.extend(extract_conversation_message_paths(message["content"]))
+
+    activities = item.get("activities")
+    project_id = str(item.get("projectId") or "").strip()
+    project_sources_prefix = (
+        f"meet_files/projects/{project_id}/sources/"
+        if PROJECT_ID_PATTERN.fullmatch(project_id)
+        else ""
+    )
+    if isinstance(activities, dict):
+        for record in activities.values():
+            if not isinstance(record, dict) or not isinstance(record.get("events"), list):
+                continue
+            for event in record["events"]:
+                if not isinstance(event, dict):
+                    continue
+                file_path = event.get("file_path")
+                if isinstance(file_path, str):
+                    raw_paths.extend(split_workspace_reference_candidates(file_path))
+                tool_name = str(event.get("tool_name") or "")
+                title = str(event.get("title") or "")
+                if (
+                    project_sources_prefix
+                    and tool_name == "list_workspace_files"
+                    and event.get("phase") == "observation"
+                    and isinstance(event.get("detail"), str)
+                ):
+                    raw_paths.extend(
+                        path
+                        for path in extract_workspace_paths(event["detail"])
+                        if path.startswith(project_sources_prefix)
+                    )
+                is_file_output = (
+                    event.get("activity_type") == "file_edit"
+                    or tool_name
+                    in {
+                        "write_text_file",
+                        "edit_text_file",
+                        "apply_unified_patch",
+                        "create_docx_from_markdown",
+                        "create_pdf_from_markdown",
+                        "create_pptx_from_outline",
+                        "create_xlsx",
+                    }
+                    or any(word in title for word in ("生成DOCX", "生成PDF", "生成PPT", "生成表格"))
+                )
+                if not is_file_output:
+                    continue
+                for key in ("detail", "content"):
+                    value = event.get(key)
+                    if isinstance(value, str):
+                        raw_paths.extend(extract_workspace_paths(value))
+
+    files: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_path in raw_paths:
+        try:
+            path = workspace.resolve(raw_path)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not path.is_file() or not is_conversation_file_visible(path):
+            continue
+        relative = account_relative_path(path)
+        if relative in seen:
+            continue
+        seen.add(relative)
+        files.append(file_item_payload(path))
+    files.sort(key=lambda file: (int(file["modified"]), str(file["name"])), reverse=True)
+    return files
+
+
+def extract_conversation_message_paths(text: str) -> list[str]:
+    paths = extract_workspace_paths(text)
+    paths.extend(
+        match.group(1).strip()
+        for match in re.finditer(
+            r"`((?:meet_files|meeting_audio_minutes|产出材料|分析材料|学习笔记)/[^`\r\n]+)`",
+            text,
+        )
+    )
+    paths.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"(?m)^-\s*\[[^\]]+\]\s*[^:\r\n]+:\s*(.+?)\s*$", text)
+    )
+    return paths
+
+
+def is_conversation_file_visible(path: Path) -> bool:
+    try:
+        relative = path.relative_to(account_workspace_root())
+    except ValueError:
+        return False
+    if any(part.startswith(".") for part in relative.parts):
+        return False
+    if path.name in {"manifest.json", "project.json"}:
+        return False
+    if is_attachment_file(path):
+        return True
+    if not relative.parts or relative.parts[0] not in {
+        "meet_files",
+        "meeting_audio_minutes",
+        "产出材料",
+        "分析材料",
+        "学习笔记",
+    }:
+        return False
+    blocked_parts = {"conversation_history", "file_previews", "asr_sessions", "model_cache"}
+    if any(part in blocked_parts for part in relative.parts):
+        return False
+    visible_extensions = {
+        *FILE_LIBRARY_OUTPUT_EXTENSIONS,
+        *TEXT_PREVIEW_EXTENSIONS,
+        *IMAGE_PREVIEW_EXTENSIONS,
+        *AUDIO_PREVIEW_EXTENSIONS,
+        *VIDEO_PREVIEW_EXTENSIONS,
+    }
+    return path.suffix.lower() in visible_extensions
+
+
+def sync_conversation_files_to_project(
+    conversation: dict[str, Any],
+    project: dict[str, Any],
+) -> dict[str, Any]:
+    project_id = sanitize_project_id(project.get("id"))
+    conversation_id = sanitize_conversation_id(conversation.get("id"))
+    files = conversation_file_items(conversation)
+    if not files:
+        return {"files": [], "copied_count": 0, "unchanged_count": 0}
+
+    storage_root = account_workspace_root()
+    workspace = WorkspaceFiles(storage_root)
+    project_sources = (project_dir(project_id) / "sources").resolve()
+    folder_name = sanitize_filename(str(conversation.get("title") or "未命名对话"))[:60]
+    target_dir = project_sources / "聊天文件" / f"{folder_name}-{conversation_id[-8:]}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    name_counts: dict[str, int] = {}
+    for file in files:
+        name = str(file["name"])
+        name_counts[name] = name_counts.get(name, 0) + 1
+
+    synced_files: list[dict[str, Any]] = []
+    copied_count = 0
+    unchanged_count = 0
+    for file in files:
+        source = workspace.resolve(str(file["path"]))
+        try:
+            source.relative_to(project_sources)
+            target = source
+        except ValueError:
+            name = source.name
+            if name_counts.get(name, 0) > 1:
+                digest = hashlib.sha256(str(file["path"]).encode("utf-8")).hexdigest()[:8]
+                name = f"{source.stem}-{digest}{source.suffix}"
+            target = target_dir / name
+
+        if target == source or (target.is_file() and files_have_same_content(source, target)):
+            unchanged_count += 1
+        else:
+            shutil.copy2(source, target)
+            copied_count += 1
+        synced_files.append(file_item_payload(target))
+
+    now = int(time.time())
+    syncs = project.get("conversation_file_syncs")
+    if not isinstance(syncs, dict):
+        syncs = {}
+    syncs[conversation_id] = {
+        "title": str(conversation.get("title") or "未命名对话"),
+        "synced_at": now,
+        "source_files": [str(file["path"]) for file in files],
+        "project_files": [str(file["path"]) for file in synced_files],
+    }
+    project["conversation_file_syncs"] = syncs
+    project["updated_at"] = now
+    write_project(project)
+    return {
+        "files": synced_files,
+        "copied_count": copied_count,
+        "unchanged_count": unchanged_count,
+    }
 
 
 def projects_root() -> Path:
