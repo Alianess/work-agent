@@ -19,5 +19,8 @@ reportlab==4.4.9
 xlsxwriter==3.2.9
 
 # Skill/runtime helpers
+mlx-embeddings==0.1.0
+numpy==2.4.6
 PyYAML==6.0.3
 requests==2.34.2
+qrcode[pil]==8.2

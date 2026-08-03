@@ -2,14 +2,25 @@
 
 set -euo pipefail
 
-LABEL="com.work-agent"
 DOMAIN="gui/$(id -u)"
+PRIMARY_LABEL="com.work-agent"
+LEGACY_LABEL="com.alian.work-agent"
+
+if [[ -n "${WORK_AGENT_SERVICE_LABEL:-}" ]]; then
+  LABEL="$WORK_AGENT_SERVICE_LABEL"
+elif launchctl print "$DOMAIN/$PRIMARY_LABEL" >/dev/null 2>&1; then
+  LABEL="$PRIMARY_LABEL"
+elif launchctl print "$DOMAIN/$LEGACY_LABEL" >/dev/null 2>&1; then
+  LABEL="$LEGACY_LABEL"
+else
+  LABEL="$PRIMARY_LABEL"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SOURCE_PLIST="$WORKSPACE_ROOT/launchd/$LABEL.plist"
 TEMPLATE_PLIST="$WORKSPACE_ROOT/launchd/$LABEL.plist.template"
 TARGET_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-
 ensure_source_plist() {
   if [[ -f "$SOURCE_PLIST" ]]; then
     return 0

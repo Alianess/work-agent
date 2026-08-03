@@ -1,19 +1,46 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from work_agent_core.cross_chat_memory import CrossChatMemoryStore
 from work_agent_core.history_recall import ChatHistoryRecall, extract_query_terms, register_history_recall_tool
+from work_agent_core.retrieval_core import RetrievalBackendError
 from work_agent_core.session_store import ConversationSession, SessionStore
 from work_agent_core.tools import ToolRegistry
 
 
+class FakeRetrievalBackend:
+    enabled = True
+    embedding_model = "fake-bge-m3"
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            if any(marker in text for marker in ("滨湖宾馆", "出差住在哪里", "住宿地点")):
+                vectors.append([1.0, 0.0, 0.0])
+            elif any(marker in text for marker in ("机密代号", "隐语是什么")):
+                vectors.append([0.0, 1.0, 0.0])
+            else:
+                vectors.append([0.0, 0.0, 1.0])
+        return vectors
+
+class FailingRetrievalBackend(FakeRetrievalBackend):
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        raise RetrievalBackendError("embedding service offline")
+
 class HistoryRecallTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.rag_env = mock.patch.dict(
+            os.environ,
+            {"WORK_AGENT_HISTORY_RAG_ENABLED": "0"},
+        )
+        self.rag_env.start()
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
         self.store = SessionStore(root, session_dir=root / "conversation_history" / "sessions")
@@ -35,6 +62,7 @@ class HistoryRecallTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+        self.rag_env.stop()
 
     def test_chinese_query_generates_discriminative_bigrams(self) -> None:
         terms = extract_query_terms("回想之前示例制造的设备预算 280 万")
@@ -85,6 +113,31 @@ class HistoryRecallTests(unittest.TestCase):
         self.assertTrue(payload_all["results"])
         self.assertIn("实时转写", payload_all["results"][0]["content"])
 
+    def test_short_turn_is_recalled_with_neighboring_parent_episode(self) -> None:
+        session = ConversationSession(
+            id="episode-parent",
+            messages=[
+                {"role": "user", "content": "几点了？"},
+                {"role": "assistant", "content": "现在是 20:05。"},
+                {"role": "user", "content": "继续处理海盐计划。"},
+                {"role": "assistant", "content": "海盐计划的下一节点是周五提交报告。"},
+            ],
+        )
+        self.store.save(session)
+
+        payload = json.loads(
+            ChatHistoryRecall(self.store, session.id).search(
+                {"query": "海盐计划 周五", "scope": "current"}
+            )
+        )
+
+        result = payload["results"][0]
+        self.assertEqual(result["return_mode"], "parent_episode")
+        self.assertEqual(result["source_kind"], "recall_episode")
+        self.assertIn("几点了", result["content"])
+        self.assertIn("海盐计划", result["content"])
+        self.assertTrue(result["matched_passages"])
+
     def test_core_tool_is_bound_to_current_conversation(self) -> None:
         registry = ToolRegistry()
         register_history_recall_tool(registry, self.store, self.session.id)
@@ -117,7 +170,14 @@ class HistoryRecallTests(unittest.TestCase):
                 "SELECT count(*) FROM chat_history_fts WHERE conversation_id = ?",
                 (self.session.id,),
             ).fetchone()[0]
-        self.assertEqual(after, before + 2)
+        self.assertGreater(after, 0)
+        recall.search({"query": "二期预算", "scope": "all"})
+        with sqlite3.connect(recall.database_path) as connection:
+            repeated = connection.execute(
+                "SELECT count(*) FROM chat_history_fts WHERE conversation_id = ?",
+                (self.session.id,),
+            ).fetchone()[0]
+        self.assertEqual(repeated, after)
 
     def test_auto_scope_searches_project_chats_and_preserves_project_isolation(self) -> None:
         project_current = ConversationSession(
@@ -185,10 +245,132 @@ class HistoryRecallTests(unittest.TestCase):
         self.assertEqual(payload["scope"], "account")
         self.assertEqual(payload["results"][0]["conversation_id"], "account-other")
 
-    def test_cross_chat_summary_memory_is_returned_with_source_and_correction_state(self) -> None:
+    def test_hybrid_dense_recall_finds_semantic_match_without_shared_terms(self) -> None:
+        other = ConversationSession(
+            id="semantic-source",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "差旅安排已经确认：统一入住滨湖宾馆，接送车辆早上八点发车。",
+                }
+            ],
+            metadata={"title": "差旅安排"},
+        )
+        self.store.save(other)
+        payload = json.loads(
+            ChatHistoryRecall(
+                self.store,
+                self.session.id,
+                retrieval_backend=FakeRetrievalBackend(),
+            ).search(
+                {"query": "上次出差住在哪里", "scope": "account"}
+            )
+        )
+
+        self.assertEqual(payload["retrieval_status"]["mode"], "hybrid")
+        self.assertTrue(payload["retrieval_status"]["dense"])
+        result = next(
+            item for item in payload["results"] if item["conversation_id"] == "semantic-source"
+        )
+        self.assertIn("滨湖宾馆", result["content"])
+        self.assertIn("dense", result["matched_by"])
+
+    def test_dense_recall_uses_loaded_session_whitelist_for_project_isolation(self) -> None:
+        current = ConversationSession(
+            id="dense-project-current",
+            messages=[{"role": "user", "content": "继续。"}],
+            metadata={"project_id": "project-one"},
+        )
+        same_project = ConversationSession(
+            id="dense-project-same",
+            messages=[{"role": "assistant", "content": "本项目机密代号是松针计划。"}],
+            metadata={"project_id": "project-one"},
+        )
+        other_project = ConversationSession(
+            id="dense-project-other",
+            messages=[{"role": "assistant", "content": "其他项目机密代号是海浪计划。"}],
+            metadata={"project_id": "project-two"},
+        )
+        for session in (current, same_project, other_project):
+            self.store.save(session)
+
+        payload = json.loads(
+            ChatHistoryRecall(
+                self.store,
+                current.id,
+                project_id="project-one",
+                retrieval_backend=FakeRetrievalBackend(),
+            ).search(
+                {"query": "之前的隐语是什么", "scope": "auto", "limit": 8}
+            )
+        )
+
+        ids = {item["conversation_id"] for item in payload["results"]}
+        self.assertIn("dense-project-same", ids)
+        self.assertNotIn("dense-project-other", ids)
+
+    def test_durable_session_project_wins_over_stale_archive_project(self) -> None:
+        current = ConversationSession(
+            id="stale-current",
+            messages=[{"role": "user", "content": "继续。"}],
+            metadata={"project_id": "project-one"},
+        )
+        moved = ConversationSession(
+            id="stale-moved",
+            messages=[{"role": "assistant", "content": "迁移后的项目机密代号是海浪计划。"}],
+            metadata={"project_id": "project-two"},
+        )
+        self.store.save(current)
+        self.store.save(moved)
+        (self.store.session_dir.parent / "conversations.json").write_text(
+            json.dumps(
+                {
+                    "items": [
+                        {"id": current.id, "projectId": "project-one"},
+                        {"id": moved.id, "projectId": "project-one"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        payload = json.loads(
+            ChatHistoryRecall(
+                self.store,
+                current.id,
+                project_id="project-one",
+                retrieval_backend=FakeRetrievalBackend(),
+            ).search(
+                {"query": "项目的隐语是什么", "scope": "auto", "limit": 8}
+            )
+        )
+
+        self.assertNotIn(
+            moved.id,
+            {item["conversation_id"] for item in payload["results"]},
+        )
+
+    def test_model_failure_degrades_to_bm25_without_losing_exact_recall(self) -> None:
+        payload = json.loads(
+            ChatHistoryRecall(
+                self.store,
+                self.session.id,
+                retrieval_backend=FailingRetrievalBackend(),
+            ).search(
+                {"query": "示例制造 280 万", "scope": "compressed"}
+            )
+        )
+
+        self.assertEqual(payload["retrieval_status"]["mode"], "bm25_fallback")
+        self.assertTrue(payload["retrieval_status"]["degraded"])
+        self.assertFalse(payload["model_used"])
+        self.assertTrue(any("280 万元" in item["content"] for item in payload["results"]))
+
+    def test_explicit_core_memory_is_returned_with_source_and_correction_state(self) -> None:
         CrossChatMemoryStore(self.store).upsert_many(
             [{"kind": "fact", "content": "示例制造一期设备预算为 280 万元。"}],
             conversation_id="memory-source", conversation_title="预算讨论", source_excerpt="预算讨论原文。",
+            state="explicit",
         )
         payload = json.loads(
             ChatHistoryRecall(self.store, self.session.id).search(
@@ -198,7 +380,7 @@ class HistoryRecallTests(unittest.TestCase):
 
         memory = next(item for item in payload["memory_results"] if item["conversation_id"] == "memory-source")
         self.assertEqual(memory["conversation_title"], "预算讨论")
-        self.assertEqual(memory["state"], "automatic")
+        self.assertEqual(memory["state"], "explicit")
         self.assertIn("280 万元", memory["content"])
 
 

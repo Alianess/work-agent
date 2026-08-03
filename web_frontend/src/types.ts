@@ -65,6 +65,7 @@ export type AsrSettingsPayload = {
 };
 
 export type AgentSettingsPayload = {
+  assistant_name: string;
   nickname: string;
   occupation: string;
   details: string;
@@ -72,6 +73,115 @@ export type AgentSettingsPayload = {
   work_background: string;
   company_document_format: string;
   message?: string;
+};
+
+export type WeixinLoginState = {
+  session_id: string;
+  qr_url: string;
+  status: string;
+  expires_in?: number;
+  needs_verify_code?: boolean;
+  message?: string;
+};
+
+export type WeixinChannelStatus = {
+  channel: "weixin";
+  connected: boolean;
+  account_id: string;
+  user_id: string;
+  state: "disconnected" | "starting" | "connected" | "error" | "stopped";
+  running: boolean;
+  last_error: string;
+  last_message_at: number;
+  login: WeixinLoginState | null;
+  capabilities: {
+    direct_messages: boolean;
+    ordinary_groups: boolean;
+    text: boolean;
+    voice_transcript: boolean;
+    media: boolean;
+  };
+};
+
+export type FridayNotification = {
+  id: string;
+  kind: "reminder";
+  title: string;
+  body: string;
+  source: string;
+  created_at: number;
+  deliver_at: number;
+  delivered_at: number;
+  read_at: number;
+};
+
+export type FridayNotificationsPayload = {
+  items: FridayNotification[];
+  unread_count: number;
+};
+
+export type WorkReportMetadata = {
+  report_type: "daily" | "weekly" | "biweekly";
+  start_date: string;
+  end_date: string;
+  source_coverage?: "full" | "partial" | "external_gap";
+  needs_user_input?: boolean;
+  content_path?: string;
+  content?: string;
+  created_at?: number;
+  updated_at?: number;
+};
+
+export type WorkEvidenceItem = {
+  timestamp: number;
+  date: string;
+  conversation_id?: string;
+  conversation_title: string;
+  project_id?: string;
+  turn_id?: string;
+  user_request?: string;
+  result?: string;
+  artifacts?: string[];
+  status?: string;
+  source: "conversation_activity" | "turn_runtime" | string;
+};
+
+export type WorkCalendarDay = {
+  date: string;
+  weekday: number;
+  is_workday: boolean;
+  evidence_count: number;
+  artifact_count: number;
+  report_types: Array<"daily" | "weekly" | "biweekly">;
+};
+
+export type WorkCalendarPayload = {
+  ok: boolean;
+  year: number;
+  month: number;
+  days: WorkCalendarDay[];
+  reports: WorkReportMetadata[];
+  calendar: {
+    rule: string;
+    override_years: number[];
+    years_using_weekday_fallback: number[];
+    override_path: string;
+    source?: string;
+    document_title?: string;
+    document_number?: string;
+  };
+};
+
+export type WorkDayDetailPayload = {
+  ok: boolean;
+  date: string;
+  is_workday: boolean;
+  evidence_count: number;
+  evidence_truncated: boolean;
+  evidence: WorkEvidenceItem[];
+  daily_report: WorkReportMetadata | null;
+  covering_reports: WorkReportMetadata[];
+  calendar: WorkCalendarPayload["calendar"];
 };
 
 export type CrossChatMemory = {
@@ -83,6 +193,8 @@ export type CrossChatMemory = {
   content: string;
   source_excerpt: string;
   state: "automatic" | "explicit" | "corrected";
+  importance: number;
+  confidence: number;
   created_at: number;
   updated_at: number;
 };
@@ -90,10 +202,18 @@ export type CrossChatMemory = {
 export type CrossChatMemoriesPayload = {
   memories: CrossChatMemory[];
   count: number;
+  counts: { account: number; projects: number };
   automatic: boolean;
-  source: "automatic_memory";
+  source: "core_memory";
   enabled: boolean;
   profile: { project_id: string; content: string; updated_at: number } | null;
+  policy: {
+    account_limit: number;
+    project_limit: number;
+    minimum_user_turns: number;
+    refresh_interval_user_turns: number;
+    history_recall: string;
+  };
   project_id: string | null;
 };
 
@@ -174,10 +294,75 @@ export type ProjectSummary = {
   updated_at: number;
   root: string;
   file_count: number;
+  material_count: number;
+  hidden_file_count: number;
+};
+
+export type ProjectMaterialVersion = FileItem & {
+  category: "decision" | "deliverable" | "plan" | "meeting" | "reference" | "other";
+  category_label: string;
+  document_status: "final" | "current" | "draft" | "process";
+  document_status_label: string;
+  display_name: string;
+};
+
+export type ProjectMaterial = ProjectMaterialVersion & {
+  version_count: number;
+  history: ProjectMaterialVersion[];
+};
+
+export type ProjectMaterialGroup = {
+  id: ProjectMaterial["category"];
+  label: string;
+  count: number;
+  materials: ProjectMaterial[];
+};
+
+export type ProjectTimelineNode = {
+  row: number;
+  node_id?: string | null;
+  workstream?: string | null;
+  planned_date?: string | null;
+  actual_date?: string | null;
+  title?: string | null;
+  completion_criteria?: string | null;
+  status: string;
+  progress?: string | null;
+  next_action?: string | null;
+  owner?: string | null;
+  materials?: string | null;
+  updated_at?: string | null;
+  notes?: string | null;
+  priority?: string | null;
+  schedule_state: "completed" | "cancelled" | "risk" | "overdue" | "due_soon" | "upcoming" | "unscheduled";
+  days_until?: number | null;
+};
+
+export type ProjectTimeline = {
+  exists: boolean;
+  path?: string | null;
+  name?: string | null;
+  sheet_name?: string | null;
+  header_row?: number | null;
+  modified?: number | null;
+  nodes: ProjectTimelineNode[];
+  summary: {
+    total: number;
+    completed: number;
+    in_progress: number;
+    risk: number;
+    overdue: number;
+    scheduled: number;
+    unscheduled: number;
+    completion_rate: number;
+  };
+  error?: string | null;
 };
 
 export type Project = ProjectSummary & {
   files: FileItem[];
+  material_groups: ProjectMaterialGroup[];
+  timeline: ProjectTimeline | null;
 };
 
 export type ProjectsPayload = {
@@ -352,7 +537,12 @@ export type AgentActivityEvent = {
   title: string;
   detail?: string;
   content?: string;
-  activity_type?: "command" | "file_edit";
+  input_summary?: string;
+  result_summary?: string;
+  activity_type?: "command" | "file_edit" | "work_note" | "runtime_summary" | "plan" | "approval_review";
+  plan?: Array<{ step: string; status: "pending" | "in_progress" | "completed" }>;
+  plan_completed?: number;
+  plan_total?: number;
   command?: string;
   command_status?: "running" | "success" | "error" | "approval_required";
   risk_category?: "READ" | "MODIFY" | "EXECUTE" | "NETWORK" | "DELETE" | "SYSTEM" | string;
@@ -401,7 +591,12 @@ export type AgentStreamEvent =
       content: string;
       append_mode?: "append" | "replace";
       detail?: string;
-      activity_type?: "command" | "file_edit";
+      input_summary?: string;
+      result_summary?: string;
+      activity_type?: "command" | "file_edit" | "work_note" | "runtime_summary" | "plan" | "approval_review";
+      plan?: Array<{ step: string; status: "pending" | "in_progress" | "completed" }>;
+      plan_completed?: number;
+      plan_total?: number;
       command?: string;
       command_status?: "running" | "success" | "error" | "approval_required";
       risk_category?: "READ" | "MODIFY" | "EXECUTE" | "NETWORK" | "DELETE" | "SYSTEM" | string;

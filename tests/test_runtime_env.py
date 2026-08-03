@@ -9,7 +9,12 @@ from pathlib import Path
 from work_agent_core.docx_exporter import create_docx, resolve_document_title
 from work_agent_core.progress import command_heartbeat_text
 from work_agent_core.office_preview import find_soffice
-from work_agent_core.shell_tools import ShellExecutionTools, safe_environment
+from work_agent_core.shell_tools import (
+    ShellExecutionTools,
+    approval_action_id,
+    issue_internal_approval_grant,
+    safe_environment,
+)
 from work_agent_core.skill_manifest import office_python, probe_skill_environment
 from work_agent_core.skill_runtime import render_skill_tool_arguments
 from work_agent_core import web_server
@@ -32,10 +37,20 @@ class RuntimeEnvironmentTests(unittest.TestCase):
         self.assertEqual(environment["PIP_REQUIRE_VIRTUALENV"], "true")
 
     def test_bare_python_command_uses_project_venv(self) -> None:
+        action_id = approval_action_id(
+            command="python3 -c \"import sys; print(sys.executable)\"",
+            cwd=str(self.workspace_root.resolve()),
+            timeout_seconds=120,
+        )
         result = ShellExecutionTools(self.workspace_root).execute(
             {
                 "command": "python3 -c \"import sys; print(sys.executable)\"",
-                "approved_by_user": True,
+                "_approval_source": "user",
+                "_approval_action_id": action_id,
+                "_approval_grant": issue_internal_approval_grant(
+                    action_id=action_id,
+                    source="user",
+                ),
             }
         )
         payload = json.loads(result)

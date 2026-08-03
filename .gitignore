@@ -19,6 +19,7 @@ web_frontend/dist/
 outputs/
 # Private user data, recordings, generated artifacts, traces, browser state, and caches.
 meet_files/
+work_reports/
 tmp/
 .playwright-mcp/
 .codex_tmp/

@@ -12,6 +12,7 @@ import type {
   FilePayload,
   FileItem,
   FilesPayload,
+  FridayNotificationsPayload,
   MeetingArchivesPayload,
   MeetingResult,
   MeetingMinutesSettingsPayload,
@@ -27,7 +28,11 @@ import type {
   SpeechTranscriptionPayload,
   TemporarySyncFile,
   TemporarySyncPayload,
-  ToolsPayload
+  ToolsPayload,
+  WeixinChannelStatus,
+  WeixinLoginState,
+  WorkCalendarPayload,
+  WorkDayDetailPayload
 } from "./types";
 
 export type AuthUser = {
@@ -98,6 +103,46 @@ export const api = {
   models: () => requestJson<ModelsPayload>("/api/models"),
   asrSettings: () => requestJson<AsrSettingsPayload>("/api/settings/asr"),
   agentSettings: () => requestJson<AgentSettingsPayload>("/api/settings/agent"),
+  weixinStatus: () => requestJson<WeixinChannelStatus>("/api/channels/weixin"),
+  startWeixinLogin: (force = false) =>
+    requestJson<WeixinLoginState>("/api/channels/weixin/login/start", {
+      method: "POST",
+      body: JSON.stringify({ force })
+    }),
+  pollWeixinLogin: (sessionId: string, verifyCode = "") =>
+    requestJson<
+      | (WeixinLoginState & { connected: false; needs_verify_code?: boolean })
+      | {
+          connected: true;
+          status: "connected";
+          account_id: string;
+          user_id: string;
+          message: string;
+        }
+    >("/api/channels/weixin/login/poll", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId, verify_code: verifyCode })
+    }),
+  disconnectWeixin: () =>
+    requestJson<{ ok: boolean; connected: false; message: string }>("/api/channels/weixin/disconnect", {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  notifications: () => requestJson<FridayNotificationsPayload>("/api/notifications"),
+  workReportCalendar: (year: number, month: number) =>
+    requestJson<WorkCalendarPayload>(`/api/work-reports/calendar?year=${year}&month=${month}`),
+  workReportDay: (date: string) =>
+    requestJson<WorkDayDetailPayload>(`/api/work-reports/day?date=${encodeURIComponent(date)}`),
+  markNotificationsRead: (id?: string) =>
+    requestJson<FridayNotificationsPayload>("/api/notifications/read", {
+      method: "POST",
+      body: JSON.stringify(id ? { id } : { all: true })
+    }),
+  deleteNotification: (id: string) =>
+    requestJson<FridayNotificationsPayload>("/api/notifications/delete", {
+      method: "POST",
+      body: JSON.stringify({ id })
+    }),
   meetingMinutesSettings: () => requestJson<MeetingMinutesSettingsPayload>("/api/settings/meeting-minutes"),
   tools: () => requestJson<ToolsPayload>("/api/tools"),
   debugTraces: (params?: { conversation_id?: string; trace_id?: string; limit?: number }) => {
@@ -217,7 +262,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
-  saveAgentSettings: (payload: { work_background: string; company_document_format: string }) =>
+  saveAgentSettings: (payload: AgentSettingsPayload) =>
     requestJson<AgentSettingsPayload>("/api/settings/agent", {
       method: "POST",
       body: JSON.stringify(payload)
@@ -253,6 +298,7 @@ export const api = {
     messages: ChatMessage[];
     profile: string;
     reasoning_effort: ReasoningEffort;
+    auto_approve?: boolean;
     skill_hint?: string | null;
     conversation_summary?: string | null;
     conversation_summary_message_count?: number;
@@ -270,6 +316,7 @@ export const api = {
       messages: ChatMessage[];
       profile: string;
       reasoning_effort: ReasoningEffort;
+      auto_approve?: boolean;
       skill_hint?: string | null;
       conversation_summary?: string | null;
       conversation_summary_message_count?: number;
@@ -284,13 +331,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
-  conversations: () => requestJson<{ items: unknown[] }>("/api/conversations"),
+  conversations: () => requestJson<{ items: unknown[]; revision: number }>("/api/conversations"),
   conversationFiles: (conversationId: string) =>
     requestJson<{ conversation_id: string; title: string; files: FileItem[] }>(
       `/api/conversations/${encodeURIComponent(conversationId)}/files`
     ),
-  saveConversations: (payload: { items: unknown[] }) =>
-    requestJson<{ ok: boolean; path: string; count: number }>("/api/conversations/save", {
+  saveConversations: (payload: {
+    base_revision?: number;
+    upserts?: unknown[];
+    deleted_ids?: string[];
+    items?: unknown[];
+  }) =>
+    requestJson<{
+      ok: boolean;
+      conflict?: boolean;
+      path?: string;
+      count: number;
+      revision: number;
+      items?: unknown[];
+    }>("/api/conversations/save", {
       method: "POST",
       body: JSON.stringify(payload)
     }),
@@ -344,6 +403,32 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ manifest_path: manifestPath })
     }),
+  createProjectTimeline: (projectId: string) =>
+    requestJson<{ ok: boolean; project: Project }>(
+      `/api/projects/${encodeURIComponent(projectId)}/timeline/create`,
+      { method: "POST", body: JSON.stringify({}) }
+    ),
+  selectProjectTimeline: (projectId: string, path: string) =>
+    requestJson<{ ok: boolean; project: Project }>(
+      `/api/projects/${encodeURIComponent(projectId)}/timeline/select`,
+      { method: "POST", body: JSON.stringify({ path }) }
+    ),
+  updateProjectTimeline: (
+    projectId: string,
+    changes: Array<{
+      action: "add" | "update" | "delete";
+      match?: Record<string, unknown>;
+      values?: Record<string, unknown>;
+      delete_mode?: "soft" | "row";
+    }>
+  ) =>
+    requestJson<{ ok: boolean; project: Project; result: unknown }>(
+      `/api/projects/${encodeURIComponent(projectId)}/timeline/changes`,
+      {
+        method: "POST",
+        body: JSON.stringify({ changes, change_source: "项目页面" })
+      }
+    ),
   generateMinutes: (payload: {
     transcript_path: string;
     output_dir: string;

@@ -9,7 +9,7 @@ import threading
 import time
 
 
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 DEFAULT_SESSION_DIR = Path("meet_files/conversation_history/sessions")
 
 
@@ -19,6 +19,8 @@ class ConversationSession:
     messages: list[dict[str, Any]] = field(default_factory=list)
     summary: str = ""
     summary_message_count: int = 0
+    recall_episodes: list[dict[str, Any]] = field(default_factory=list)
+    compaction_events: list[dict[str, Any]] = field(default_factory=list)
     created_at: int = field(default_factory=lambda: int(time.time()))
     updated_at: int = field(default_factory=lambda: int(time.time()))
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -31,6 +33,8 @@ class ConversationSession:
             "updated_at": int(time.time()),
             "summary": self.summary,
             "summary_message_count": self.summary_message_count,
+            "recall_episodes": self.recall_episodes,
+            "compaction_events": self.compaction_events,
             "messages": repair_runtime_message_sequence(
                 [message for message in (sanitize_runtime_message(item) for item in self.messages) if message]
             ),
@@ -46,6 +50,14 @@ class ConversationSession:
             messages=repair_runtime_message_sequence(cleaned_messages),
             summary=str(payload.get("summary") or ""),
             summary_message_count=max(0, int(payload.get("summary_message_count") or 0)),
+            recall_episodes=[
+                item for item in (payload.get("recall_episodes") or [])
+                if isinstance(item, dict)
+            ],
+            compaction_events=[
+                item for item in (payload.get("compaction_events") or [])
+                if isinstance(item, dict)
+            ],
             created_at=max(0, int(payload.get("created_at") or time.time())),
             updated_at=max(0, int(payload.get("updated_at") or time.time())),
             metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
@@ -56,8 +68,9 @@ class SessionStore:
     """Persistent per-conversation working memory store.
 
     This is deliberately conversation-scoped runtime state, not long-term user
-    memory. It stores raw model messages including assistant tool_calls and tool
-    results so later turns can continue from actual agent state.
+    memory. Active messages keep exact ReAct state. Once a compression checkpoint
+    covers a completed turn, reproducible tool bulk may be folded while a dense
+    recall episode preserves the public implementation path and outcome.
     """
 
     def __init__(self, workspace_root: str | Path, *, session_dir: str | Path = DEFAULT_SESSION_DIR) -> None:
@@ -94,6 +107,12 @@ class SessionStore:
             0,
             min(int(session.summary_message_count or 0), len(session.messages)),
         )
+        session.recall_episodes = [
+            item for item in session.recall_episodes if isinstance(item, dict)
+        ]
+        session.compaction_events = [
+            item for item in session.compaction_events if isinstance(item, dict)
+        ][-64:]
         session.updated_at = int(time.time())
         path = self._path_for(session.id)
         with self._lock:
@@ -145,6 +164,8 @@ class SessionStore:
         session.messages = []
         session.summary = ""
         session.summary_message_count = 0
+        session.recall_episodes = []
+        session.compaction_events = []
         return self.bootstrap_from_display_messages(
             session,
             display_messages,
@@ -188,6 +209,12 @@ class SessionStore:
         # safer than leaking discarded context into the new branch.
         session.summary = ""
         session.summary_message_count = 0
+        session.recall_episodes = [
+            episode
+            for episode in session.recall_episodes
+            if int(episode.get("end_message_index") or 0) <= cut_index
+        ]
+        session.compaction_events = []
 
     def _path_for(self, conversation_id: str) -> Path:
         return self.session_dir / f"{conversation_id}.json"

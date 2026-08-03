@@ -1,7 +1,9 @@
 import {
   AlertCircle,
   AtSign,
+  Bell,
   Brain,
+  CalendarDays,
   Check,
   ChevronDown,
   ChevronRight,
@@ -36,6 +38,7 @@ import {
   Search,
   SendHorizontal,
   Settings2,
+  ShieldCheck,
   Sparkles,
   Trash2,
   Upload,
@@ -57,6 +60,7 @@ import type {
   CrossChatMemory,
   FileItem,
   FilePayload,
+  FridayNotificationsPayload,
   MeetingArchive,
   MeetingTime,
   MeetingResult,
@@ -64,22 +68,54 @@ import type {
   ModelsPayload,
   ModelProfile,
   Project,
+  ProjectMaterial,
   ProjectSummary,
+  ProjectTimelineNode,
   ReasoningEffort,
   SkillInfo,
   SkillInstructionsPayload,
   TemporarySyncPayload,
-  ToolsPayload
+  ToolsPayload,
+  WeixinChannelStatus,
+  WeixinLoginState,
+  WorkCalendarPayload,
+  WorkDayDetailPayload
 } from "./types";
 
-type View = "agent" | "projects" | "skills" | "artifacts" | "models" | "transcribe" | "more" | "sync";
+type View = "agent" | "friday" | "projects" | "skills" | "artifacts" | "models" | "transcribe" | "more" | "sync" | "work-calendar";
 type ArtifactTab = "meeting" | "files";
+type ProjectDetailTab = "chat" | "timeline" | "files";
 type FileFilter = "all" | "audio" | "image" | "document" | "output";
 type StatusTone = "idle" | "success" | "error" | "loading";
 type RealtimeTranscriptionStatus = "idle" | "recording" | "processing" | "error";
 type ModelProviderPresetId = "openai-compatible" | "openai" | "deepseek" | "openrouter";
 type ComposerSubmenu = "model" | "reasoning" | "advanced" | null;
 type ModelEditorMode = "add" | "edit" | null;
+type TimelineEditorValues = {
+  node_id: string;
+  workstream: string;
+  planned_date: string;
+  title: string;
+  completion_criteria: string;
+  status: string;
+  progress: string;
+  next_action: string;
+  owner: string;
+  materials: string;
+  actual_date: string;
+  notes: string;
+};
+type TimelineEditorState = {
+  mode: "add" | "edit";
+  row?: number;
+  values: TimelineEditorValues;
+  original?: TimelineEditorValues;
+};
+type TimelineCompletionState = {
+  node: ProjectTimelineNode;
+  note: string;
+  materialPaths: string[];
+};
 
 const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string; shortLabel: string }> = [
   { value: "light", label: "轻度", shortLabel: "轻" },
@@ -88,6 +124,22 @@ const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string; shortLab
   { value: "very_high", label: "极高", shortLabel: "极高" }
 ];
 const REASONING_STORAGE_KEY = "work-agent-reasoning-effort";
+const AUTO_APPROVE_STORAGE_KEY = "work-agent-auto-approve";
+const TIMELINE_STATUS_OPTIONS = ["未开始", "推进中", "待确认", "有风险", "已完成", "已取消"];
+const EMPTY_TIMELINE_VALUES: TimelineEditorValues = {
+  node_id: "",
+  workstream: "",
+  planned_date: "",
+  title: "",
+  completion_criteria: "",
+  status: "未开始",
+  progress: "",
+  next_action: "",
+  owner: "",
+  materials: "",
+  actual_date: "",
+  notes: ""
+};
 
 const MODEL_PROVIDER_PRESETS: Record<
   ModelProviderPresetId,
@@ -186,6 +238,7 @@ type QueuedChatItem = {
   content: string;
   attachments: AttachmentItem[];
   skill: SkillInfo | null;
+  autoApprove: boolean;
 };
 type ActiveChatRun = {
   abortController: AbortController;
@@ -201,7 +254,7 @@ type RunChatMessageOptions = {
   conversationSummaryMessageCount?: number;
   rewindUserMessageOrdinal?: number;
 };
-type ActivityDisplayGroupKind = "commands" | "files" | "tools";
+type ActivityDisplayGroupKind = "work";
 type ActivityDisplayItem =
   | { kind: "event"; key: string; event: AgentActivityEvent }
   | {
@@ -249,6 +302,7 @@ const fileFilterOptions: Array<{ id: FileFilter; label: string }> = [
 ];
 
 const conversationStorageKey = "work-agent-conversation-history";
+const FRIDAY_CONVERSATION_ID = "friday-main";
 const pendingConversationTitle = "待命名对话";
 const untitledConversationTitle = "待命名对话";
 const toolCallMarkupPattern = /<\/?\s*(?:tool_calls?|工具调用(?:列表)?)(?=[\s>/])/i;
@@ -282,9 +336,11 @@ function initialView(): View {
     query === "projects" ||
     query === "artifacts" ||
     query === "agent" ||
+    query === "friday" ||
     query === "transcribe" ||
     query === "more" ||
-    query === "sync"
+    query === "sync" ||
+    query === "work-calendar"
   ) {
     return query;
   }
@@ -292,11 +348,25 @@ function initialView(): View {
   return "agent";
 }
 
+function initialProjectRoute(): { projectId: string; tab: ProjectDetailTab } | null {
+  const params = new URLSearchParams(window.location.search);
+  const projectId = params.get("project")?.trim();
+  if (!projectId) return null;
+  const rawTab = params.get("projectTab");
+  const tab: ProjectDetailTab =
+    rawTab === "timeline" || rawTab === "files" || rawTab === "chat" ? rawTab : "chat";
+  return { projectId, tab };
+}
+
 function loadReasoningEffort(): ReasoningEffort {
   const saved = window.localStorage.getItem(REASONING_STORAGE_KEY);
   return REASONING_OPTIONS.some((option) => option.value === saved)
     ? (saved as ReasoningEffort)
     : "medium";
+}
+
+function loadAutoApprove(): boolean {
+  return window.localStorage.getItem(AUTO_APPROVE_STORAGE_KEY) === "true";
 }
 
 function reasoningOption(value: ReasoningEffort) {
@@ -363,9 +433,17 @@ export default function App() {
   const [models, setModels] = useState<ModelsPayload | null>(null);
   const [asrSettings, setAsrSettings] = useState<AsrSettingsPayload | null>(null);
   const [agentSettings, setAgentSettings] = useState<AgentSettingsPayload | null>(null);
+  const [weixinStatus, setWeixinStatus] = useState<WeixinChannelStatus | null>(null);
+  const [weixinBusy, setWeixinBusy] = useState(false);
+  const [weixinVerifyCode, setWeixinVerifyCode] = useState("");
+  const [notifications, setNotifications] = useState<FridayNotificationsPayload>({
+    items: [],
+    unread_count: 0
+  });
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [meetingMinutesSettings, setMeetingMinutesSettings] = useState<MeetingMinutesSettingsPayload | null>(null);
   const [crossChatMemories, setCrossChatMemories] = useState<CrossChatMemory[]>([]);
-  const [memoryProfile, setMemoryProfile] = useState<{ content: string; updated_at: number } | null>(null);
+  const [memoryManagerOpen, setMemoryManagerOpen] = useState(false);
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryScope, setMemoryScope] = useState<"all" | "account" | "projects">("all");
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
@@ -386,6 +464,12 @@ export default function App() {
   const temporarySyncRequestRef = useRef(0);
   const [temporarySyncBusy, setTemporarySyncBusy] = useState(false);
   const [temporarySyncClock, setTemporarySyncClock] = useState(Date.now());
+  const todayIso = new Date().toLocaleDateString("sv-SE");
+  const [workCalendarCursor, setWorkCalendarCursor] = useState(todayIso.slice(0, 7));
+  const [workCalendar, setWorkCalendar] = useState<WorkCalendarPayload | null>(null);
+  const [selectedWorkDate, setSelectedWorkDate] = useState(todayIso);
+  const [workDayDetail, setWorkDayDetail] = useState<WorkDayDetailPayload | null>(null);
+  const [workCalendarLoading, setWorkCalendarLoading] = useState(false);
   const [meetingArchives, setMeetingArchives] = useState<MeetingArchive[]>([]);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -395,7 +479,13 @@ export default function App() {
   const [projectCreateForm, setProjectCreateForm] = useState({ name: "", instructions: "" });
   const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
   const [projectSettingsForm, setProjectSettingsForm] = useState({ name: "", instructions: "" });
-  const [projectDetailTab, setProjectDetailTab] = useState<"chat" | "files">("chat");
+  const initialProjectRouteRef = useRef(initialProjectRoute());
+  const projectRouteRestoredRef = useRef(false);
+  const [projectDetailTab, setProjectDetailTab] = useState<ProjectDetailTab>(
+    initialProjectRouteRef.current?.tab ?? "chat"
+  );
+  const [timelineEditor, setTimelineEditor] = useState<TimelineEditorState | null>(null);
+  const [timelineCompletion, setTimelineCompletion] = useState<TimelineCompletionState | null>(null);
   const [projectChatDraft, setProjectChatDraft] = useState("");
   const [meetingSyncOpen, setMeetingSyncOpen] = useState(false);
   const [meetingSyncProjectId, setMeetingSyncProjectId] = useState("");
@@ -419,8 +509,7 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
-      content:
-        "你好，我是本地工作智能体。你可以直接和我对话，也可以让我读取工作区文件、生成会议纪要或整理当前项目。"
+      content: fridayGreeting("Friday")
     }
   ]);
   const [chatInput, setChatInput] = useState("");
@@ -428,7 +517,7 @@ export default function App() {
   const [editMessageDraft, setEditMessageDraft] = useState("");
   const [conversationHistory, setConversationHistory] = useState<ConversationHistoryItem[]>([]);
   const conversationHistoryRef = useRef<ConversationHistoryItem[]>(conversationHistory);
-  const [currentConversationId, setCurrentConversationId] = useState(() => createConversationId());
+  const [currentConversationId, setCurrentConversationId] = useState(FRIDAY_CONVERSATION_ID);
   const [conversationSummary, setConversationSummary] = useState("");
   const [conversationSummaryMessageCount, setConversationSummaryMessageCount] = useState(0);
   const [activeChatTurnIndex, setActiveChatTurnIndex] = useState<number | null>(null);
@@ -459,6 +548,11 @@ export default function App() {
   const chatMessagesRef = useRef<ChatMessage[]>(chatMessages);
   const titleGenerationInFlightRef = useRef<Set<string>>(new Set());
   const conversationArchiveReadyRef = useRef(false);
+  const conversationArchiveRevisionRef = useRef(0);
+  const conversationArchiveShadowRef = useRef<ConversationHistoryItem[]>([]);
+  const conversationArchivePendingRef = useRef<ConversationHistoryItem[] | null>(null);
+  const conversationArchiveSavingRef = useRef(false);
+  const conversationArchiveSaveTimerRef = useRef<number | null>(null);
   const [speechSupported, setSpeechSupported] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -508,6 +602,7 @@ export default function App() {
   const [composerModelMenuOpen, setComposerModelMenuOpen] = useState(false);
   const [composerSubmenu, setComposerSubmenu] = useState<ComposerSubmenu>(null);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(loadReasoningEffort);
+  const [autoApprove, setAutoApprove] = useState(loadAutoApprove);
   const composerModelMenuRef = useRef<HTMLDivElement | null>(null);
   const [meetingOutputKey, setMeetingOutputKey] = useState("");
   const [meetingResult, setMeetingResult] = useState<MeetingResult | null>(null);
@@ -551,6 +646,7 @@ export default function App() {
     hotwords: ""
   });
   const [agentSettingsForm, setAgentSettingsForm] = useState({
+    assistant_name: "Friday",
     nickname: "",
     occupation: "",
     details: "",
@@ -587,11 +683,36 @@ export default function App() {
 
   useEffect(() => {
     if (authState !== "authenticated" || !currentUser) return;
+    if (conversationArchiveSaveTimerRef.current !== null) {
+      window.clearTimeout(conversationArchiveSaveTimerRef.current);
+      conversationArchiveSaveTimerRef.current = null;
+    }
     conversationArchiveReadyRef.current = false;
-    const localHistory = loadConversationHistory(currentUser.username);
+    conversationArchiveRevisionRef.current = 0;
+    conversationArchiveShadowRef.current = [];
+    conversationArchivePendingRef.current = null;
+    conversationArchiveSavingRef.current = false;
+    const localHistory = ensureFridayConversation(
+      loadConversationHistory(currentUser.username),
+      "Friday"
+    );
     conversationHistoryRef.current = localHistory;
     setConversationHistory(localHistory);
-    setCurrentConversationId(createConversationId());
+    const requestedView = initialView();
+    if (requestedView === "friday") {
+      const friday = localHistory.find((item) => item.id === FRIDAY_CONVERSATION_ID)!;
+      openFridayConversationItem(friday);
+    } else {
+      const recentTask = localHistory.find((item) => item.id !== FRIDAY_CONVERSATION_ID);
+      if (recentTask) {
+        openConversation(recentTask);
+      } else {
+        startNewChat();
+      }
+    }
+    if (requestedView !== "agent" && requestedView !== "friday") {
+      setViewWithUrl(requestedView);
+    }
     void refreshAll();
     void restoreConversationArchive();
   }, [authState, currentUser?.id]);
@@ -610,6 +731,76 @@ export default function App() {
       window.clearInterval(clockTimer);
     };
   }, [authState, view]);
+
+  useEffect(() => {
+    if (authState !== "authenticated" || view !== "work-calendar") return;
+    void refreshWorkCalendar();
+  }, [authState, view, workCalendarCursor]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") return;
+    const poll = () => {
+      void api.notifications().then(setNotifications).catch(() => undefined);
+      if (view === "friday") {
+        void restoreConversationArchive();
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 30_000);
+    return () => window.clearInterval(timer);
+  }, [authState, view]);
+
+  useEffect(() => {
+    const login = weixinStatus?.login;
+    if (!login?.session_id || login.needs_verify_code) return;
+    let cancelled = false;
+    const poll = async () => {
+      while (!cancelled) {
+        try {
+          const result = await api.pollWeixinLogin(login.session_id);
+          if (cancelled) return;
+          if (result.connected) {
+            const nextStatus = await api.weixinStatus();
+            if (cancelled) return;
+            setWeixinStatus(nextStatus);
+            setStatus({ tone: "success", text: result.message || "微信已连接" });
+            return;
+          }
+          setWeixinStatus((current) =>
+            current
+              ? {
+                  ...current,
+                  login: {
+                    session_id: result.session_id,
+                    qr_url: result.qr_url,
+                    status: result.status,
+                    needs_verify_code: result.needs_verify_code,
+                    message: result.message
+                  }
+                }
+              : current
+          );
+          if (
+            result.needs_verify_code ||
+            result.status === "expired" ||
+            result.status === "verify_code_blocked"
+          ) {
+            return;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        } catch (error) {
+          if (!cancelled) {
+            setStatus({ tone: "error", text: explainError(error) });
+          }
+          return;
+        }
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+    };
+  }, [weixinStatus?.login?.session_id, weixinStatus?.login?.needs_verify_code]);
 
   useEffect(() => {
     chatMessagesRef.current = chatMessages;
@@ -632,11 +823,16 @@ export default function App() {
     if (!currentUser) return;
     saveConversationHistory(conversationHistory, currentUser.username);
     if (conversationArchiveReadyRef.current) {
-      void api.saveConversations({ items: conversationHistory }).catch(() => {
-        // The browser copy is still kept if the workspace archive is temporarily unavailable.
-      });
+      queueConversationArchiveSave(conversationHistory);
     }
   }, [conversationHistory, currentUser?.id]);
+
+  useEffect(() => {
+    if (!agentSettings?.assistant_name) return;
+    setConversationHistory((items) =>
+      ensureFridayConversation(items, agentSettings.assistant_name)
+    );
+  }, [agentSettings?.assistant_name]);
 
   useEffect(() => {
     const candidates = conversationHistory.filter(shouldGenerateModelTitle);
@@ -670,13 +866,17 @@ export default function App() {
 
   useEffect(() => {
     if (!models) return;
-    setAgentForm((form) => ({ ...form, profile: form.profile || models.default_profile }));
-    setMeetingForm((form) => ({ ...form, profile: form.profile || models.default_profile }));
+    setAgentForm((form) => ({ ...form, profile: models.default_profile }));
+    setMeetingForm((form) => ({ ...form, profile: models.default_profile }));
   }, [models]);
 
   useEffect(() => {
     window.localStorage.setItem(REASONING_STORAGE_KEY, reasoningEffort);
   }, [reasoningEffort]);
+
+  useEffect(() => {
+    window.localStorage.setItem(AUTO_APPROVE_STORAGE_KEY, String(autoApprove));
+  }, [autoApprove]);
 
   useEffect(() => {
     if (!composerModelMenuOpen) return;
@@ -706,7 +906,7 @@ export default function App() {
   }, [activityRunning]);
 
   useEffect(() => {
-    if (view !== "agent" || !pendingChatScrollToBottomRef.current) return;
+    if ((view !== "agent" && view !== "friday") || !pendingChatScrollToBottomRef.current) return;
     pendingChatScrollToBottomRef.current = false;
     scheduleChatScrollToBottom();
   }, [view, currentConversationId, chatMessages.length]);
@@ -731,10 +931,6 @@ export default function App() {
     };
   }, [historyMenu]);
 
-  const keyReadyCount = useMemo(
-    () => profiles.filter((profile) => profile.api_key_configured).length,
-    [profiles]
-  );
   const skillQuery = useMemo(() => parseSkillQuery(chatInput), [chatInput]);
   const suggestedSkills = useMemo(() => {
     if (skillQuery === null) return [];
@@ -752,8 +948,16 @@ export default function App() {
   );
   const libraryCounts = useMemo(() => countLibraryFiles(files), [files]);
   const filteredConversationHistory = useMemo(
-    () => filterConversations(conversationHistory, conversationSearch),
+    () =>
+      filterConversations(
+        conversationHistory.filter((item) => item.id !== FRIDAY_CONVERSATION_ID),
+        conversationSearch
+      ),
     [conversationHistory, conversationSearch]
+  );
+  const regularConversationHistory = useMemo(
+    () => conversationHistory.filter((item) => item.id !== FRIDAY_CONVERSATION_ID),
+    [conversationHistory]
   );
   const filteredCrossChatMemories = useMemo(() => {
     const query = memoryQuery.trim().toLocaleLowerCase("zh-CN");
@@ -764,6 +968,11 @@ export default function App() {
       return `${memory.content} ${memory.conversation_title}`.toLocaleLowerCase("zh-CN").includes(query);
     });
   }, [crossChatMemories, memoryQuery, memoryScope]);
+  const accountMemoryCount = useMemo(
+    () => crossChatMemories.filter((memory) => !memory.project_id).length,
+    [crossChatMemories]
+  );
+  const projectMemoryCount = crossChatMemories.length - accountMemoryCount;
   const chatUserTurns = useMemo(
     () =>
       chatMessages.flatMap((message, messageIndex) =>
@@ -862,6 +1071,20 @@ export default function App() {
     } else {
       url.searchParams.set("tab", artifactTab);
     }
+    if (next !== "projects") {
+      url.searchParams.delete("project");
+      url.searchParams.delete("projectTab");
+    }
+    window.history.replaceState(null, "", url);
+  }
+
+  function setProjectRouteWithUrl(projectId: string, tab: ProjectDetailTab) {
+    setProjectDetailTab(tab);
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "projects");
+    url.searchParams.set("project", projectId);
+    url.searchParams.set("projectTab", tab);
+    url.searchParams.delete("tab");
     window.history.replaceState(null, "", url);
   }
 
@@ -872,6 +1095,55 @@ export default function App() {
     url.searchParams.set("view", "artifacts");
     url.searchParams.set("tab", next);
     window.history.replaceState(null, "", url);
+  }
+
+  async function refreshWorkCalendar() {
+    const [yearText, monthText] = workCalendarCursor.split("-");
+    const year = Number(yearText);
+    const month = Number(monthText);
+    const targetDate = selectedWorkDate.startsWith(`${workCalendarCursor}-`)
+      ? selectedWorkDate
+      : `${workCalendarCursor}-01`;
+    setWorkCalendarLoading(true);
+    try {
+      const [calendarPayload, detailPayload] = await Promise.all([
+        api.workReportCalendar(year, month),
+        api.workReportDay(targetDate)
+      ]);
+      setWorkCalendar(calendarPayload);
+      setSelectedWorkDate(targetDate);
+      setWorkDayDetail(detailPayload);
+      setStatus({ tone: "success", text: "工作日历已更新" });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setWorkCalendarLoading(false);
+    }
+  }
+
+  async function selectWorkCalendarDay(targetDate: string) {
+    setSelectedWorkDate(targetDate);
+    setWorkCalendarLoading(true);
+    try {
+      setWorkDayDetail(await api.workReportDay(targetDate));
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setWorkCalendarLoading(false);
+    }
+  }
+
+  function shiftWorkCalendarMonth(offset: number) {
+    const [yearText, monthText] = workCalendarCursor.split("-");
+    const shifted = new Date(Number(yearText), Number(monthText) - 1 + offset, 1);
+    const next = `${shifted.getFullYear()}-${String(shifted.getMonth() + 1).padStart(2, "0")}`;
+    setWorkCalendarCursor(next);
+  }
+
+  function draftWorkReportRequest(kind: "daily" | "weekly" | "biweekly") {
+    const label = kind === "daily" ? "日报" : kind === "weekly" ? "周报" : "双周报";
+    setChatInput(`请使用日报周报双周报技能，以 ${selectedWorkDate} 为基准生成${label}。先复用已有日报，只在缺口处回查工作证据。`);
+    setViewWithUrl("agent");
   }
 
   async function refreshTemporarySync(silent = false) {
@@ -982,6 +1254,8 @@ export default function App() {
         nextAsrSettings,
         nextAgentSettings,
         nextMeetingMinutesSettings,
+        nextWeixinStatus,
+        nextNotifications,
         nextMemories,
         nextTools,
         nextSkills,
@@ -994,6 +1268,8 @@ export default function App() {
         api.asrSettings(),
         api.agentSettings(),
         api.meetingMinutesSettings(),
+        api.weixinStatus(),
+        api.notifications(),
         api.memories(),
         api.tools(),
         api.skills(),
@@ -1011,6 +1287,7 @@ export default function App() {
       });
       setAgentSettings(nextAgentSettings);
       setAgentSettingsForm({
+        assistant_name: nextAgentSettings.assistant_name,
         nickname: nextAgentSettings.nickname,
         occupation: nextAgentSettings.occupation,
         details: nextAgentSettings.details,
@@ -1019,17 +1296,40 @@ export default function App() {
         company_document_format: nextAgentSettings.company_document_format
       });
       setMeetingMinutesSettings(nextMeetingMinutesSettings);
+      setWeixinStatus(nextWeixinStatus);
+      setNotifications(nextNotifications);
       setMeetingMinutesSettingsForm({
         default_output_dir: nextMeetingMinutesSettings.default_output_dir,
         custom_instructions: nextMeetingMinutesSettings.custom_instructions
       });
       setCrossChatMemories(nextMemories.memories);
-      setMemoryProfile(nextMemories.profile ? { content: nextMemories.profile.content, updated_at: nextMemories.profile.updated_at } : null);
       setTools(nextTools);
       setSkills(nextSkills.skills);
       setFiles(nextFiles.files);
       setMeetingArchives(nextMeetingArchives.meetings);
       setProjects(nextProjects.projects);
+      const initialProjectRoute = initialProjectRouteRef.current;
+      if (
+        !projectRouteRestoredRef.current
+        && initialProjectRoute
+        && nextProjects.projects.some((project) => project.id === initialProjectRoute.projectId)
+      ) {
+        projectRouteRestoredRef.current = true;
+        const restoredProject = await api.project(initialProjectRoute.projectId);
+        setSelectedProject(restoredProject.project);
+        setProjectSettingsForm({
+          name: restoredProject.project.name,
+          instructions: restoredProject.project.instructions
+        });
+        setActiveProjectId(restoredProject.project.id);
+        activeProjectIdRef.current = restoredProject.project.id;
+        setProjectDetailTab(initialProjectRoute.tab);
+        setView("projects");
+        setProjectRouteWithUrl(restoredProject.project.id, initialProjectRoute.tab);
+      } else if (selectedProject) {
+        const refreshedProject = await api.project(selectedProject.id);
+        setSelectedProject(refreshedProject.project);
+      }
       setStatus({ tone: "success", text: "工作区已刷新" });
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
@@ -1123,7 +1423,7 @@ export default function App() {
     }
   }
 
-  async function openProject(projectId: string) {
+  async function openProject(projectId: string, preferredTab: ProjectDetailTab = "chat") {
     setBusy(true);
     setStatus({ tone: "loading", text: "正在打开项目…" });
     try {
@@ -1135,10 +1435,13 @@ export default function App() {
       });
       setActiveProjectId(projectId);
       activeProjectIdRef.current = projectId;
-      setProjectDetailTab("chat");
+      setProjectDetailTab(preferredTab);
+      setTimelineEditor(null);
+      setTimelineCompletion(null);
       setProjectChatDraft("");
       setProjectSettingsOpen(false);
       setViewWithUrl("projects");
+      setProjectRouteWithUrl(projectId, preferredTab);
       setStatus({ tone: "success", text: `已打开 ${payload.project.name}` });
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
@@ -1152,7 +1455,13 @@ export default function App() {
     setActiveProjectId(null);
     activeProjectIdRef.current = null;
     setProjectSettingsOpen(false);
+    setTimelineEditor(null);
+    setTimelineCompletion(null);
     setViewWithUrl("projects");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("project");
+    url.searchParams.delete("projectTab");
+    window.history.replaceState(null, "", url);
   }
 
   async function createProject(event: FormEvent<HTMLFormElement>) {
@@ -1169,8 +1478,11 @@ export default function App() {
       setActiveProjectId(payload.project.id);
       activeProjectIdRef.current = payload.project.id;
       setProjectDetailTab("chat");
+      setTimelineEditor(null);
+      setTimelineCompletion(null);
       setProjectChatDraft("");
       setViewWithUrl("projects");
+      setProjectRouteWithUrl(payload.project.id, "chat");
       setStatus({ tone: "success", text: "项目已创建" });
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
@@ -1256,6 +1568,194 @@ export default function App() {
         items.map((item) => (item.id === payload.project.id ? payload.project : item))
       );
       setStatus({ tone: "success", text: "项目资料已移除" });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createProjectTimeline() {
+    if (!selectedProject) return;
+    setBusy(true);
+    setStatus({ tone: "loading", text: "正在创建项目时间线…" });
+    try {
+      const payload = await api.createProjectTimeline(selectedProject.id);
+      setSelectedProject(payload.project);
+      setProjects((items) =>
+        items.map((item) => (item.id === payload.project.id ? payload.project : item))
+      );
+      setTimelineEditor({
+        mode: "add",
+        values: { ...EMPTY_TIMELINE_VALUES }
+      });
+      setStatus({ tone: "success", text: "时间线 Excel 已创建" });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function editTimelineNode(node: ProjectTimelineNode) {
+    setTimelineCompletion(null);
+    const values: TimelineEditorValues = {
+      node_id: String(node.node_id ?? ""),
+      workstream: String(node.workstream ?? ""),
+      planned_date: normalizeTimelineDateInput(node.planned_date),
+      title: String(node.title ?? ""),
+      completion_criteria: String(node.completion_criteria ?? ""),
+      status: String(node.status || "未开始"),
+      progress: String(node.progress ?? ""),
+      next_action: String(node.next_action ?? ""),
+      owner: String(node.owner ?? ""),
+      materials: String(node.materials ?? ""),
+      actual_date: normalizeTimelineDateInput(node.actual_date),
+      notes: String(node.notes ?? "")
+    };
+    setTimelineEditor({ mode: "edit", row: node.row, values, original: { ...values } });
+  }
+
+  async function saveTimelineNode(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedProject || !timelineEditor) return;
+    if (!timelineEditor.values.title.trim()) {
+      setStatus({ tone: "error", text: "请填写关键节点。" });
+      return;
+    }
+    const values = Object.fromEntries(
+      Object.entries(timelineEditor.values)
+        .filter(([key, value]) => {
+          if (timelineEditor.mode === "add") {
+            return key === "status" || String(value).trim() !== "";
+          }
+          return timelineEditor.original?.[key as keyof TimelineEditorValues] !== value;
+        })
+        .map(([key, value]) => [key, String(value).trim()])
+    );
+    if (timelineEditor.mode === "edit" && Object.keys(values).length === 0) {
+      setTimelineEditor(null);
+      return;
+    }
+    const change =
+      timelineEditor.mode === "add"
+        ? { action: "add" as const, values }
+        : {
+            action: "update" as const,
+            match: { row: timelineEditor.row },
+            values
+          };
+    setBusy(true);
+    setStatus({ tone: "loading", text: "正在回写时间线 Excel…" });
+    try {
+      const payload = await api.updateProjectTimeline(selectedProject.id, [change]);
+      setSelectedProject(payload.project);
+      setProjects((items) =>
+        items.map((item) => (item.id === payload.project.id ? payload.project : item))
+      );
+      setTimelineEditor(null);
+      setStatus({ tone: "success", text: "时间节点已同步到 Excel" });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function beginTimelineCompletion(node: ProjectTimelineNode) {
+    setTimelineEditor(null);
+    setTimelineCompletion({
+      node,
+      note: "",
+      materialPaths: timelineMaterialPaths(node.materials)
+    });
+  }
+
+  async function addTimelineCompletionFiles(fileList: FileList | File[]) {
+    if (!selectedProject || !timelineCompletion) return;
+    const uploaded = await uploadProjectFiles(fileList, selectedProject.id);
+    if (uploaded.length === 0) return;
+    setTimelineCompletion((current) =>
+      current
+        ? {
+            ...current,
+            materialPaths: Array.from(new Set([
+              ...current.materialPaths,
+              ...uploaded.map((item) => item.path)
+            ]))
+          }
+        : current
+    );
+  }
+
+  async function confirmTimelineCompletion(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedProject || !timelineCompletion) return;
+    const note = timelineCompletion.note.trim();
+    if (!note) {
+      setStatus({ tone: "error", text: "请写一句完成说明，作为节点验收留痕。" });
+      return;
+    }
+    const completedAt = localDateInputValue(new Date());
+    const node = timelineCompletion.node;
+    const progress = [String(node.progress ?? "").trim(), `完成确认：${note}`]
+      .filter(Boolean)
+      .join("\n");
+    const notes = [String(node.notes ?? "").trim(), `${completedAt} 确认完成：${note}`]
+      .filter(Boolean)
+      .join("\n");
+    const materials = mergeTimelineMaterials(node.materials, timelineCompletion.materialPaths);
+    setBusy(true);
+    setStatus({ tone: "loading", text: "正在确认完成并回写 Excel…" });
+    try {
+      const payload = await api.updateProjectTimeline(selectedProject.id, [{
+        action: "update",
+        match: { row: node.row },
+        values: {
+          status: "已完成",
+          progress,
+          actual_date: completedAt,
+          next_action: "",
+          materials,
+          notes
+        }
+      }]);
+      setSelectedProject(payload.project);
+      setProjects((items) =>
+        items.map((item) => (item.id === payload.project.id ? payload.project : item))
+      );
+      setTimelineCompletion(null);
+      setStatus({
+        tone: "success",
+        text: timelineCompletion.materialPaths.length > 0
+          ? `节点已完成，已挂接 ${timelineCompletion.materialPaths.length} 份成果`
+          : "节点已完成，完成说明已落盘"
+      });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteTimelineNode(node: ProjectTimelineNode) {
+    if (!selectedProject) return;
+    setBusy(true);
+    setStatus({ tone: "loading", text: "正在取消时间节点…" });
+    try {
+      const payload = await api.updateProjectTimeline(selectedProject.id, [
+        {
+          action: "delete",
+          match: { row: node.row },
+          delete_mode: "soft"
+        }
+      ]);
+      setSelectedProject(payload.project);
+      setProjects((items) =>
+        items.map((item) => (item.id === payload.project.id ? payload.project : item))
+      );
+      setTimelineEditor(null);
+      setStatus({ tone: "success", text: "节点已标记为已取消" });
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
     } finally {
@@ -2113,7 +2613,7 @@ export default function App() {
   function requestChatScrollToBottom() {
     pendingChatScrollToBottomRef.current = true;
     window.setTimeout(() => {
-      if (!pendingChatScrollToBottomRef.current || view !== "agent") return;
+      if (!pendingChatScrollToBottomRef.current || (view !== "agent" && view !== "friday")) return;
       pendingChatScrollToBottomRef.current = false;
       scheduleChatScrollToBottom();
     }, 0);
@@ -2164,8 +2664,28 @@ export default function App() {
     setViewWithUrl("agent");
   }
 
-  function openConversation(item: ConversationHistoryItem) {
-    requestChatScrollToBottom();
+  function openFridayConversation() {
+    const assistantName = agentSettings?.assistant_name?.trim() || "Friday";
+    const next = ensureFridayConversation(conversationHistoryRef.current, assistantName);
+    conversationHistoryRef.current = next;
+    setConversationHistory(next);
+    const friday = next.find((item) => item.id === FRIDAY_CONVERSATION_ID);
+    if (friday) openFridayConversationItem(friday);
+  }
+
+  function openFridayConversationItem(
+    item: ConversationHistoryItem,
+    options: { preserveActivityPanel?: boolean; preserveScrollPosition?: boolean } = {}
+  ) {
+    openConversation(item, options);
+    setViewWithUrl("friday");
+  }
+
+  function openConversation(
+    item: ConversationHistoryItem,
+    options: { preserveActivityPanel?: boolean; preserveScrollPosition?: boolean } = {}
+  ) {
+    if (!options.preserveScrollPosition) requestChatScrollToBottom();
     const restoredActivityRecords = item.activities ?? {};
     const restoredActivityIndex =
       typeof item.activeActivityIndex === "number" && restoredActivityRecords[item.activeActivityIndex]
@@ -2195,7 +2715,7 @@ export default function App() {
     setActivityRecords(restoredActivityRecords);
     setActivityPanelMessageIndex(restoredActivityIndex);
     setActivityEvents(restoredActivityRecord?.events ?? []);
-    setActivityOpen(false);
+    if (!options.preserveActivityPanel) setActivityOpen(false);
     setActivityMessageIndex(restoredActivityIndex);
     setActivityStartedAt(activeRun?.startedAt ?? null);
     activityRunningRef.current = Boolean(activeRun);
@@ -2268,6 +2788,7 @@ export default function App() {
   }
 
   function deleteConversation(id: string) {
+    if (id === FRIDAY_CONVERSATION_ID) return;
     if (deleteConfirmConversationId !== id) {
       setDeleteConfirmConversationId(id);
       return;
@@ -2329,19 +2850,124 @@ export default function App() {
     }
   }
 
+  function queueConversationArchiveSave(items: ConversationHistoryItem[], delayMs = 350) {
+    if (!conversationArchiveReadyRef.current || !currentUser) return;
+    conversationArchivePendingRef.current = items.map(sanitizeConversationHistoryItem);
+    if (conversationArchiveSavingRef.current) return;
+    if (conversationArchiveSaveTimerRef.current !== null) {
+      window.clearTimeout(conversationArchiveSaveTimerRef.current);
+    }
+    conversationArchiveSaveTimerRef.current = window.setTimeout(() => {
+      conversationArchiveSaveTimerRef.current = null;
+      void flushConversationArchiveSave();
+    }, delayMs);
+  }
+
+  async function flushConversationArchiveSave() {
+    if (conversationArchiveSavingRef.current || !conversationArchiveReadyRef.current) return;
+    const snapshot = conversationArchivePendingRef.current;
+    conversationArchivePendingRef.current = null;
+    if (!snapshot) return;
+
+    const change = conversationArchiveChangeSet(
+      conversationArchiveShadowRef.current,
+      snapshot
+    );
+    if (change.upserts.length === 0 && change.deletedIds.length === 0) return;
+
+    conversationArchiveSavingRef.current = true;
+    let retryAfterConflict = false;
+    try {
+      const result = await api.saveConversations({
+        base_revision: conversationArchiveRevisionRef.current,
+        upserts: change.upserts,
+        deleted_ids: change.deletedIds
+      });
+      if (result.conflict) {
+        const serverItems = (result.items ?? [])
+          .filter(isConversationHistoryItem)
+          .map(sanitizeConversationHistoryItem);
+        const merged = ensureFridayConversation(
+          mergeConversationArchiveConflict(
+            conversationArchiveShadowRef.current,
+            snapshot,
+            serverItems
+          ),
+          agentSettings?.assistant_name?.trim() || "Friday"
+        );
+        conversationArchiveRevisionRef.current = result.revision;
+        conversationArchiveShadowRef.current = serverItems;
+        conversationHistoryRef.current = merged;
+        setConversationHistory(merged);
+        conversationArchivePendingRef.current = merged;
+        retryAfterConflict = true;
+        setStatus({
+          tone: "success",
+          text: "聊天存档检测到其他入口的新内容，已合并后继续保存。"
+        });
+        return;
+      }
+      if (!result.ok) {
+        throw new Error("聊天存档保存未完成。");
+      }
+      conversationArchiveRevisionRef.current = result.revision;
+      conversationArchiveShadowRef.current = snapshot;
+    } catch (error) {
+      // Do not silently retry a failed persistence request.  The next explicit
+      // conversation change will create a fresh, versioned save request.
+      conversationArchivePendingRef.current = snapshot;
+      setStatus({ tone: "error", text: `聊天存档保存失败：${explainError(error)}` });
+    } finally {
+      conversationArchiveSavingRef.current = false;
+      const pending = conversationArchivePendingRef.current;
+      if (
+        pending &&
+        conversationArchiveReadyRef.current &&
+        (retryAfterConflict || pending !== snapshot)
+      ) {
+        queueConversationArchiveSave(pending, 0);
+      }
+    }
+  }
+
   async function restoreConversationArchive() {
+    let loaded = false;
     try {
       const payload = await api.conversations();
       const archivedItems = payload.items
         .filter(isConversationHistoryItem)
         .map(sanitizeConversationHistoryItem);
-      if (archivedItems.length > 0) {
-        setConversationHistory((items) => mergeConversationHistories(archivedItems, items));
+      const merged = ensureFridayConversation(
+        conversationArchiveShadowRef.current.length > 0
+          ? mergeConversationArchiveConflict(
+              conversationArchiveShadowRef.current,
+              conversationHistoryRef.current,
+              archivedItems
+            )
+          : mergeConversationHistories(archivedItems, conversationHistoryRef.current),
+        agentSettings?.assistant_name?.trim() || "Friday"
+      );
+      conversationHistoryRef.current = merged;
+      setConversationHistory(merged);
+      conversationArchiveShadowRef.current = archivedItems;
+      conversationArchiveRevisionRef.current = payload.revision;
+      loaded = true;
+      if (currentConversationIdRef.current === FRIDAY_CONVERSATION_ID) {
+        const friday = merged.find((item) => item.id === FRIDAY_CONVERSATION_ID);
+        if (friday) {
+          openFridayConversationItem(friday, {
+            preserveActivityPanel: true,
+            preserveScrollPosition: true
+          });
+        }
       }
-    } catch {
-      // Keep the browser-local copy when the workspace archive is not available.
+    } catch (error) {
+      setStatus({ tone: "error", text: `聊天存档读取失败：${explainError(error)}` });
     } finally {
       conversationArchiveReadyRef.current = true;
+      if (loaded) {
+        queueConversationArchiveSave(conversationHistoryRef.current);
+      }
     }
   }
 
@@ -2474,7 +3100,8 @@ export default function App() {
       {
         content,
         attachments: [],
-        skill: inferSkillFromText(content, skills)
+        skill: inferSkillFromText(content, skills),
+        autoApprove
       },
       {
         baseMessages,
@@ -2492,7 +3119,8 @@ export default function App() {
     await runChatMessage({
       content,
       attachments: [],
-      skill: inferSkillFromText(chatMessagesRef.current.map((item) => item.content).join("\n"), skills)
+      skill: inferSkillFromText(chatMessagesRef.current.map((item) => item.content).join("\n"), skills),
+      autoApprove
     });
   }
 
@@ -2502,7 +3130,8 @@ export default function App() {
     const queuedItem = {
       content,
       attachments,
-      skill: selectedSkill ?? inferSkillFromText(content, skills)
+      skill: selectedSkill ?? inferSkillFromText(content, skills),
+      autoApprove
     };
     if (!queuedItem.content && queuedItem.attachments.length === 0) return;
     setChatInput("");
@@ -2693,6 +3322,7 @@ export default function App() {
           messages: nextMessages,
           profile: agentForm.profile,
           reasoning_effort: reasoningEffort,
+          auto_approve: queuedItem.autoApprove,
           skill_hint: outgoingSkill?.id ?? null,
           conversation_summary: baseConversationSummary || null,
           conversation_summary_message_count: baseConversationSummaryMessageCount,
@@ -3261,6 +3891,24 @@ export default function App() {
     contextSummary: string;
     contextSummaryMessageCount: number;
   }) {
+    if (id === FRIDAY_CONVERSATION_ID) {
+      const assistantName = agentSettings?.assistant_name?.trim() || "Friday";
+      setConversationHistory((items) => {
+        const next = upsertConversation(items, {
+          id,
+          title: assistantName,
+          group: "助理",
+          messages,
+          contextSummary,
+          contextSummaryMessageCount,
+          activities,
+          activeActivityIndex
+        });
+        conversationHistoryRef.current = next;
+        return next;
+      });
+      return;
+    }
     setConversationHistory((items) => {
       const next = upsertConversation(items, {
         id,
@@ -3574,6 +4222,7 @@ export default function App() {
       const payload = await api.saveAgentSettings(agentSettingsForm);
       setAgentSettings(payload);
       setAgentSettingsForm({
+        assistant_name: payload.assistant_name,
         nickname: payload.nickname,
         occupation: payload.occupation,
         details: payload.details,
@@ -3589,12 +4238,83 @@ export default function App() {
     }
   }
 
+  async function startWeixinLogin(force = false) {
+    setWeixinBusy(true);
+    setStatus({ tone: "loading", text: "正在向微信申请登录二维码…" });
+    try {
+      const login = await api.startWeixinLogin(force);
+      const nextStatus = await api.weixinStatus();
+      setWeixinStatus({ ...nextStatus, login });
+      setWeixinVerifyCode("");
+      setStatus({ tone: "success", text: "二维码已生成，请使用手机微信扫描" });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setWeixinBusy(false);
+    }
+  }
+
+  async function submitWeixinVerifyCode(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const sessionId = weixinStatus?.login?.session_id;
+    if (!sessionId || !weixinVerifyCode.trim()) return;
+    setWeixinBusy(true);
+    setStatus({ tone: "loading", text: "正在验证手机微信显示的数字…" });
+    try {
+      const result = await api.pollWeixinLogin(sessionId, weixinVerifyCode.trim());
+      if (result.connected) {
+        setWeixinStatus(await api.weixinStatus());
+        setWeixinVerifyCode("");
+        setStatus({ tone: "success", text: result.message || "微信已连接" });
+        return;
+      }
+      setWeixinStatus((current) =>
+        current
+          ? {
+              ...current,
+              login: {
+                session_id: result.session_id,
+                qr_url: result.qr_url,
+                status: result.status,
+                needs_verify_code: result.needs_verify_code,
+                message: result.message
+              }
+            }
+          : current
+      );
+      setWeixinVerifyCode("");
+      setStatus({
+        tone: result.needs_verify_code ? "error" : "loading",
+        text: result.message || "正在等待微信确认"
+      });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setWeixinBusy(false);
+    }
+  }
+
+  async function disconnectWeixin() {
+    if (!window.confirm("断开后 Friday 将停止接收微信消息；需要再次扫码才能恢复。确认断开吗？")) {
+      return;
+    }
+    setWeixinBusy(true);
+    try {
+      const result = await api.disconnectWeixin();
+      setWeixinStatus(await api.weixinStatus());
+      setStatus({ tone: "success", text: result.message });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setWeixinBusy(false);
+    }
+  }
+
   async function refreshCrossChatMemories() {
     try {
       const payload = await api.memories();
       setCrossChatMemories(payload.memories);
-      setMemoryProfile(payload.profile ? { content: payload.profile.content, updated_at: payload.profile.updated_at } : null);
-      setStatus({ tone: "success", text: `已载入 ${payload.count} 条自动记忆` });
+      setStatus({ tone: "success", text: `已载入 ${payload.count} 条核心记忆` });
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
     }
@@ -3872,8 +4592,8 @@ export default function App() {
         <section className="recent-block" aria-label="历史对话">
           <h2>历史对话</h2>
           <div className="recent-list">
-            {conversationHistory.length > 0 ? (
-              conversationHistory.map((item) => {
+            {regularConversationHistory.length > 0 ? (
+              regularConversationHistory.map((item) => {
                 const isActive = currentConversationId === item.id;
                 const isRenaming = renamingConversationId === item.id;
                 const projectName = item.projectId
@@ -3957,25 +4677,39 @@ export default function App() {
           </div>
         </section>
 
-        <div className="side-status" aria-label="当前状态">
+        <button
+          type="button"
+          className={`friday-launcher ${view === "friday" ? "is-active" : ""}`}
+          aria-current={view === "friday" ? "page" : undefined}
+          onClick={openFridayConversation}
+        >
+          <span className="friday-launcher-mark" aria-hidden="true">
+            <Sparkles />
+          </span>
+          <span className="friday-launcher-copy">
+            <strong>{agentSettings?.assistant_name || "Friday"}</strong>
+            <small>{weixinStatus?.connected ? "微信已连接 · 持续助理" : "持续助理"}</small>
+          </span>
+          <ChevronRight aria-hidden="true" />
+        </button>
+
+        <div className="side-status" aria-label="当前账户">
           <div className="account-card">
             <span className="account-avatar" aria-hidden="true"><UserRound /></span>
             <span className="account-copy">
               <strong>{currentUser.username}</strong>
-              <small>{currentUser.role === "admin" ? "管理员" : "独立账户"}</small>
             </span>
             <button type="button" className="account-logout" onClick={() => void logout()} title="退出登录" aria-label="退出登录">
               <LogOut aria-hidden="true" />
             </button>
           </div>
-          <StatusLine label="当前模型" value={currentProfile?.name ?? "未加载"} />
-          <StatusLine label="密钥状态" value={`${keyReadyCount}/${profiles.length} 已配置`} />
-          <StatusLine label="可用技能" value={`${skills.length} 个`} />
         </div>
       </aside>
 
       <main
-        className={`main ${view === "agent" ? "chat-main" : ""} ${
+        className={`main ${view === "agent" || view === "friday" ? "chat-main" : ""} ${
+          view === "friday" ? "friday-main" : ""
+        } ${
           fileReaderOpen ? "file-reader-main" : ""
         } ${meetingArchiveOpen ? "meeting-archive-main" : ""}`}
         id="main-content"
@@ -3985,7 +4719,11 @@ export default function App() {
             <div>
               <h2>{titleForView(view, artifactTab)}</h2>
               <p className="overline">
-                {view === "agent"
+                {view === "friday"
+                  ? weixinStatus?.connected
+                    ? "持续助理 · 网页与微信共享同一条长期会话"
+                    : "持续助理 · 可在设置中扫码连接微信"
+                  : view === "agent"
                   ? activeProjectId
                     ? `项目：${selectedProject?.name ?? "正在载入"} · 自动使用项目资料`
                     : "本地文件、技能和模型都在同一条对话里汇合"
@@ -3999,6 +4737,8 @@ export default function App() {
                     ? "浏览器麦克风实时记录，本地降噪后转写并保存"
                   : view === "sync"
                     ? "同一账号的设备之间临时传递文字和文件"
+                  : view === "work-calendar"
+                    ? "按日期查看本地工作记录、日报和周期报告"
                   : view === "more"
                     ? "临时同步、会议归档、实时转写等功能入口"
                   : view === "artifacts" && artifactTab === "files"
@@ -4008,10 +4748,90 @@ export default function App() {
             </div>
             <div className="topbar-actions">
               <StatusPill tone={status.tone}>{status.text}</StatusPill>
-              <button type="button" className="secondary-button" onClick={refreshAll} disabled={busy}>
-                <RefreshCw aria-hidden="true" className={busy ? "spin" : ""} />
-                刷新
-              </button>
+              <div className="notification-control">
+                <button
+                  type="button"
+                  className={`notification-button ${notificationsOpen ? "is-active" : ""}`}
+                  aria-label={`提醒${notifications.unread_count ? `，${notifications.unread_count} 条未读` : ""}`}
+                  title="Friday 提醒"
+                  aria-haspopup="dialog"
+                  aria-expanded={notificationsOpen}
+                  onClick={() => setNotificationsOpen((open) => !open)}
+                >
+                  <Bell aria-hidden="true" />
+                  {notifications.unread_count > 0 ? (
+                    <span className="notification-badge">
+                      {notifications.unread_count > 99 ? "99+" : notifications.unread_count}
+                    </span>
+                  ) : null}
+                </button>
+                {notificationsOpen ? (
+                  <div className="notification-popover" role="dialog" aria-label="Friday 提醒">
+                    <div className="notification-popover-heading">
+                      <div>
+                        <strong>提醒</strong>
+                        <span>无需立即回复的信息</span>
+                      </div>
+                      {notifications.unread_count > 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => void api.markNotificationsRead().then(setNotifications)}
+                        >
+                          全部已读
+                        </button>
+                      ) : null}
+                    </div>
+                    <div className="notification-list">
+                      {notifications.items.length > 0 ? (
+                        notifications.items.map((item) => (
+                          <div
+                            key={item.id}
+                            className={`notification-item ${item.read_at ? "" : "is-unread"}`}
+                          >
+                            <button
+                              type="button"
+                              className="notification-item-content"
+                              onClick={() => {
+                                if (!item.read_at) {
+                                  void api.markNotificationsRead(item.id).then(setNotifications).catch((error) => {
+                                    setStatus({ tone: "error", text: explainError(error) });
+                                  });
+                                }
+                              }}
+                            >
+                              <span className="notification-dot" aria-hidden="true" />
+                              <span>
+                                <strong>{item.title}</strong>
+                                <p>{item.body}</p>
+                                <small>{formatProjectDate(item.created_at)}</small>
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              className="notification-delete-button"
+                              aria-label={`删除提醒：${item.title}`}
+                              title="删除提醒"
+                              onClick={() => {
+                                void api.deleteNotification(item.id).then(setNotifications).catch((error) => {
+                                  setStatus({ tone: "error", text: explainError(error) });
+                                });
+                              }}
+                            >
+                              <Trash2 aria-hidden="true" />
+                            </button>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="notification-empty">
+                          <Bell aria-hidden="true" />
+                          <p>暂时没有提醒</p>
+                          <span>需要讨论的事项会直接进入 Friday 对话。</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
               {view === "agent" && activeConversation ? (
                 <button
                   type="button"
@@ -4030,11 +4850,12 @@ export default function App() {
         ) : null}
 
         <section className="workspace-surface" aria-busy={busy}>
-          {view === "agent" && renderAgent()}
+          {(view === "agent" || view === "friday") && renderAgent()}
           {view === "projects" && renderProjects()}
           {view === "skills" && renderSkills()}
           {view === "transcribe" && renderRealtimeTranscription()}
           {view === "sync" && renderTemporarySync()}
+          {view === "work-calendar" && renderWorkCalendar()}
           {view === "artifacts" && renderArtifacts()}
           {view === "models" && renderModels()}
           {view === "more" && renderMore()}
@@ -4090,6 +4911,8 @@ export default function App() {
       ) : null}
 
       {projectCreateOpen ? renderProjectCreateDialog() : null}
+
+      {memoryManagerOpen ? renderMemoryManagerDialog() : null}
 
       {historyMenu ? renderHistoryMenu() : null}
 
@@ -4245,16 +5068,25 @@ export default function App() {
             role="tab"
             aria-selected={projectDetailTab === "chat"}
             className={projectDetailTab === "chat" ? "is-active" : ""}
-            onClick={() => setProjectDetailTab("chat")}
+            onClick={() => setProjectRouteWithUrl(selectedProject.id, "chat")}
           >
             聊天
           </button>
           <button
             type="button"
             role="tab"
+            aria-selected={projectDetailTab === "timeline"}
+            className={projectDetailTab === "timeline" ? "is-active" : ""}
+            onClick={() => setProjectRouteWithUrl(selectedProject.id, "timeline")}
+          >
+            项目进度
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={projectDetailTab === "files"}
             className={projectDetailTab === "files" ? "is-active" : ""}
-            onClick={() => setProjectDetailTab("files")}
+            onClick={() => setProjectRouteWithUrl(selectedProject.id, "files")}
           >
             文件
           </button>
@@ -4288,12 +5120,179 @@ export default function App() {
               </div>
             )}
           </>
+        ) : projectDetailTab === "timeline" ? (
+          <section className="project-section project-timeline-section">
+            {selectedProject.timeline?.exists ? (
+              <>
+                <header className="project-timeline-header">
+                  <div>
+                    <h3>关键节点</h3>
+                    <p>
+                      Excel 是唯一事实源
+                      {selectedProject.timeline.modified
+                        ? ` · 更新于 ${formatProjectDate(selectedProject.timeline.modified)}`
+                        : ""}
+                    </p>
+                  </div>
+                  <div className="project-timeline-actions">
+                    {selectedProject.timeline.path ? (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => void openLocalFile(selectedProject.timeline!.path!)}
+                      >
+                        <FileText aria-hidden="true" />
+                        打开 Excel
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="primary-button"
+                      onClick={() =>
+                        setTimelineEditor({
+                          mode: "add",
+                          values: { ...EMPTY_TIMELINE_VALUES }
+                        })
+                      }
+                    >
+                      <Plus aria-hidden="true" />
+                      新增节点
+                    </button>
+                  </div>
+                </header>
+
+                {selectedProject.timeline.error ? (
+                  <div className="project-timeline-error" role="alert">
+                    <AlertCircle aria-hidden="true" />
+                    <span>
+                      <strong>暂时无法识别这份 Excel</strong>
+                      {selectedProject.timeline.error}
+                    </span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="project-timeline-summary" aria-label="时间线摘要">
+                      <span><strong>{selectedProject.timeline.summary.total}</strong>全部节点</span>
+                      <span><strong>{selectedProject.timeline.summary.completed}</strong>已完成</span>
+                      <span><strong>{selectedProject.timeline.summary.in_progress}</strong>推进中</span>
+                      <span className={selectedProject.timeline.summary.overdue > 0 ? "is-danger" : ""}>
+                        <strong>{selectedProject.timeline.summary.overdue}</strong>已逾期
+                      </span>
+                      <span className={selectedProject.timeline.summary.risk > 0 ? "is-warning" : ""}>
+                        <strong>{selectedProject.timeline.summary.risk}</strong>有风险
+                      </span>
+                      <span><strong>{selectedProject.timeline.summary.unscheduled}</strong>待排期</span>
+                    </div>
+
+                    {timelineEditor ? (
+                      <TimelineEditor
+                        editor={timelineEditor}
+                        busy={busy}
+                        onChange={(key, value) =>
+                          setTimelineEditor((current) =>
+                            current
+                              ? { ...current, values: { ...current.values, [key]: value } }
+                              : current
+                          )
+                        }
+                        onCancel={() => setTimelineEditor(null)}
+                        onSubmit={saveTimelineNode}
+                      />
+                    ) : null}
+
+                    {timelineCompletion ? (
+                      <TimelineCompletionPanel
+                        completion={timelineCompletion}
+                        materials={selectedProject.material_groups.flatMap((group) => group.materials)}
+                        busy={busy}
+                        onNoteChange={(note) =>
+                          setTimelineCompletion((current) => current ? { ...current, note } : current)
+                        }
+                        onToggleMaterial={(path) =>
+                          setTimelineCompletion((current) => {
+                            if (!current) return current;
+                            const selected = current.materialPaths.includes(path);
+                            return {
+                              ...current,
+                              materialPaths: selected
+                                ? current.materialPaths.filter((item) => item !== path)
+                                : [...current.materialPaths, path]
+                            };
+                          })
+                        }
+                        onUpload={(files) => void addTimelineCompletionFiles(files)}
+                        onCancel={() => setTimelineCompletion(null)}
+                        onSubmit={confirmTimelineCompletion}
+                      />
+                    ) : null}
+
+                    {(selectedProject.timeline.nodes ?? []).length > 0 ? (
+                      <ol className="project-timeline-list" aria-label="项目关键节点">
+                        {selectedProject.timeline.nodes.map((node) => (
+                          <TimelineNodeRow
+                            key={`${node.row}-${node.node_id ?? ""}`}
+                            node={node}
+                            materials={selectedProject.material_groups.flatMap((group) => group.materials)}
+                            onOpenMaterial={(path) => void openLocalFile(path)}
+                            onComplete={() => beginTimelineCompletion(node)}
+                            onEdit={() => editTimelineNode(node)}
+                            onDelete={() => void deleteTimelineNode(node)}
+                          />
+                        ))}
+                      </ol>
+                    ) : (
+                      <div className="project-timeline-empty">
+                        <CalendarDays aria-hidden="true" />
+                        <strong>时间线已经就绪</strong>
+                        <span>先添加第一个明确日期、状态和下一步的关键节点。</span>
+                        {!timelineEditor ? (
+                          <button
+                            type="button"
+                            className="primary-button"
+                            onClick={() =>
+                              setTimelineEditor({
+                                mode: "add",
+                                values: { ...EMPTY_TIMELINE_VALUES }
+                              })
+                            }
+                          >
+                            添加第一个节点
+                          </button>
+                        ) : null}
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            ) : (
+              <div className="project-timeline-empty is-first-run">
+                <CalendarDays aria-hidden="true" />
+                <strong>建立项目时间线</strong>
+                <span>
+                  创建一份可由你、网页和 Friday 共同维护的 Excel。日期、状态和下一步只保留一份事实。
+                </span>
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={busy}
+                  onClick={() => void createProjectTimeline()}
+                >
+                  创建时间线 Excel
+                </button>
+              </div>
+            )}
+          </section>
         ) : (
           <section className="project-section project-sources-section">
               <header>
                 <div>
-                  <h3>项目文件</h3>
-                  <p>这些文件会由项目内 Agent 在需要时自动读取。</p>
+                  <h3>项目材料</h3>
+                  <p>
+                    按用途展示当前有效版本
+                    {selectedProject.hidden_file_count > 0
+                      ? `，已收起 ${selectedProject.hidden_file_count} 份过程稿或旧版本`
+                      : "，过程稿不会混入这里"}
+                  </p>
                 </div>
                 <label className="secondary-button project-upload-button">
                   <Upload aria-hidden="true" />
@@ -4308,39 +5307,36 @@ export default function App() {
                   />
                 </label>
               </header>
-              {selectedProject.files.length > 0 ? (
-                <div className="project-file-list">
-                  {selectedProject.files.map((file) => (
-                    <div className="project-file-row" key={file.path}>
-                      <button
-                        type="button"
-                        className="project-file-main"
-                        onClick={() =>
-                          void openFile(file.path).then((opened) => {
-                            if (opened) setArtifactTabWithUrl("files");
-                          })
-                        }
-                      >
-                        <span className="project-file-icon" aria-hidden="true">{iconForAttachment(file.kind)}</span>
-                        <span><strong>{file.name}</strong><small>{formatBytes(file.size)} · {formatProjectDate(file.modified)}</small></span>
-                      </button>
-                      <button
-                        type="button"
-                        className="project-file-delete"
-                        aria-label={`移除 ${file.name}`}
-                        title="从项目中移除"
-                        onClick={() => void deleteProjectFile(file.path)}
-                      >
-                        <Trash2 aria-hidden="true" />
-                      </button>
-                    </div>
+              {(selectedProject.material_groups ?? []).length > 0 ? (
+                <div className="project-material-groups">
+                  {selectedProject.material_groups.map((group) => (
+                    <section className="project-material-group" key={group.id} aria-labelledby={`material-group-${group.id}`}>
+                      <header>
+                        <h4 id={`material-group-${group.id}`}>{group.label}</h4>
+                        <span>{group.count} 份</span>
+                      </header>
+                      <div className="project-material-list">
+                        {group.materials.map((material) => (
+                          <ProjectMaterialRow
+                            key={material.path}
+                            material={material}
+                            onOpen={(path) =>
+                              void openFile(path).then((opened) => {
+                                if (opened) setArtifactTabWithUrl("files");
+                              })
+                            }
+                            onDelete={(path) => void deleteProjectFile(path)}
+                          />
+                        ))}
+                      </div>
+                    </section>
                   ))}
                 </div>
               ) : (
                 <label className="project-source-empty">
                   <Upload aria-hidden="true" />
-                  <strong>把相关材料放进项目</strong>
-                  <span>支持 PDF、Word、Excel、PPT、图片、录音和文本文件</span>
+                  <strong>把项目正式材料放进来</strong>
+                  <span>系统会按用途归类，并从多个版本中保留当前有效版本</span>
                   <input
                     type="file"
                     multiple
@@ -4564,7 +5560,9 @@ export default function App() {
 
   function renderAgent() {
     return (
-      <div className={`chat-page ${activityOpen || chatFilesOpen ? "has-side-panel" : ""}`}>
+      <div className={`chat-page ${view === "friday" ? "is-friday" : "is-task-chat"} ${
+        activityOpen || chatFilesOpen ? "has-side-panel" : ""
+      }`}>
         <div className="chat-workarea">
           <section ref={chatThreadRef} className="chat-thread" aria-label="智能体对话">
             <div className="chat-messages" aria-live="polite">
@@ -4834,6 +5832,16 @@ export default function App() {
                     >
                       <Plus aria-hidden="true" />
                     </button>
+                    <button
+                      type="button"
+                      className={`auto-approve-toggle ${autoApprove ? "is-active" : ""}`}
+                      aria-pressed={autoApprove}
+                      title="由独立审查智能体评估需审批动作；固定安全边界与高风险拒绝规则不受模型影响"
+                      onClick={() => setAutoApprove((enabled) => !enabled)}
+                    >
+                      <ShieldCheck aria-hidden="true" />
+                      替我审批
+                    </button>
                     <div className="compose-input-wrap">
                       <textarea
                         id="chat-input"
@@ -4971,9 +5979,9 @@ export default function App() {
                                   key={profile.name}
                                   type="button"
                                   onClick={() => {
-                                    setAgentForm((form) => ({ ...form, profile: profile.name }));
                                     setComposerModelMenuOpen(false);
                                     setComposerSubmenu(null);
+                                    void switchModel(profile.name);
                                   }}
                                 >
                                   <span>{formatProfileLabel(profile)}</span>
@@ -5310,13 +6318,22 @@ export default function App() {
   }
 
   function renderActivityEvent(item: AgentActivityEvent, key: string) {
+    if (item.phase === "error" || item.command_status === "error") {
+      return renderActivityError(item, key);
+    }
     return (
       <article key={key} className={`activity-item activity-${item.phase}`}>
         <span className="activity-marker" aria-hidden="true">
           {iconForActivity(item.phase)}
         </span>
         <div className="activity-content">
-          {item.activity_type === "command" ? (
+          {item.activity_type === "work_note" ? (
+            <div className="activity-work-note">
+              <p>{item.detail || item.content || item.title}</p>
+            </div>
+          ) : item.activity_type === "plan" ? (
+            renderTaskPlanActivity(item)
+          ) : item.activity_type === "command" ? (
             renderCommandActivity(item)
           ) : item.activity_type === "file_edit" ? (
             renderFileEditActivity(item)
@@ -5332,6 +6349,83 @@ export default function App() {
               {item.content ? <p className="activity-stream-text">{item.content}</p> : null}
             </>
           )}
+        </div>
+      </article>
+    );
+  }
+
+  function renderTaskPlanActivity(item: AgentActivityEvent) {
+    const plan = item.plan ?? [];
+    const completed = item.plan_completed ?? plan.filter((entry) => entry.status === "completed").length;
+    return (
+      <div className="activity-plan-card">
+        <div className="activity-plan-heading">
+          <span>执行计划</span>
+          <strong>{completed}/{item.plan_total ?? plan.length}</strong>
+        </div>
+        <ol>
+          {plan.map((entry, index) => (
+            <li key={`${entry.step}-${index}`} className={`is-${entry.status}`}>
+              <span aria-hidden="true">
+                {entry.status === "completed" ? <CheckCircle2 /> : entry.status === "in_progress" ? <Loader2 className="spin" /> : <Clock3 />}
+              </span>
+              <p>{entry.step}</p>
+            </li>
+          ))}
+        </ol>
+      </div>
+    );
+  }
+
+  function renderActivityError(item: AgentActivityEvent, key: string) {
+    const errorText = [item.detail, item.content].filter(Boolean).join("\n\n").trim();
+    const copyPayload = [
+      item.title,
+      item.tool_name ? `工具：${item.tool_name}` : "",
+      item.step ? `步骤：${item.step}` : "",
+      item.command ? `命令：${item.command}` : "",
+      errorText
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return (
+      <article key={key} className="activity-item activity-error">
+        <span className="activity-marker" aria-hidden="true">
+          <AlertCircle />
+        </span>
+        <div className="activity-content">
+          <details className="activity-error-card" open>
+            <summary>
+              <AlertCircle aria-hidden="true" />
+              <span>
+                <strong>{item.title || "执行失败"}</strong>
+                <small>{compactActivityLine(errorText, 180) || "保留完整错误信息以便排查"}</small>
+              </span>
+              <ChevronRight aria-hidden="true" />
+            </summary>
+            <div className="activity-error-body">
+              <div className="activity-command-toolbar">
+                <span>
+                  Error
+                  {item.step ? <b>第 {item.step} 步</b> : null}
+                  {item.tool_name ? <b translate="no">{item.tool_name}</b> : null}
+                </span>
+                <button
+                  type="button"
+                  aria-label="复制完整错误"
+                  onClick={() => copyText(copyPayload, "错误信息已复制")}
+                >
+                  <Copy aria-hidden="true" />
+                </button>
+              </div>
+              <pre>
+                <code>
+                  {item.command ? `${item.command}\n\n` : ""}
+                  {errorText || "未收到更多错误详情。完整原始事件仍保留在后端活动日志中。"}
+                </code>
+              </pre>
+            </div>
+          </details>
         </div>
       </article>
     );
@@ -5370,39 +6464,46 @@ export default function App() {
     const detailText = activityRowDetail(item);
     const copyPayload = item.activity_type === "file_edit" ? item.content || "" : activityRowCopyText(item);
     return (
-      <div className="activity-summary-row" key={`${item.id ?? item.title}-${index}`}>
-        <div className="activity-summary-row-head">
-          <span>
+      <details className="activity-operation-row" key={`${item.id ?? item.title}-${index}`}>
+        <summary>
+          <span className="activity-operation-copy">
             <strong>{activityRowTitle(item)}</strong>
-            {detailText ? <small>{detailText}</small> : null}
+            <small>{activityOperationSummary(item)}</small>
           </span>
-          {copyPayload ? (
-            <button type="button" aria-label="复制详情" onClick={() => copyText(copyPayload, "详情已复制")}>
-              <Copy aria-hidden="true" />
-            </button>
-          ) : null}
-        </div>
-        {item.activity_type === "file_edit" ? (
-          <div className="activity-summary-diff">
-            <span className="activity-file-stats" aria-label={`新增 ${item.additions ?? 0} 行，删除 ${item.deletions ?? 0} 行`}>
-              <b className="is-add">+{item.additions ?? 0}</b>
-              <b className="is-del">-{item.deletions ?? 0}</b>
-            </span>
-            {item.content ? (
-              <pre>
-                <code>{compactActivityOutput(item.content)}</code>
-              </pre>
+          <ChevronRight aria-hidden="true" />
+        </summary>
+        <div className="activity-operation-body">
+          {detailText ? <p>{detailText}</p> : null}
+          <div className="activity-command-toolbar">
+            <span>{item.activity_type === "file_edit" ? "File diff" : item.tool_name ? "Tool" : "Shell"}</span>
+            {copyPayload ? (
+              <button type="button" aria-label="复制详情" onClick={() => copyText(copyPayload, "详情已复制")}>
+                <Copy aria-hidden="true" />
+              </button>
             ) : null}
           </div>
-        ) : output || item.command || item.tool_name ? (
-          <pre>
-            <code>
-              {activityRowCommandLine(item)}
-              {output ? `\n\n${compactActivityOutput(output)}` : ""}
-            </code>
-          </pre>
-        ) : null}
-      </div>
+          {item.activity_type === "file_edit" ? (
+            <div className="activity-summary-diff">
+              <span className="activity-file-stats" aria-label={`新增 ${item.additions ?? 0} 行，删除 ${item.deletions ?? 0} 行`}>
+                <b className="is-add">+{item.additions ?? 0}</b>
+                <b className="is-del">-{item.deletions ?? 0}</b>
+              </span>
+              {item.content ? (
+                <pre>
+                  <code>{compactActivityOutput(item.content, 1800)}</code>
+                </pre>
+              ) : null}
+            </div>
+          ) : output || item.command || item.tool_name ? (
+            <pre>
+              <code>
+                {activityRowCommandLine(item)}
+                {output ? `\n\n${compactActivityOutput(output, 1800)}` : ""}
+              </code>
+            </pre>
+          ) : null}
+        </div>
+      </details>
     );
   }
 
@@ -5591,6 +6692,17 @@ export default function App() {
         </header>
 
         <div className="more-grid" aria-label="功能入口">
+          <button type="button" className="more-card" onClick={() => setViewWithUrl("work-calendar")}>
+            <span className="panel-icon">
+              <CalendarDays aria-hidden="true" />
+            </span>
+            <span>
+              <strong>工作日历</strong>
+              <small>按天查看工作记录和日报，在周期末回看周报、双周报。</small>
+            </span>
+            <ChevronRight aria-hidden="true" />
+          </button>
+
           <button type="button" className="more-card" onClick={() => setViewWithUrl("sync")}>
             <span className="panel-icon">
               <Cloud aria-hidden="true" />
@@ -5627,6 +6739,149 @@ export default function App() {
             </span>
             <ChevronRight aria-hidden="true" />
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  function renderWorkCalendar() {
+    const year = workCalendar?.year ?? Number(workCalendarCursor.slice(0, 4));
+    const month = workCalendar?.month ?? Number(workCalendarCursor.slice(5, 7));
+    const firstWeekday = (new Date(year, month - 1, 1).getDay() + 6) % 7;
+    const reportLabel = (kind: string) => kind === "daily" ? "日" : kind === "weekly" ? "周" : "双";
+    const selectedDay = workCalendar?.days.find((item) => item.date === selectedWorkDate);
+    const periodReports = (workDayDetail?.covering_reports ?? []).filter((item) => item.report_type !== "daily");
+    return (
+      <div className="work-calendar-page">
+        <header className="work-calendar-heading">
+          <div>
+            <span className="work-calendar-kicker">LOCAL WORK LEDGER</span>
+            <h2>工作日历</h2>
+            <p>每天先沉淀一页，周报和双周报只做归并，不再重新翻完所有聊天。</p>
+          </div>
+          <div className="work-calendar-actions">
+            <button type="button" className="secondary-button" onClick={() => draftWorkReportRequest("weekly")}>写周报</button>
+            <button type="button" className="primary-button" onClick={() => draftWorkReportRequest("biweekly")}>写双周报</button>
+          </div>
+        </header>
+
+        <div className="work-calendar-layout">
+          <section className="work-calendar-sheet" aria-label={`${year}年${month}月工作日历`}>
+            <div className="work-calendar-toolbar">
+              <button type="button" aria-label="上个月" onClick={() => shiftWorkCalendarMonth(-1)}>
+                <ChevronRight aria-hidden="true" className="is-back" />
+              </button>
+              <strong>{year} 年 {month} 月</strong>
+              <button type="button" aria-label="下个月" onClick={() => shiftWorkCalendarMonth(1)}>
+                <ChevronRight aria-hidden="true" />
+              </button>
+            </div>
+            <div className="work-calendar-weekdays" aria-hidden="true">
+              {['一', '二', '三', '四', '五', '六', '日'].map((item) => <span key={item}>周{item}</span>)}
+            </div>
+            <div className="work-calendar-grid">
+              {Array.from({ length: firstWeekday }, (_, index) => <span className="work-calendar-blank" key={`blank-${index}`} />)}
+              {(workCalendar?.days ?? []).map((day) => (
+                <button
+                  type="button"
+                  key={day.date}
+                  className={`work-calendar-day ${day.is_workday ? "is-workday" : "is-rest"} ${day.date === selectedWorkDate ? "is-selected" : ""}`}
+                  onClick={() => void selectWorkCalendarDay(day.date)}
+                >
+                  <span className="work-calendar-day-top">
+                    <strong>{Number(day.date.slice(-2))}</strong>
+                    <small>{day.is_workday ? "工作" : "休"}</small>
+                  </span>
+                  <span className="work-calendar-day-count">
+                    {day.evidence_count ? `${day.evidence_count} 项记录` : "暂无记录"}
+                  </span>
+                  <span className="work-calendar-day-footer">
+                    <i style={{ "--evidence-strength": Math.min(day.evidence_count / 25, 1) } as CSSProperties} />
+                    <span>
+                      {day.report_types.map((kind) => <b key={kind} title={`${kind} report`}>{reportLabel(kind)}</b>)}
+                    </span>
+                  </span>
+                </button>
+              ))}
+            </div>
+            {workCalendar?.calendar.years_using_weekday_fallback.includes(year) ? (
+              <p className="work-calendar-fallback">
+                {year} 年尚未导入国务院节假日调休表，当前按周一至周五识别工作日。
+              </p>
+            ) : workCalendar?.calendar.override_years.includes(year) ? (
+              <p className="work-calendar-fallback is-official">
+                已按{workCalendar.calendar.document_number || "国务院办公厅通知"}校准法定节假日和调休工作日。
+              </p>
+            ) : null}
+          </section>
+
+          <aside className="work-day-panel" aria-live="polite">
+            <div className="work-day-panel-heading">
+              <div>
+                <span>{selectedDay?.is_workday ?? workDayDetail?.is_workday ? "工作日" : "休息日"}</span>
+                <h3>{selectedWorkDate}</h3>
+                <p>{workDayDetail?.evidence_count ?? 0} 项智能体工作记录</p>
+              </div>
+              <button type="button" className="secondary-button" onClick={() => draftWorkReportRequest("daily")}>写日报</button>
+            </div>
+
+            {workCalendarLoading && !workDayDetail ? (
+              <div className="work-day-empty"><Loader2 className="spin" aria-hidden="true" />正在读取本地工作账本…</div>
+            ) : (
+              <>
+                <section className="work-day-report-card">
+                  <div className="work-day-section-title">
+                    <strong>当日日报</strong>
+                    <span>{workDayDetail?.daily_report ? "已归档" : "待整理"}</span>
+                  </div>
+                  {workDayDetail?.daily_report?.content ? (
+                    <MarkdownContent content={workDayDetail.daily_report.content} onOpenFile={openLinkedFile} />
+                  ) : (
+                    <p className="work-day-empty-copy">这一天还没有日报。已有记录会直接复用，不需要重新扫描全部聊天。</p>
+                  )}
+                </section>
+
+                <section className="work-day-evidence">
+                  <div className="work-day-section-title">
+                    <strong>当天工作</strong>
+                    {workDayDetail?.evidence_truncated ? <span>仅显示最近 25 项</span> : null}
+                  </div>
+                  {(workDayDetail?.evidence ?? []).length ? (
+                    <div className="work-evidence-list">
+                      {(workDayDetail?.evidence ?? []).map((item, index) => (
+                        <article key={`${item.turn_id || item.timestamp}-${index}`}>
+                          <div>
+                            <strong>{item.conversation_title || "未命名任务"}</strong>
+                            <time>{new Date(item.timestamp * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>
+                          </div>
+                          {item.result ? <p>{item.result}</p> : item.user_request ? <p>{item.user_request}</p> : null}
+                          {item.artifacts?.length ? <small>形成 {item.artifacts.length} 个产物</small> : null}
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="work-day-empty-copy">没有发现本地智能体记录；如果当天在外开会或使用了其他电脑，可以在写日报时补充。</p>
+                  )}
+                </section>
+
+                {periodReports.length ? (
+                  <section className="work-period-reports">
+                    <div className="work-day-section-title"><strong>覆盖这一天的周期报告</strong></div>
+                    {periodReports.map((report) => (
+                      <details key={`${report.report_type}-${report.start_date}-${report.end_date}`}>
+                        <summary>
+                          <span>{report.report_type === "weekly" ? "周报" : "双周报"}</span>
+                          <small>{report.start_date} 至 {report.end_date}</small>
+                          <ChevronRight aria-hidden="true" />
+                        </summary>
+                        {report.content ? <MarkdownContent content={report.content} onOpenFile={openLinkedFile} /> : null}
+                      </details>
+                    ))}
+                  </section>
+                ) : null}
+              </>
+            )}
+          </aside>
         </div>
       </div>
     );
@@ -6208,6 +7463,155 @@ export default function App() {
     );
   }
 
+  function renderMemoryManagerDialog() {
+    return (
+      <div
+        className="memory-dialog-layer"
+        role="presentation"
+        onMouseDown={() => setMemoryManagerOpen(false)}
+      >
+        <section
+          className="memory-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="memory-dialog-title"
+          onMouseDown={(event) => event.stopPropagation()}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") setMemoryManagerOpen(false);
+          }}
+        >
+          <header className="memory-dialog-head">
+            <div>
+              <h2 id="memory-dialog-title">核心记忆</h2>
+              <p>
+                关于你的记忆最多 8 条；每个项目最多 6 条。具体数字、文件和某次讨论保留在聊天原文中按需检索。
+              </p>
+            </div>
+            <button type="button" aria-label="关闭记忆管理" onClick={() => setMemoryManagerOpen(false)}>
+              <X aria-hidden="true" />
+            </button>
+          </header>
+
+          <div className="memory-dialog-toolbar">
+            <label className="memory-search-field">
+              <Search aria-hidden="true" />
+              <span className="sr-only">搜索核心记忆</span>
+              <input
+                autoFocus
+                type="search"
+                value={memoryQuery}
+                placeholder="搜索核心记忆或来源聊天"
+                onChange={(event) => setMemoryQuery(event.target.value)}
+              />
+            </label>
+            <div className="memory-scope-switch" role="group" aria-label="记忆范围">
+              {([
+                ["all", "全部"],
+                ["account", "关于你"],
+                ["projects", "项目"]
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={memoryScope === value ? "is-active" : ""}
+                  aria-pressed={memoryScope === value}
+                  onClick={() => setMemoryScope(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => void refreshCrossChatMemories()}
+              disabled={busy}
+            >
+              <RefreshCw aria-hidden="true" />
+              刷新
+            </button>
+          </div>
+
+          <div className="memory-dialog-explainer">
+            <strong>核心记忆不是聊天摘要</strong>
+            <span>系统只在明确要求记住，或较长讨论中反复确认稳定特征时低频更新。</span>
+          </div>
+
+          <div className="memory-dialog-content">
+            {filteredCrossChatMemories.length > 0 ? (
+              <div className="memory-list" role="list">
+                {filteredCrossChatMemories.map((memory) => {
+                  const projectName = projects.find((project) => project.id === memory.project_id)?.name;
+                  const editing = editingMemoryId === memory.id;
+                  const confirmingDelete = deleteConfirmMemoryId === memory.id;
+                  return (
+                    <article className="memory-row" role="listitem" key={memory.id}>
+                      <header>
+                        <div className="memory-source-title">
+                          <strong>{memory.project_id ? projectName || "项目记忆" : "关于你"}</strong>
+                          {memory.state === "corrected" ? <span className="memory-corrected-badge">已纠正</span> : null}
+                          {projectName ? <span className="memory-project-badge">{projectName}</span> : null}
+                        </div>
+                        <time>{formatProjectDate(memory.updated_at)}</time>
+                      </header>
+                      {editing ? (
+                        <div className="memory-editor">
+                          <textarea
+                            autoFocus
+                            rows={5}
+                            value={memoryDraft}
+                            aria-label="纠正核心记忆"
+                            onChange={(event) => setMemoryDraft(event.target.value)}
+                          />
+                          <div>
+                            <button type="button" className="secondary-button" onClick={() => { setEditingMemoryId(null); setMemoryDraft(""); }}>取消</button>
+                            <button type="button" className="primary-button" disabled={busy || !memoryDraft.trim()} onClick={() => void saveMemoryCorrection(memory.id)}>
+                              <Check aria-hidden="true" />保存纠正
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <p>{memory.content}</p>
+                      )}
+                      {!editing ? (
+                        <footer>
+                          <button type="button" className="text-button" onClick={() => openMemorySource(memory)}>
+                            <Eye aria-hidden="true" />来源聊天
+                          </button>
+                          <span className="memory-row-spacer" />
+                          <button type="button" className="text-button" onClick={() => startEditMemory(memory)}>
+                            <Pencil aria-hidden="true" />修改
+                          </button>
+                          <button
+                            type="button"
+                            className={`text-button memory-delete-button ${confirmingDelete ? "is-confirming" : ""}`}
+                            onClick={() => void deleteCrossChatMemory(memory.id)}
+                          >
+                            <Trash2 aria-hidden="true" />{confirmingDelete ? "确认删除" : "删除"}
+                          </button>
+                        </footer>
+                      ) : null}
+                    </article>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="memory-empty-state">
+                <Brain aria-hidden="true" />
+                <strong>{crossChatMemories.length > 0 ? "没有匹配的核心记忆" : "当前没有核心记忆"}</strong>
+                <p>
+                  {crossChatMemories.length > 0
+                    ? "换一个关键词或范围试试。"
+                    : "这是正常状态。细节仍保存在原始聊天中，需要时会通过关键词检索。"}
+                </p>
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   function renderModels() {
     return (
       <div className="stack settings-page">
@@ -6216,6 +7620,20 @@ export default function App() {
           <p className="muted">
             这是你主动填写的个性化资料，独立于系统自动生成的记忆。只写希望长期生效的称呼、身份与偏好。
           </p>
+          <Field label="助理名称" htmlFor="assistant-name">
+            <input
+              id="assistant-name"
+              value={agentSettingsForm.assistant_name}
+              onChange={(event) =>
+                setAgentSettingsForm({
+                  ...agentSettingsForm,
+                  assistant_name: event.target.value
+                })
+              }
+              placeholder="Friday"
+            />
+          </Field>
+          <p className="muted">显示在固定的持续对话入口中；默认名称为 Friday。</p>
           <div className="form-grid">
             <Field label="昵称" htmlFor="agent-nickname">
               <input id="agent-nickname" value={agentSettingsForm.nickname} onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, nickname: event.target.value })} placeholder="希望智能体如何称呼你？" />
@@ -6262,13 +7680,152 @@ export default function App() {
           </div>
         </form>
 
-        <section className="panel memory-manager" aria-labelledby="cross-chat-memory-title">
-          <div className="memory-manager-heading">
+        <section className="panel weixin-settings" aria-labelledby="weixin-channel-title">
+          <div className="weixin-settings-heading">
+            <div className="panel-header">
+              <span className="panel-icon"><MessageCircle aria-hidden="true" /></span>
+              <div>
+                <h3 id="weixin-channel-title">微信连接</h3>
+                <p>在手机微信中直接和 Friday 持续对话。</p>
+              </div>
+            </div>
+            <span className={`weixin-connection-state is-${weixinStatus?.state ?? "disconnected"}`}>
+              <span aria-hidden="true" />
+              {weixinStatus?.connected
+                ? weixinStatus.running
+                  ? "已连接"
+                  : "连接异常"
+                : "未连接"}
+            </span>
+          </div>
+
+          <div className="weixin-boundary-note">
+            <AlertCircle aria-hidden="true" />
+            <p>
+              扫码会创建一个独立的微信机器人身份，不会接管你的个人微信号。目前可靠支持机器人私聊；
+              普通微信群通常无法接收，图片和文件也暂未接入。
+            </p>
+          </div>
+
+          {weixinStatus?.connected ? (
+            <div className="weixin-connected-view">
+              <dl>
+                <div>
+                  <dt>机器人账号</dt>
+                  <dd translate="no">{weixinStatus.account_id}</dd>
+                </div>
+                <div>
+                  <dt>当前能力</dt>
+                  <dd>文字私聊、已转写语音、Friday 长期会话</dd>
+                </div>
+                <div>
+                  <dt>最近消息</dt>
+                  <dd>
+                    {weixinStatus.last_message_at
+                      ? formatProjectDate(weixinStatus.last_message_at)
+                      : "尚未收到消息"}
+                  </dd>
+                </div>
+              </dl>
+              {weixinStatus.last_error ? (
+                <div className="weixin-channel-error" role="alert">
+                  <AlertCircle aria-hidden="true" />
+                  <span>{weixinStatus.last_error}</span>
+                </div>
+              ) : null}
+              <div className="form-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void api.weixinStatus().then(setWeixinStatus)}
+                  disabled={weixinBusy}
+                >
+                  <RefreshCw aria-hidden="true" />
+                  刷新状态
+                </button>
+                <button
+                  type="button"
+                  className="text-button danger-text-button"
+                  onClick={() => void disconnectWeixin()}
+                  disabled={weixinBusy}
+                >
+                  断开微信
+                </button>
+              </div>
+            </div>
+          ) : weixinStatus?.login ? (
+            <div className="weixin-login-flow">
+              <div className="weixin-qr-frame">
+                <img
+                  src={`/api/channels/weixin/login/qr?session_id=${encodeURIComponent(weixinStatus.login.session_id)}`}
+                  alt="用于连接 Friday 的微信二维码"
+                />
+              </div>
+              <div className="weixin-login-copy">
+                <strong>{weixinLoginStatusLabel(weixinStatus.login)}</strong>
+                <p>{weixinStatus.login.message || "请使用手机微信扫描二维码并在手机上确认。"}</p>
+                {weixinStatus.login.needs_verify_code ? (
+                  <form className="weixin-verify-form" onSubmit={submitWeixinVerifyCode}>
+                    <label htmlFor="weixin-verify-code">手机微信显示的数字</label>
+                    <div>
+                      <input
+                        id="weixin-verify-code"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        value={weixinVerifyCode}
+                        onChange={(event) => setWeixinVerifyCode(event.target.value.replace(/\D/g, ""))}
+                      />
+                      <button
+                        type="submit"
+                        className="primary-button"
+                        disabled={weixinBusy || !weixinVerifyCode.trim()}
+                      >
+                        确认
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <span className="weixin-waiting">
+                    <Loader2 className="spin" aria-hidden="true" />
+                    正在等待扫码结果
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => void startWeixinLogin(true)}
+                  disabled={weixinBusy}
+                >
+                  重新生成二维码
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="weixin-disconnected-view">
+              <div>
+                <strong>连接后，微信消息会进入同一个 Friday 持续会话</strong>
+                <p>网页和微信共享后端会话、长期记忆和工具能力，不需要使用 /new。</p>
+              </div>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => void startWeixinLogin()}
+                disabled={weixinBusy}
+              >
+                {weixinBusy ? <Loader2 className="spin" aria-hidden="true" /> : <MessageCircle aria-hidden="true" />}
+                生成微信二维码
+              </button>
+            </div>
+          )}
+        </section>
+
+        <section className="panel memory-settings-summary" aria-labelledby="cross-chat-memory-title">
+          <div className="memory-settings-heading">
             <div className="panel-header">
               <span className="panel-icon"><Brain aria-hidden="true" /></span>
               <div>
                 <h3 id="cross-chat-memory-title">记忆</h3>
-                <p>系统从聊天中提炼长期信息，并在回答前按相关性取回；聊天原文仍可用于核验。</p>
+                <p>这里只保留少量、跨任务长期有效的核心信息。</p>
               </div>
             </div>
             <div className="memory-manager-status">
@@ -6278,146 +7835,40 @@ export default function App() {
                 <b>{agentSettingsForm.memory_enabled ? "启用记忆" : "关闭记忆"}</b>
               </label>
               <button type="button" className="text-button" onClick={() => void saveAgentSettings({ preventDefault() {} } as FormEvent<HTMLFormElement>)} disabled={busy}>保存开关</button>
-              <button type="button" className="text-button" onClick={() => void refreshCrossChatMemories()} disabled={busy}>
-                <RefreshCw aria-hidden="true" />重新同步
+            </div>
+          </div>
+
+          <div className="memory-settings-body">
+            <div className="memory-settings-counts" aria-label="核心记忆数量">
+              <span><strong>{accountMemoryCount}</strong><small>关于你 · 上限 8 条</small></span>
+              <span><strong>{projectMemoryCount}</strong><small>项目记忆 · 每项目上限 6 条</small></span>
+            </div>
+            <p>
+              普通对话细节、数字、文件和阶段进展保留在原始聊天中，需要时通过关键词检索召回，
+              不会不断写进核心记忆。
+            </p>
+            <div className="memory-settings-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  setMemoryManagerOpen(true);
+                  void refreshCrossChatMemories();
+                }}
+              >
+                <Brain aria-hidden="true" />
+                管理核心记忆
               </button>
+              <span>查看、纠正或删除每一条记忆</span>
             </div>
           </div>
-
-          <div className="memory-manager-toolbar">
-            <label className="memory-search-field">
-              <Search aria-hidden="true" />
-              <span className="sr-only">搜索跨聊天记忆</span>
-              <input
-                type="search"
-                value={memoryQuery}
-                placeholder="搜索记忆或来源聊天"
-                onChange={(event) => setMemoryQuery(event.target.value)}
-              />
-            </label>
-            <div className="memory-scope-switch" role="group" aria-label="记忆范围">
-              {([
-                ["all", "全部"],
-                ["account", "普通聊天"],
-                ["projects", "项目"]
-              ] as const).map(([value, label]) => (
-                <button
-                  key={value}
-                  type="button"
-                  className={memoryScope === value ? "is-active" : ""}
-                  aria-pressed={memoryScope === value}
-                  onClick={() => setMemoryScope(value)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="memory-structure-note">
-            <span><strong>关于你</strong> 由你主动填写</span>
-            <ChevronRight aria-hidden="true" />
-            <span><strong>自动记忆</strong> 从聊天提炼</span>
-            <ChevronRight aria-hidden="true" />
-            <span><strong>原文回想</strong> 用于核验细节</span>
-          </div>
-
-          {agentSettingsForm.memory_enabled ? null : <p className="memory-notice">关闭后不会生成、更新或在回答中参考自动记忆；现有记忆不会被删除。</p>}
-          {crossChatMemories.length > 0 ? null : <p className="memory-notice">记忆会在聊天达到一定信息量后后台整理；不会把每句闲聊都保存下来。</p>}
-          {memoryProfile ? (
-            <article className="memory-profile" aria-label="自动记忆摘要">
-              <header><strong>记忆摘要</strong><time>{formatProjectDate(memoryProfile.updated_at)}</time></header>
-              <p>{memoryProfile.content}</p>
-            </article>
-          ) : null}
-
-          {filteredCrossChatMemories.length > 0 ? (
-            <div className="memory-list" role="list">
-              {filteredCrossChatMemories.map((memory) => {
-                const projectName = projects.find((project) => project.id === memory.project_id)?.name;
-                const editing = editingMemoryId === memory.id;
-                const confirmingDelete = deleteConfirmMemoryId === memory.id;
-                return (
-                  <article className="memory-row" role="listitem" key={memory.id}>
-                    <header>
-                      <div className="memory-source-title">
-                        <strong>{memory.conversation_title || "未命名聊天"}</strong>
-                        {memory.state === "corrected" ? <span className="memory-corrected-badge">已纠正</span> : null}
-                        {projectName ? <span className="memory-project-badge">{projectName}</span> : null}
-                      </div>
-                      <time>{formatProjectDate(memory.updated_at)}</time>
-                    </header>
-                    {editing ? (
-                      <div className="memory-editor">
-                        <textarea
-                          autoFocus
-                          rows={6}
-                          value={memoryDraft}
-                          aria-label={`纠正来自${memory.conversation_title}的记忆`}
-                          onChange={(event) => setMemoryDraft(event.target.value)}
-                        />
-                        <div>
-                          <button type="button" className="secondary-button" onClick={() => { setEditingMemoryId(null); setMemoryDraft(""); }}>取消</button>
-                          <button type="button" className="primary-button" disabled={busy || !memoryDraft.trim()} onClick={() => void saveMemoryCorrection(memory.id)}>
-                            <Check aria-hidden="true" />保存纠正
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <p>{memory.content}</p>
-                    )}
-                    {!editing ? (
-                      <footer>
-                        <button type="button" className="text-button" onClick={() => openMemorySource(memory)}>
-                          <Eye aria-hidden="true" />查看来源聊天
-                        </button>
-                        <span className="memory-row-spacer" />
-                        <button type="button" className="text-button" onClick={() => startEditMemory(memory)}>
-                          <Pencil aria-hidden="true" />纠正
-                        </button>
-                        <button
-                          type="button"
-                          className={`text-button memory-delete-button ${confirmingDelete ? "is-confirming" : ""}`}
-                          onClick={() => void deleteCrossChatMemory(memory.id)}
-                        >
-                          <Trash2 aria-hidden="true" />{confirmingDelete ? "确认删除" : "删除"}
-                        </button>
-                      </footer>
-                    ) : null}
-                  </article>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="memory-empty-state">
-              <Brain aria-hidden="true" />
-              <strong>{crossChatMemories.length > 0 ? "没有匹配的记忆" : "还没有自动记忆"}</strong>
-              <p>{crossChatMemories.length > 0 ? "换一个关键词或记忆范围试试。" : "系统会在后续对话中提炼有长期价值的信息；聊天原文仍可随时回想和核验。"}</p>
-            </div>
-          )}
         </section>
 
         <form className="panel settings-meeting-minutes" onSubmit={saveMeetingMinutesSettings}>
           <PanelHeader icon={<FileText aria-hidden="true" />} title="会议纪要设置" />
           <p className="muted">
-            这里保存本账户的会议纪要偏好，会在每次生成时附加到会议纪要流程；它不修改技能的通用说明。
+            这里保存本账户的补充写作要求，会在每次生成时附加到会议纪要流程；输出位置由系统统一管理。
           </p>
-          <Field label="默认输出目录" htmlFor="meeting-minutes-output-dir">
-            <input
-              id="meeting-minutes-output-dir"
-              name="meeting-minutes-output-dir"
-              type="text"
-              spellCheck={false}
-              value={meetingMinutesSettingsForm.default_output_dir}
-              onChange={(event) =>
-                setMeetingMinutesSettingsForm({
-                  ...meetingMinutesSettingsForm,
-                  default_output_dir: event.target.value
-                })
-              }
-              placeholder="meet_files"
-            />
-          </Field>
           <Field label="补充写作要求" htmlFor="meeting-minutes-custom-instructions">
             <textarea
               id="meeting-minutes-custom-instructions"
@@ -7205,6 +8656,431 @@ function OutputPanel({
   );
 }
 
+function TimelineEditor({
+  editor,
+  busy,
+  onChange,
+  onCancel,
+  onSubmit
+}: {
+  editor: TimelineEditorState;
+  busy: boolean;
+  onChange: (key: keyof TimelineEditorValues, value: string) => void;
+  onCancel: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <form className="timeline-editor" onSubmit={onSubmit}>
+      <header>
+        <div>
+          <strong>{editor.mode === "add" ? "新增关键节点" : "编辑关键节点"}</strong>
+          <span>保存后直接回写项目 Excel</span>
+        </div>
+        <button type="button" className="icon-action-button" aria-label="关闭节点编辑" onClick={onCancel}>
+          <X aria-hidden="true" />
+        </button>
+      </header>
+      <div className="timeline-editor-grid">
+        <label className="is-wide">
+          <span>关键节点</span>
+          <input
+            autoFocus
+            required
+            value={editor.values.title}
+            placeholder="例如：完成装修方案内部确认"
+            onChange={(event) => onChange("title", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>计划日期</span>
+          <input
+            type="date"
+            value={editor.values.planned_date}
+            onChange={(event) => onChange("planned_date", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>状态</span>
+          <select value={editor.values.status} onChange={(event) => onChange("status", event.target.value)}>
+            {TIMELINE_STATUS_OPTIONS.map((status) => <option value={status} key={status}>{status}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>工作线</span>
+          <input
+            value={editor.values.workstream}
+            placeholder="可研、装修、课程建设…"
+            onChange={(event) => onChange("workstream", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>责任方</span>
+          <input
+            value={editor.values.owner}
+            placeholder="负责人或责任单位"
+            onChange={(event) => onChange("owner", event.target.value)}
+          />
+        </label>
+        <label className="is-wide">
+          <span>验收口径</span>
+          <input
+            value={editor.values.completion_criteria}
+            placeholder="做到什么程度才算完成"
+            onChange={(event) => onChange("completion_criteria", event.target.value)}
+          />
+        </label>
+        <label className="is-wide">
+          <span>当前进展</span>
+          <textarea
+            rows={2}
+            value={editor.values.progress}
+            onChange={(event) => onChange("progress", event.target.value)}
+          />
+        </label>
+        <label className="is-wide">
+          <span>下一步动作</span>
+          <textarea
+            rows={2}
+            value={editor.values.next_action}
+            onChange={(event) => onChange("next_action", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>实际完成日期</span>
+          <input
+            type="date"
+            value={editor.values.actual_date}
+            onChange={(event) => onChange("actual_date", event.target.value)}
+          />
+        </label>
+        <label>
+          <span>相关材料</span>
+          <input
+            value={editor.values.materials}
+            placeholder="方案、纪要、报告…"
+            onChange={(event) => onChange("materials", event.target.value)}
+          />
+        </label>
+        <label className="is-wide">
+          <span>备注</span>
+          <input value={editor.values.notes} onChange={(event) => onChange("notes", event.target.value)} />
+        </label>
+      </div>
+      <footer>
+        <button type="button" className="secondary-button" onClick={onCancel}>取消</button>
+        <button type="submit" className="primary-button" disabled={busy}>
+          {busy ? "正在同步…" : "保存到 Excel"}
+        </button>
+      </footer>
+    </form>
+  );
+}
+
+function TimelineCompletionPanel({
+  completion,
+  materials,
+  busy,
+  onNoteChange,
+  onToggleMaterial,
+  onUpload,
+  onCancel,
+  onSubmit
+}: {
+  completion: TimelineCompletionState;
+  materials: ProjectMaterial[];
+  busy: boolean;
+  onNoteChange: (note: string) => void;
+  onToggleMaterial: (path: string) => void;
+  onUpload: (files: FileList) => void;
+  onCancel: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <form className="timeline-completion-panel" onSubmit={onSubmit}>
+      <header>
+        <div>
+          <span>确认节点完成</span>
+          <strong>{completion.node.title || completion.node.completion_criteria || "未命名节点"}</strong>
+        </div>
+        <button type="button" className="icon-action-button" aria-label="关闭完成确认" onClick={onCancel}>
+          <X aria-hidden="true" />
+        </button>
+      </header>
+      <label className="timeline-completion-note">
+        <span>完成说明 <b>必填</b></span>
+        <textarea
+          autoFocus
+          required
+          rows={3}
+          value={completion.note}
+          placeholder="例如：可研报告已完成内部确认，关键数据与合作边界已核验。"
+          onChange={(event) => onNoteChange(event.target.value)}
+        />
+      </label>
+      <section className="timeline-completion-materials" aria-label="选择成果材料">
+        <header>
+          <div>
+            <strong>成果材料</strong>
+            <span>选择已经放进项目的正式或当前版本；中间稿不必挂接。</span>
+          </div>
+          <label className="secondary-button timeline-completion-upload">
+            <Upload aria-hidden="true" />
+            上传成果
+            <input
+              type="file"
+              multiple
+              onChange={(event) => {
+                if (event.currentTarget.files) onUpload(event.currentTarget.files);
+                event.currentTarget.value = "";
+              }}
+            />
+          </label>
+        </header>
+        {materials.length > 0 ? (
+          <div className="timeline-material-picker">
+            {materials.map((material) => (
+              <label key={material.path}>
+                <input
+                  type="checkbox"
+                  checked={completion.materialPaths.includes(material.path)}
+                  onChange={() => onToggleMaterial(material.path)}
+                />
+                <FileText aria-hidden="true" />
+                <span>
+                  <strong>{material.display_name}</strong>
+                  <small>{material.category_label} · {material.document_status_label}</small>
+                </span>
+              </label>
+            ))}
+          </div>
+        ) : (
+          <p className="timeline-material-empty">项目里还没有可选材料，可以直接上传成果文件。</p>
+        )}
+      </section>
+      <footer>
+        <span>确认后会回写状态、实际完成日期、完成说明和成果路径到 Excel。</span>
+        <button type="button" className="secondary-button" onClick={onCancel}>取消</button>
+        <button type="submit" className="primary-button" disabled={busy || !completion.note.trim()}>
+          <CheckCircle2 aria-hidden="true" />
+          {busy ? "正在落盘…" : "确认完成"}
+        </button>
+      </footer>
+    </form>
+  );
+}
+
+function TimelineNodeRow({
+  node,
+  materials,
+  onOpenMaterial,
+  onComplete,
+  onEdit,
+  onDelete
+}: {
+  node: ProjectTimelineNode;
+  materials: ProjectMaterial[];
+  onOpenMaterial: (path: string) => void;
+  onComplete: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const schedule = timelineScheduleLabel(node);
+  const materialEntries = timelineMaterialEntries(node.materials, materials);
+  return (
+    <li className={`timeline-node is-${node.schedule_state}`}>
+      <div className="timeline-node-date">
+        <strong>{formatTimelineDate(node.planned_date)}</strong>
+        <span>{schedule}</span>
+      </div>
+      <span className="timeline-node-marker" aria-hidden="true" />
+      <div className="timeline-node-body">
+        <header>
+          <div>
+            <span className="timeline-node-workstream">{node.workstream || "未分类"}</span>
+            <strong>{node.title || node.completion_criteria || "未命名节点"}</strong>
+          </div>
+          <span className={`timeline-status is-${node.schedule_state}`}>{node.status}</span>
+        </header>
+        {node.progress ? <p>{node.progress}</p> : null}
+        {node.next_action ? (
+          <div className="timeline-next-action">
+            <span>下一步</span>
+            <strong>{node.next_action}</strong>
+          </div>
+        ) : null}
+        {materialEntries.length > 0 ? (
+          <div className="timeline-node-materials">
+            <span>{node.schedule_state === "completed" ? "完成材料" : "相关材料"}</span>
+            <div>
+              {materialEntries.map((entry) =>
+                entry.path ? (
+                  <button type="button" key={entry.value} onClick={() => onOpenMaterial(entry.path!)}>
+                    <FileText aria-hidden="true" />
+                    {entry.label}
+                  </button>
+                ) : (
+                  <span key={entry.value}>{entry.label}</span>
+                )
+              )}
+            </div>
+          </div>
+        ) : null}
+        <footer>
+          <span>{node.owner ? `责任方：${node.owner}` : "责任方待明确"}</span>
+          {node.schedule_state === "completed" && node.actual_date
+            ? <span>完成日期：{formatTimelineDate(node.actual_date)}</span>
+            : null}
+          <div>
+            {node.schedule_state !== "completed" && node.schedule_state !== "cancelled" ? (
+              <button type="button" className="timeline-complete-action" onClick={onComplete}>
+                <CheckCircle2 aria-hidden="true" />确认完成
+              </button>
+            ) : null}
+            <button type="button" onClick={onEdit}><Pencil aria-hidden="true" />编辑</button>
+            {node.schedule_state !== "cancelled" ? (
+              <button type="button" onClick={onDelete}><X aria-hidden="true" />取消节点</button>
+            ) : null}
+          </div>
+        </footer>
+      </div>
+    </li>
+  );
+}
+
+function normalizeTimelineDateInput(value: string | null | undefined) {
+  const text = String(value ?? "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : "";
+}
+
+function localDateInputValue(value: Date) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function timelineMaterialParts(value: string | null | undefined) {
+  return String(value ?? "")
+    .split(/[\n；;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function timelineMaterialPaths(value: string | null | undefined) {
+  return timelineMaterialParts(value).filter((item) => item.startsWith("meet_files/"));
+}
+
+function mergeTimelineMaterials(
+  current: string | null | undefined,
+  selectedPaths: string[]
+) {
+  const descriptive = timelineMaterialParts(current).filter((item) => !item.startsWith("meet_files/"));
+  return Array.from(new Set([...descriptive, ...selectedPaths])).join("\n");
+}
+
+function timelineMaterialEntries(
+  value: string | null | undefined,
+  materials: ProjectMaterial[]
+) {
+  const byPath = new Map(materials.map((material) => [material.path, material]));
+  return timelineMaterialParts(value).map((part) => {
+    const material = byPath.get(part);
+    return {
+      value: part,
+      path: material?.path,
+      label: material?.display_name || part
+    };
+  });
+}
+
+function formatTimelineDate(value: string | null | undefined) {
+  const text = String(value ?? "").trim();
+  if (!text) return "待排期";
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (!match) return text;
+  return `${Number(match[2])}月${Number(match[3])}日`;
+}
+
+function timelineScheduleLabel(node: ProjectTimelineNode) {
+  if (node.schedule_state === "completed") return "已完成";
+  if (node.schedule_state === "cancelled") return "已取消";
+  if (node.schedule_state === "risk") return "存在风险";
+  if (node.schedule_state === "overdue") return `逾期 ${Math.abs(node.days_until ?? 0)} 天`;
+  if (node.schedule_state === "due_soon") {
+    if (node.days_until === 0) return "今天";
+    return `${node.days_until} 天后`;
+  }
+  if (node.schedule_state === "upcoming") return `${node.days_until} 天后`;
+  return "待排期";
+}
+
+function ProjectMaterialRow({
+  material,
+  onOpen,
+  onDelete
+}: {
+  material: ProjectMaterial;
+  onOpen: (path: string) => void;
+  onDelete: (path: string) => void;
+}) {
+  return (
+    <article className="project-material-row">
+      <div className="project-material-current">
+        <button type="button" className="project-material-main" onClick={() => onOpen(material.path)}>
+          <span className="project-file-icon" aria-hidden="true">{iconForAttachment(material.kind)}</span>
+          <span className="project-material-copy">
+            <span className="project-material-title-line">
+              <strong>{material.display_name}</strong>
+              <span className={`project-material-status is-${material.document_status}`}>
+                {material.document_status_label}
+              </span>
+            </span>
+            <small>
+              {material.extension.replace(".", "").toUpperCase()} · {formatBytes(material.size)} · {formatProjectDate(material.modified)}
+            </small>
+          </span>
+        </button>
+        <button
+          type="button"
+          className="project-file-delete"
+          aria-label={`移除 ${material.name}`}
+          title="从项目中移除"
+          onClick={() => onDelete(material.path)}
+        >
+          <Trash2 aria-hidden="true" />
+        </button>
+      </div>
+      {material.history.length > 0 ? (
+        <details className="project-material-history">
+          <summary>
+            <ChevronRight aria-hidden="true" />
+            历史版本 {material.history.length}
+          </summary>
+          <div>
+            {material.history.map((version) => (
+              <div className="project-material-history-row" key={version.path}>
+                <button type="button" onClick={() => onOpen(version.path)}>
+                  <span>{version.name}</span>
+                  <small>{version.document_status_label} · {formatProjectDate(version.modified)}</small>
+                </button>
+                <button
+                  type="button"
+                  className="project-file-delete"
+                  aria-label={`移除历史版本 ${version.name}`}
+                  title="从项目中移除"
+                  onClick={() => onDelete(version.path)}
+                >
+                  <Trash2 aria-hidden="true" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
 function EmptyState({ text }: { text: string }) {
   return (
     <div className="empty-state">
@@ -7714,22 +9590,15 @@ function StatusPill({ children, tone }: { children: ReactNode; tone: StatusTone 
   return <span className={`status-pill status-${tone}`} title={title}>{children}</span>;
 }
 
-function StatusLine({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="status-line">
-      <span>{label}</span>
-      <strong translate="no">{value}</strong>
-    </div>
-  );
-}
-
 function titleForView(view: View, artifactTab: ArtifactTab) {
+  if (view === "friday") return "Friday";
   if (view === "projects") return "项目";
   if (view === "skills") return "技能";
   if (view === "transcribe") return "实时转写";
   if (view === "artifacts") return artifactTab === "files" ? "文件库" : "会议纪要";
   if (view === "models") return "模型与设置";
   if (view === "sync") return "临时同步区";
+  if (view === "work-calendar") return "工作日历";
   if (view === "more") return "更多";
   return "智能体对话";
 }
@@ -7974,6 +9843,14 @@ function mergeConversationHistories(
   for (const item of localItems) {
     const local = sanitizeConversationHistoryItem(item);
     const archived = byId.get(local.id);
+    if (
+      local.id === FRIDAY_CONVERSATION_ID &&
+      archived &&
+      archived.messages.length > local.messages.length
+    ) {
+      byId.set(local.id, archived);
+      continue;
+    }
     // Browser state is normally newer, but older browser archives could be
     // missing projectId after the first-turn title save.  Merge that durable
     // server-side association back instead of hiding the chat from its project.
@@ -7985,6 +9862,140 @@ function mergeConversationHistories(
     );
   }
   return orderConversationHistory(Array.from(byId.values()));
+}
+
+function conversationArchiveChangeSet(
+  baseItems: ConversationHistoryItem[],
+  nextItems: ConversationHistoryItem[]
+) {
+  const baseById = new Map(baseItems.map((item) => [item.id, sanitizeConversationHistoryItem(item)]));
+  const nextById = new Map(nextItems.map((item) => [item.id, sanitizeConversationHistoryItem(item)]));
+  const upserts = Array.from(nextById.values()).filter(
+    (item) => !conversationHistoryItemsEqual(item, baseById.get(item.id))
+  );
+  const deletedIds = Array.from(baseById.keys()).filter((id) => !nextById.has(id));
+  return { upserts, deletedIds };
+}
+
+function mergeConversationArchiveConflict(
+  baseItems: ConversationHistoryItem[],
+  localItems: ConversationHistoryItem[],
+  serverItems: ConversationHistoryItem[]
+) {
+  const baseById = new Map(baseItems.map((item) => [item.id, sanitizeConversationHistoryItem(item)]));
+  const localById = new Map(localItems.map((item) => [item.id, sanitizeConversationHistoryItem(item)]));
+  const serverById = new Map(serverItems.map((item) => [item.id, sanitizeConversationHistoryItem(item)]));
+  const ids = new Set([...baseById.keys(), ...localById.keys(), ...serverById.keys()]);
+  const merged: ConversationHistoryItem[] = [];
+
+  for (const id of ids) {
+    const base = baseById.get(id);
+    const local = localById.get(id);
+    const server = serverById.get(id);
+    if (!base) {
+      merged.push(local ?? server!);
+      continue;
+    }
+    if (!local) {
+      // A local deletion only wins when the server has not changed that chat.
+      if (server && !conversationHistoryItemsEqual(server, base)) merged.push(server);
+      continue;
+    }
+    if (!server) {
+      // Likewise, preserve a local edit if it raced with a server deletion.
+      if (!conversationHistoryItemsEqual(local, base)) merged.push(local);
+      continue;
+    }
+    if (conversationHistoryItemsEqual(local, base)) {
+      merged.push(server);
+    } else if (conversationHistoryItemsEqual(server, base)) {
+      merged.push(local);
+    } else {
+      merged.push(mergeDivergedConversationHistoryItem(server, local));
+    }
+  }
+  return orderConversationHistory(merged);
+}
+
+function mergeDivergedConversationHistoryItem(
+  server: ConversationHistoryItem,
+  local: ConversationHistoryItem
+): ConversationHistoryItem {
+  const messages = mergeConversationMessages(server.messages, local.messages);
+  const activities = mergeConversationActivities(server.activities, local.activities);
+  return {
+    ...server,
+    ...local,
+    messages,
+    activities,
+    activeActivityIndex: Math.max(server.activeActivityIndex ?? -1, local.activeActivityIndex ?? -1)
+  };
+}
+
+function mergeConversationMessages(server: ChatMessage[], local: ChatMessage[]) {
+  const seen = new Set<string>();
+  const merged: ChatMessage[] = [];
+  for (const message of [...server, ...local]) {
+    const key = JSON.stringify(message);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(message);
+  }
+  return merged;
+}
+
+function mergeConversationActivities(
+  server?: ActivityRecordMap,
+  local?: ActivityRecordMap
+): ActivityRecordMap | undefined {
+  if (!server) return local;
+  if (!local) return server;
+  const merged: ActivityRecordMap = { ...server };
+  for (const [key, localRecord] of Object.entries(local)) {
+    const index = Number(key);
+    const serverRecord = merged[index];
+    if (!serverRecord || localRecord.events.length > serverRecord.events.length) {
+      merged[index] = localRecord;
+    }
+  }
+  return merged;
+}
+
+function conversationHistoryItemsEqual(
+  left: ConversationHistoryItem | undefined,
+  right: ConversationHistoryItem | undefined
+) {
+  if (!left || !right) return left === right;
+  return JSON.stringify(sanitizeConversationHistoryItem(left)) === JSON.stringify(sanitizeConversationHistoryItem(right));
+}
+
+function fridayGreeting(assistantName: string): string {
+  return `你好，我是${assistantName}，你的项目经理助理。这里是一条持续对话，不需要用 /new；你可以随时接着上次的工作继续说。`;
+}
+
+function ensureFridayConversation(
+  items: ConversationHistoryItem[],
+  assistantName: string
+): ConversationHistoryItem[] {
+  const name = assistantName.trim() || "Friday";
+  const current = items.find((item) => item.id === FRIDAY_CONVERSATION_ID);
+  if (current) {
+    return orderConversationHistory([
+      { ...current, title: name, group: "助理", pinned: false, projectId: undefined },
+      ...items.filter((item) => item.id !== FRIDAY_CONVERSATION_ID)
+    ]);
+  }
+  return orderConversationHistory([
+    {
+      id: FRIDAY_CONVERSATION_ID,
+      title: name,
+      group: "助理",
+      messages: [{ role: "assistant", content: fridayGreeting(name) }],
+      contextSummary: "",
+      contextSummaryMessageCount: 0
+    },
+    ...items
+  ]);
 }
 
 function lastActivityRecordIndex(records: ActivityRecordMap) {
@@ -8028,7 +10039,7 @@ function buildActivityDisplayItems(events: AgentActivityEvent[]): ActivityDispla
     if (shouldHideActivityEvent(normalized)) return;
     const groupKind = groupKindForActivityEvent(normalized);
     if (groupKind) {
-      if (!group || group.kind !== groupKind) {
+      if (!group) {
         flushGroup();
         group = { kind: groupKind, startIndex: index, events: [] };
       }
@@ -8059,7 +10070,7 @@ function makeActivityDisplayGroup(
     status,
     title: activityGroupTitle(groupKind, events),
     detail: activityGroupDetail(groupKind, events, status),
-    icon: groupKind === "files" ? "±" : groupKind === "tools" ? "·" : "$",
+    icon: "⌘",
     open: status === "running" || status === "approval_required" || status === "error",
     events
   };
@@ -8112,17 +10123,24 @@ function shouldHideActivityEvent(event: AgentActivityEvent) {
   if (event.title === "载入上下文" || event.title === "准备处理") return true;
   if (/^第 \d+ 轮模型规划$/.test(event.title) || event.title === "请求模型") return true;
   if (event.title === "准备工具") return true;
+  if (
+    /模型思考$/.test(event.title) &&
+    /(?:✓|最终答复已写入|已确定下一步)/.test(event.content ?? "")
+  ) {
+    return true;
+  }
+  if (/^已完成 \d+ 轮$/.test(event.title)) return true;
   return false;
 }
 
 function groupKindForActivityEvent(event: AgentActivityEvent): ActivityDisplayGroupKind | null {
   if (event.phase === "error" || event.command_status === "error" || event.command_status === "approval_required") return null;
-  if (event.activity_type === "file_edit") return "files";
+  if (event.activity_type === "file_edit") return "work";
   if (event.activity_type === "command") {
     if (isModelRequestCommand(event)) return null;
-    return "commands";
+    return "work";
   }
-  if (isToolActivityEvent(event)) return "tools";
+  if (isToolActivityEvent(event)) return "work";
   return null;
 }
 
@@ -8136,25 +10154,26 @@ function mergedActivityStatus(events: AgentActivityEvent[]): NonNullable<AgentAc
 }
 
 function activityGroupTitle(groupKind: ActivityDisplayGroupKind, events: AgentActivityEvent[]) {
-  if (groupKind === "files") {
-    return `已编辑 ${numberFormatter.format(events.length)} 个文件`;
-  }
-  if (groupKind === "tools") {
-    const toolNames = uniqueActivityToolNames(events);
-    if (toolNames.length === 1) return `已调用 ${toolNames[0]}`;
-    return `已调用 ${numberFormatter.format(events.length)} 个工具`;
-  }
-
+  void groupKind;
+  const status = mergedActivityStatus(events);
   const readCount = events.filter(isReadCommand).length;
   const searchCount = events.filter(isSearchCommand).length;
   const listCount = events.filter(isListCommand).length;
-  const otherCount = events.length - readCount - searchCount - listCount;
+  const fileCount = events.filter((event) => event.activity_type === "file_edit").length;
+  const toolCount = events.filter(
+    (event) => isToolActivityEvent(event) && event.activity_type !== "command"
+  ).length;
+  const commandCount = events.filter((event) => event.activity_type === "command").length;
+  const otherCommandCount = Math.max(0, commandCount - readCount - searchCount - listCount);
   const parts: string[] = [];
-  if (readCount) parts.push(`已读取 ${numberFormatter.format(readCount)} 个文件`);
-  if (searchCount) parts.push(searchCount > 1 ? `已搜索代码 ${numberFormatter.format(searchCount)} 次` : "已搜索代码");
-  if (listCount) parts.push(listCount > 1 ? `已列出文件 ${numberFormatter.format(listCount)} 次` : "已列出文件");
-  if (otherCount) parts.push(`已运行 ${numberFormatter.format(otherCount)} 条命令`);
-  return joinChineseParts(parts.length ? parts : [`已运行 ${numberFormatter.format(events.length)} 条命令`]);
+  if (readCount) parts.push(`读取 ${numberFormatter.format(readCount)} 个文件`);
+  if (searchCount) parts.push(`搜索 ${numberFormatter.format(searchCount)} 次`);
+  if (listCount) parts.push(`查看 ${numberFormatter.format(listCount)} 次目录`);
+  if (otherCommandCount) parts.push(`运行 ${numberFormatter.format(otherCommandCount)} 条命令`);
+  if (toolCount) parts.push(`调用 ${numberFormatter.format(toolCount)} 个工具`);
+  if (fileCount) parts.push(`编辑 ${numberFormatter.format(fileCount)} 个文件`);
+  const summary = joinChineseParts(parts.length ? parts : [`处理 ${numberFormatter.format(events.length)} 项操作`]);
+  return status === "running" ? `正在${summary}` : `已${summary}`;
 }
 
 function activityGroupDetail(
@@ -8163,15 +10182,12 @@ function activityGroupDetail(
   status: NonNullable<AgentActivityEvent["command_status"]>
 ) {
   const statusText = commandStatusText(status);
-  if (groupKind === "files") {
-    const names = events.map((event) => fileNameFromPath(event.file_path ?? event.detail ?? "文件")).slice(0, 2);
-    return `${statusText} · ${names.join("、")}${events.length > names.length ? " 等" : ""}`;
-  }
-  if (groupKind === "tools") {
-    const names = uniqueActivityToolNames(events).slice(0, 2);
-    return `${statusText} · ${names.length ? names.join("、") : "展开查看工具参数和结果"}`;
-  }
-  return `${statusText} · 展开查看命令、输出和复制按钮`;
+  void groupKind;
+  const operationNames = events
+    .map(activityRowTitle)
+    .filter((name, index, items) => name && items.indexOf(name) === index)
+    .slice(0, 3);
+  return `${statusText} · ${operationNames.join("、")}${events.length > operationNames.length ? " 等" : ""}`;
 }
 
 function activityRowTitle(event: AgentActivityEvent) {
@@ -8186,7 +10202,7 @@ function activityRowTitle(event: AgentActivityEvent) {
     if (isModelRequestCommand(event)) return "模型请求";
     return "运行命令";
   }
-  return event.title;
+  return event.tool_name ? `调用 ${event.tool_name}` : event.title;
 }
 
 function activityRowDetail(event: AgentActivityEvent) {
@@ -8198,7 +10214,30 @@ function activityRowDetail(event: AgentActivityEvent) {
     const firstLine = command.split("\n")[0] ?? "";
     return firstLine.length > 160 ? `${firstLine.slice(0, 157)}...` : firstLine;
   }
-  return event.detail ?? event.tool_name ?? "";
+  return event.input_summary ?? event.detail ?? event.tool_name ?? "";
+}
+
+function activityOperationSummary(event: AgentActivityEvent) {
+  if (event.activity_type === "file_edit") {
+    return `已保存 · +${event.additions ?? 0} / -${event.deletions ?? 0}`;
+  }
+  const status = event.command_status ?? (event.phase === "observation" ? "success" : "running");
+  const resultSource =
+    event.result_summary ??
+    (event.phase === "observation" ? event.detail : undefined) ??
+    event.content ??
+    "";
+  const result = compactActivityLine(resultSource, 150);
+  if (status === "running") return "运行中";
+  if (status === "approval_required") return "等待确认";
+  if (status === "error" || event.phase === "error") return result ? `失败 · ${result}` : "失败";
+  return result ? `完成 · ${result}` : "完成";
+}
+
+function compactActivityLine(text: string, limit = 150) {
+  const value = text.replace(/\s+/g, " ").trim();
+  if (!value) return "";
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }
 
 function activityRowCommandLine(event: AgentActivityEvent) {
@@ -8321,6 +10360,15 @@ function commandStatusText(status: NonNullable<AgentActivityEvent["command_statu
   return "运行中";
 }
 
+function weixinLoginStatusLabel(login: WeixinLoginState) {
+  if (login.needs_verify_code || login.status === "need_verifycode") return "需要输入配对数字";
+  if (login.status === "scaned") return "已扫码，请在手机上确认";
+  if (login.status === "scaned_but_redirect") return "正在连接微信节点";
+  if (login.status === "expired") return "二维码已过期";
+  if (login.status === "verify_code_blocked") return "验证次数过多";
+  return "使用手机微信扫码";
+}
+
 function pendingApprovalEvent(record: ActivityRecord) {
   for (let index = record.events.length - 1; index >= 0; index -= 1) {
     const event = record.events[index];
@@ -8352,7 +10400,15 @@ function appendActivityDelta(
         title: delta.title,
         content: delta.content,
         detail: delta.detail,
+        input_summary:
+          delta.input_summary ?? (delta.phase === "action" ? delta.detail : undefined),
+        result_summary:
+          delta.result_summary ??
+          (delta.phase === "observation" || delta.phase === "error" ? delta.detail : undefined),
         activity_type: delta.activity_type,
+        plan: delta.plan,
+        plan_completed: delta.plan_completed,
+        plan_total: delta.plan_total,
         command: delta.command,
         command_status: delta.command_status,
         risk_category: delta.risk_category,
@@ -8383,7 +10439,18 @@ function appendActivityDelta(
               ? delta.content
               : `${item.content ?? ""}${delta.content}`,
           detail: delta.detail ?? item.detail,
+          input_summary:
+            delta.input_summary ??
+            item.input_summary ??
+            (item.phase === "action" ? item.detail : undefined),
+          result_summary:
+            delta.result_summary ??
+            (delta.phase === "observation" || delta.phase === "error" ? delta.detail : undefined) ??
+            item.result_summary,
           activity_type: delta.activity_type ?? item.activity_type,
+          plan: delta.plan ?? item.plan,
+          plan_completed: delta.plan_completed ?? item.plan_completed,
+          plan_total: delta.plan_total ?? item.plan_total,
           command: delta.command ?? item.command,
           command_status: delta.command_status ?? item.command_status,
           risk_category: delta.risk_category ?? item.risk_category,
@@ -8435,11 +10502,24 @@ function saveConversationHistory(items: ConversationHistoryItem[], username?: st
   try {
     window.localStorage.setItem(
       accountConversationStorageKey(username),
-      JSON.stringify(items.map(sanitizeConversationHistoryItem))
+      JSON.stringify(items.map(browserConversationHistoryItem))
     );
   } catch {
     // Local storage can be unavailable in private or restricted browser modes.
   }
+}
+
+function browserConversationHistoryItem(item: ConversationHistoryItem): ConversationHistoryItem {
+  const clean = sanitizeConversationHistoryItem(item);
+  // Browser storage is an offline chat fallback, not the debug trace store.
+  // Keeping every streamed command result here made one UI update rewrite a
+  // multi-megabyte localStorage value.  The complete activity record remains
+  // in the versioned workspace archive and backend trace files.
+  return {
+    ...clean,
+    activities: undefined,
+    activeActivityIndex: undefined
+  };
 }
 
 function sanitizeConversationHistoryItem(item: ConversationHistoryItem): ConversationHistoryItem {
@@ -8562,7 +10642,16 @@ function isAgentActivityEvent(value: unknown): value is AgentActivityEvent {
     (event.content === undefined || typeof event.content === "string") &&
     (event.activity_type === undefined ||
       event.activity_type === "command" ||
-      event.activity_type === "file_edit") &&
+      event.activity_type === "file_edit" ||
+      event.activity_type === "work_note" ||
+      event.activity_type === "runtime_summary" ||
+      event.activity_type === "plan" ||
+      event.activity_type === "approval_review") &&
+    (event.plan === undefined ||
+      (Array.isArray(event.plan) && event.plan.every((item) =>
+        item && typeof item.step === "string" &&
+        (item.status === "pending" || item.status === "in_progress" || item.status === "completed")
+      ))) &&
     (event.command === undefined || typeof event.command === "string") &&
     (event.command_status === undefined ||
       event.command_status === "running" ||
@@ -8768,12 +10857,25 @@ function collectConversationFileReferences(
   }
   for (const record of Object.values(activities)) {
     for (const event of record.events) {
-      const text = [event.title, event.detail, event.content, event.tool_name]
-        .filter(Boolean)
-        .join("\n")
-        .slice(0, 50000);
-      for (const path of extractLocalFileReferences(text)) {
-        pushPath(path);
+      const isFileOutput =
+        event.activity_type === "file_edit" ||
+        [
+          "write_text_file",
+          "edit_text_file",
+          "apply_unified_patch",
+          "create_docx_from_markdown",
+          "create_pdf_from_markdown",
+          "create_pptx_from_outline",
+          "create_xlsx"
+        ].includes(event.tool_name ?? "");
+      if (isFileOutput) {
+        const text = [event.detail, event.content]
+          .filter(Boolean)
+          .join("\n")
+          .slice(0, 50000);
+        for (const path of extractLocalFileReferences(text)) {
+          pushPath(path);
+        }
       }
     }
   }

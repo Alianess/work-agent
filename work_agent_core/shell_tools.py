@@ -4,9 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import json
+import hashlib
 import os
+import secrets
 import shlex
 import subprocess
+import threading
+import time
 
 from .progress import run_logged_process
 from .runtime_env import apply_project_agent_environment
@@ -16,7 +20,6 @@ from .tools import Tool, ToolRegistry, WorkspaceFiles
 AUTO_ALLOW_COMMANDS = {
     "pwd",
     "ls",
-    "find",
     "rg",
     "cat",
     "head",
@@ -52,10 +55,10 @@ ASK_COMMANDS = {
     "cp",
     "mv",
     "touch",
+    "rm",
 }
 VERSION_FLAGS = {"--version", "-V", "-v", "version"}
 DENY_COMMANDS = {
-    "rm",
     "sudo",
     "su",
     "chmod",
@@ -90,6 +93,10 @@ SENSITIVE_PATH_PARTS = {
     "api_key",
 }
 
+_APPROVAL_GRANT_LOCK = threading.RLock()
+_APPROVAL_GRANTS: dict[str, tuple[str, str, int]] = {}
+APPROVAL_GRANT_TTL_SECONDS = 5 * 60
+
 
 @dataclass(frozen=True)
 class ShellDecision:
@@ -109,9 +116,18 @@ class ShellExecutionTools:
             raise ValueError("缺少 command。")
         cwd = self._resolve_cwd(str(args.get("cwd") or "."))
         timeout_seconds = min(max(int(args.get("timeout_seconds") or 120), 1), 900)
-        approved_by_user = bool(args.get("approved_by_user"))
         argv = parse_command(command_text)
         decision = self._decide(argv, cwd)
+        action_id = approval_action_id(
+            command=command_text,
+            cwd=str(cwd),
+            timeout_seconds=timeout_seconds,
+        )
+        approval_granted = consume_internal_approval_grant(
+            token=str(args.get("_approval_grant") or ""),
+            action_id=action_id,
+            source=str(args.get("_approval_source") or ""),
+        )
 
         if decision.status == "deny":
             return json.dumps(
@@ -126,7 +142,7 @@ class ShellExecutionTools:
                 ensure_ascii=False,
                 indent=2,
             )
-        if decision.status == "ask" and not approved_by_user:
+        if decision.status == "ask" and not approval_granted:
             return json.dumps(
                 {
                     "ok": False,
@@ -136,6 +152,9 @@ class ShellExecutionTools:
                     "command": command_text,
                     "cwd": str(cwd),
                     "timeout_seconds": timeout_seconds,
+                    "auto_approvable": is_auto_approvable_command(argv, decision),
+                    "reviewable_by_model": is_model_reviewable_command(argv, decision),
+                    "action_id": action_id,
                     "preview": build_command_preview(
                         command_text=command_text,
                         cwd=cwd,
@@ -143,7 +162,7 @@ class ShellExecutionTools:
                         risk_category=decision.risk_category,
                         reason=decision.reason,
                     ),
-                    "next_step": "请向用户说明要执行的命令和原因，获得明确同意后再带 approved_by_user=true 调用。",
+                    "next_step": "由独立审查智能体或用户确认当前精确动作后，系统使用内部审批凭证重试。",
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -187,6 +206,10 @@ class ShellExecutionTools:
 
     def _decide(self, argv: list[str], cwd: Path) -> ShellDecision:
         executable = Path(argv[0]).name
+        if executable == "rm":
+            return decide_rm(argv, cwd, self.workspace_root)
+        if executable == "find":
+            return decide_find(argv, cwd, self.workspace_root)
         if executable in DENY_COMMANDS:
             return ShellDecision("deny", f"{executable} 属于高风险命令，当前策略直接拒绝。", risk_category_for_executable(executable))
         if has_shell_control_token(argv):
@@ -220,6 +243,8 @@ class ShellExecutionTools:
             if paths_stay_in_workspace(argv[1:], cwd, self.workspace_root):
                 return ShellDecision("ask", f"{executable} 可能执行脚本、生成文件、安装依赖或修改文件，需要用户确认。", risk_category_for_executable(executable))
             return ShellDecision("deny", "命令参数包含工作区外路径。", "SYSTEM")
+        if not paths_stay_in_workspace(argv[1:], cwd, self.workspace_root):
+            return ShellDecision("deny", "未知命令的参数包含工作区外路径。", "SYSTEM")
         return ShellDecision("ask", f"{executable} 不在白名单内，需要用户确认。", risk_category_for_executable(executable))
 
 
@@ -264,8 +289,9 @@ def register_shell_tools(registry: ToolRegistry, workspace_root: str | Path) -> 
                 "Run a controlled terminal command inside the workspace. The response includes a risk_category: "
                 "READ, MODIFY, EXECUTE, NETWORK, DELETE, or SYSTEM. Safe read-only commands "
                 "(pwd/ls/find/rg/cat/head/tail/wc/file/stat/du and read-only git subcommands) run automatically. "
-                "Commands that may write files, run scripts, install packages, use the network, or take a long time return "
-                "approval_required with a preview unless approved_by_user=true. Destructive or sensitive commands are denied. "
+                "Commands that may write files, delete a specific workspace target, run scripts, install packages, use the network, "
+                "or take a long time return approval_required with a preview. Broad deletion, sensitive access, and boundary escapes "
+                "are denied by fixed policy. "
                 "This is argv execution, not a shell: never use pipes, redirection such as 2>&1, or shell globs with ls. "
                 "For filename-pattern checks use find or rg --files. A nonzero returncode is a failed command; do not report "
                 "a verification suite as fully passed unless every required check succeeded."
@@ -279,11 +305,6 @@ def register_shell_tools(registry: ToolRegistry, workspace_root: str | Path) -> 
                     },
                     "cwd": {"type": "string", "default": "."},
                     "timeout_seconds": {"type": "integer", "default": 120},
-                    "approved_by_user": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Set true only after explicit user approval for this exact command.",
-                    },
                 },
                 "required": ["command"],
             },
@@ -360,6 +381,174 @@ def risk_category_for_executable(executable: str) -> str:
     if executable in {"sudo", "su", "chmod", "chown"}:
         return "SYSTEM"
     return "EXECUTE"
+
+
+def is_auto_approvable_command(argv: list[str], decision: ShellDecision) -> bool:
+    """Return whether the optional approval delegate may approve this command.
+
+    This is deliberately narrower than the ordinary ``ask`` bucket.  The
+    delegate can approve local, workspace-confined artifact operations and a
+    small set of verification commands, but never package installation,
+    networking, git mutation, unknown programs, or general-purpose scripts.
+    """
+    if decision.status != "ask" or not argv:
+        return False
+    executable = Path(argv[0]).name
+    if executable in {"mkdir", "touch", "cp", "mv", "ffmpeg", "soffice", "libreoffice", "pandoc"}:
+        return True
+    if executable in {"python", "python3"} and len(argv) >= 3 and argv[1] == "-m":
+        return argv[2] in {"pytest", "unittest", "compileall"}
+    if executable in {"npm", "pnpm"}:
+        if len(argv) >= 2 and argv[1] == "test":
+            return True
+        return len(argv) >= 3 and argv[1] == "run" and argv[2] in {
+            "build",
+            "test",
+            "lint",
+            "typecheck",
+            "check",
+        }
+    return False
+
+
+def is_model_reviewable_command(argv: list[str], decision: ShellDecision) -> bool:
+    """Return the fixed, narrow reviewer boundary.
+
+    ``ask`` means the user may approve an exact action.  It does *not* mean a
+    model reviewer may approve it: the latter is limited to deterministic,
+    workspace-confined build and artifact operations from
+    :func:`is_auto_approvable_command`.
+    """
+    return is_auto_approvable_command(argv, decision)
+
+
+def decide_find(argv: list[str], cwd: Path, workspace_root: Path) -> ShellDecision:
+    """Allow read-only find expressions and reject predicates with side effects."""
+    side_effect_predicates = {
+        "-delete",
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+        "-fls",
+    }
+    if any(item in side_effect_predicates for item in argv[1:]):
+        return ShellDecision(
+            "deny",
+            "find 的该表达式会删除文件、执行子命令或写入文件，不属于只读查看。",
+            "DELETE" if "-delete" in argv else "SYSTEM",
+        )
+    if paths_stay_in_workspace(argv[1:], cwd, workspace_root):
+        return ShellDecision("allow", "find 仅执行工作区内的只读查找。", "READ")
+    return ShellDecision("deny", "命令参数包含工作区外路径。", "SYSTEM")
+
+
+def decide_rm(argv: list[str], cwd: Path, workspace_root: Path) -> ShellDecision:
+    """Require an explicit user approval for every bounded deletion.
+
+    The shell tool cannot prove that the user asked to remove this exact file.
+    It therefore only validates scope here; it never silently authorizes the
+    deletion and never delegates DELETE approval to a model reviewer.
+    """
+    if len(argv) < 2:
+        return ShellDecision("deny", "rm 没有明确删除目标。", "DELETE")
+    recursive_flags = {"-r", "-R", "--recursive"}
+    dangerous_flags = {"--no-preserve-root", "-rf", "-fr", "-rF", "-Rf", "-fR"}
+    if any(item in recursive_flags or item in dangerous_flags for item in argv[1:]):
+        return ShellDecision("deny", "递归或宽范围删除不交给审查模型批准。", "DELETE")
+    allowed_flags = {"-f", "--force", "-v", "--verbose", "--"}
+    unknown_flags = [item for item in argv[1:] if item.startswith("-") and item not in allowed_flags]
+    if unknown_flags:
+        return ShellDecision("deny", f"rm 参数不在安全白名单内：{' '.join(unknown_flags)}", "DELETE")
+    targets = [item for item in argv[1:] if item != "--" and not item.startswith("-")]
+    if not targets:
+        return ShellDecision("deny", "rm 没有明确删除目标。", "DELETE")
+    if len(targets) > 20:
+        return ShellDecision("deny", "单次删除目标过多，范围不够收敛。", "DELETE")
+    resolved_targets: list[Path] = []
+    for target in targets:
+        if target in {".", ".."} or any(char in target for char in "*?[]{}"):
+            return ShellDecision("deny", "删除目标不能是工作区根目录、相对上级或通配模式。", "DELETE")
+        path = Path(target).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path.absolute()
+        if resolved == workspace_root or workspace_root not in resolved.parents:
+            return ShellDecision("deny", "删除目标不在工作区内或指向工作区根目录。", "SYSTEM")
+        if resolved.exists() and not resolved.is_file():
+            return ShellDecision("deny", "直接删除仅支持明确的普通文件，不支持目录或其他文件类型。", "DELETE")
+        resolved_targets.append(resolved)
+    return ShellDecision(
+        "ask",
+        "删除目标明确且位于工作区内，但删除需要用户逐次确认。",
+        "DELETE",
+    )
+
+
+def approval_action_id(*, command: str, cwd: str, timeout_seconds: int) -> str:
+    normalized = json.dumps(
+        {
+            "command": str(command or "").strip(),
+            "cwd": str(cwd or ".").strip() or ".",
+            "timeout_seconds": min(max(int(timeout_seconds or 120), 1), 900),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "approval-" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def issue_internal_approval_grant(*, action_id: str, source: str) -> str:
+    """Create a short-lived, single-use capability for one approved action.
+
+    The action ID is intentionally deterministic for audit, so it is not an
+    authorization credential.  Only the runtime can mint this random grant;
+    model-supplied ``_approval_source`` / ``_approval_action_id`` fields alone
+    must never execute a command.
+    """
+    if source not in {"user", "reviewer"}:
+        raise ValueError("approval grant source is invalid")
+    clean_action_id = str(action_id or "").strip()
+    if not clean_action_id:
+        raise ValueError("approval grant action_id is required")
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    with _APPROVAL_GRANT_LOCK:
+        _prune_expired_approval_grants(now)
+        _APPROVAL_GRANTS[token] = (clean_action_id, source, now + APPROVAL_GRANT_TTL_SECONDS)
+    return token
+
+
+def consume_internal_approval_grant(*, token: str, action_id: str, source: str) -> bool:
+    """Consume an exact, short-lived approval grant; unknown grants fail closed."""
+    clean_token = str(token or "").strip()
+    if source not in {"user", "reviewer"} or not clean_token:
+        return False
+    now = int(time.time())
+    with _APPROVAL_GRANT_LOCK:
+        _prune_expired_approval_grants(now)
+        grant = _APPROVAL_GRANTS.pop(clean_token, None)
+    if grant is None:
+        return False
+    granted_action_id, granted_source, expires_at = grant
+    return (
+        now <= expires_at
+        and secrets.compare_digest(granted_action_id, str(action_id or ""))
+        and secrets.compare_digest(granted_source, source)
+    )
+
+
+def _prune_expired_approval_grants(now: int) -> None:
+    expired = [token for token, grant in _APPROVAL_GRANTS.items() if grant[2] <= now]
+    for token in expired:
+        _APPROVAL_GRANTS.pop(token, None)
 
 
 def build_command_preview(

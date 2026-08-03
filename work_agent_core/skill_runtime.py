@@ -294,6 +294,126 @@ def register_skill_runtime_tools(
     )
     registry.register(
         Tool(
+            name="manage_timeline_xlsx",
+            description=(
+                "Inspect or safely edit time-node, milestone, schedule, and project-progress Excel workbooks. "
+                "It detects common Chinese or English headers, lists normalized nodes, and batch-adds, updates, "
+                "soft-deletes, or physically deletes rows while preserving untouched workbook content and styles. "
+                "Writes default to dry-run; actual writes can create a backup and hidden audit log."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["inspect", "list", "apply"],
+                        "default": "inspect",
+                    },
+                    "path": {"type": "string", "description": "Source .xlsx/.xlsm path under the workspace."},
+                    "output_path": {
+                        "type": "string",
+                        "description": "Optional target path. Omit to update the source when dry_run=false.",
+                    },
+                    "sheet_name": {"type": "string"},
+                    "header_row": {"type": "integer"},
+                    "field_mapping": {
+                        "type": "object",
+                        "description": (
+                            "Optional canonical-field mapping when automatic detection is insufficient. "
+                            "Values may be exact header names or 1-based column numbers."
+                        ),
+                        "additionalProperties": {},
+                    },
+                    "limit": {"type": "integer", "default": 200},
+                    "changes": {
+                        "type": "array",
+                        "description": (
+                            "For apply: ordered batch changes. action is add/update/delete; "
+                            "update/delete match by row, node_id, title, date, or other detected field. "
+                            "delete defaults to soft status=已取消; pass delete_mode=row for physical deletion."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["add", "update", "delete"],
+                                },
+                                "match": {"type": "object", "additionalProperties": {}},
+                                "values": {"type": "object", "additionalProperties": {}},
+                                "delete_mode": {
+                                    "type": "string",
+                                    "enum": ["soft", "row"],
+                                    "default": "soft",
+                                },
+                            },
+                            "required": ["action"],
+                        },
+                    },
+                    "create_missing_columns": {"type": "boolean", "default": False},
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Preview changes without saving. Set false only for an intended write.",
+                    },
+                    "backup": {"type": "boolean", "default": True},
+                    "record_history": {"type": "boolean", "default": True},
+                    "change_source": {"type": "string", "default": "Friday"},
+                },
+                "required": ["path"],
+            },
+            handler=runtime.manage_timeline_xlsx,
+        )
+    )
+    registry.register(
+        Tool(
+            name="manage_project_timeline",
+            description=(
+                "Read, create, or update the selected project's timeline Excel without asking the user for a path. "
+                "Use this for project milestones, planned dates, status, progress, next actions, owners, materials, "
+                "and completion dates. The project Excel remains the single source of truth."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["inspect", "create", "apply"],
+                        "default": "inspect",
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Current project id, for example project-a1b2c3d4e5f6.",
+                    },
+                    "changes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["add", "update", "delete"],
+                                },
+                                "match": {"type": "object", "additionalProperties": {}},
+                                "values": {"type": "object", "additionalProperties": {}},
+                                "delete_mode": {
+                                    "type": "string",
+                                    "enum": ["soft", "row"],
+                                    "default": "soft",
+                                },
+                            },
+                            "required": ["action"],
+                        },
+                    },
+                    "change_source": {"type": "string", "default": "Friday"},
+                },
+                "required": ["project_id"],
+            },
+            handler=runtime.manage_project_timeline,
+        )
+    )
+    registry.register(
+        Tool(
             name="create_pptx_from_outline",
             description=(
                 "Create a PowerPoint .pptx deck from a Markdown outline. Each H2 becomes a slide; "
@@ -806,6 +926,55 @@ class SkillRuntime:
             }
         )
         return result.stdout.strip()
+
+    def manage_timeline_xlsx(self, args: dict[str, Any]) -> str:
+        from .timeline_xlsx import manage_timeline_xlsx
+
+        payload = dict(args)
+        payload["path"] = str(self.workspace.resolve(str(args["path"])))
+        raw_output = str(args.get("output_path") or "").strip()
+        if raw_output:
+            payload["output_path"] = str(self.workspace.resolve(raw_output))
+        result = manage_timeline_xlsx(payload)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+    def manage_project_timeline(self, args: dict[str, Any]) -> str:
+        from .project_timeline import (
+            PROJECT_ID_PATTERN,
+            apply_project_timeline_changes,
+            create_project_timeline,
+            project_timeline_payload,
+        )
+
+        project_id = str(args.get("project_id") or "").strip()
+        if not PROJECT_ID_PATTERN.fullmatch(project_id):
+            raise ValueError("project_id 格式无效。")
+        project_directory = self.workspace.resolve(f"meet_files/projects/{project_id}")
+        manifest_path = project_directory / "project.json"
+        if not manifest_path.is_file():
+            raise ValueError("项目不存在或当前工作区无权访问。")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        operation = str(args.get("operation") or "inspect").strip().lower()
+        if operation == "create":
+            create_project_timeline(
+                project_directory,
+                project_name=str(manifest.get("name") or "项目"),
+            )
+        elif operation == "apply":
+            changes = args.get("changes")
+            if not isinstance(changes, list) or not changes:
+                raise ValueError("apply 操作必须提供非空 changes 数组。")
+            apply_project_timeline_changes(
+                project_directory,
+                changes=changes,
+                change_source=str(args.get("change_source") or "Friday"),
+            )
+        elif operation != "inspect":
+            raise ValueError("operation 仅支持 inspect、create 或 apply。")
+        result = project_timeline_payload(project_directory)
+        if result.get("path"):
+            result["path"] = str(Path(result["path"]).relative_to(self.workspace_root))
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
     def create_pptx_from_outline(self, args: dict[str, Any]) -> str:
         output_path = self.workspace.resolve(str(args["output_path"]))

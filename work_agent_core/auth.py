@@ -193,6 +193,19 @@ class AuthStore:
             ).fetchone()
         return user_from_row(row) if row is not None else None
 
+    def get_user_by_id(self, user_id: int) -> AuthUser | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (int(user_id),),
+            ).fetchone()
+        return user_from_row(row) if row is not None else None
+
+    def list_users(self) -> list[AuthUser]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute("SELECT * FROM users ORDER BY id ASC").fetchall()
+        return [user_from_row(row) for row in rows]
+
 
 def validate_username(username: str) -> str:
     clean = str(username or "").strip()

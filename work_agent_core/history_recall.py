@@ -8,8 +8,22 @@ import json
 import math
 import re
 import sqlite3
+import time
+
+import numpy as np
 
 from .cross_chat_memory import CrossChatMemoryStore
+from .retrieval_core import (
+    MlxRetrievalBackend,
+    RetrievalBackend,
+    RetrievalBackendError,
+)
+from .recall_archive import (
+    RECALL_ARCHIVE_VERSION,
+    approx_units,
+    build_recall_episodes,
+    render_episode_text,
+)
 from .session_store import (
     ConversationSession,
     SessionStore,
@@ -23,8 +37,18 @@ from .tools import Tool, ToolRegistry
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 8
 MAX_QUERY_TERMS = 18
-CHUNK_CHARS = 1800
-CHUNK_OVERLAP = 180
+HISTORY_INDEX_FORMAT_VERSION = 5
+CHUNK_TARGET_UNITS = 160
+CHUNK_OVERLAP_UNITS = 24
+CHUNK_MIN_UNITS = 70
+CHUNK_MAX_UNITS = 240
+VECTOR_BATCH_SIZE = 8
+MODEL_INPUT_CHARS = 460
+MODEL_INPUT_OVERLAP = 40
+LEXICAL_CANDIDATE_LIMIT = 60
+DENSE_CANDIDATE_LIMIT = 60
+RRF_CANDIDATE_LIMIT = 40
+RRF_K = 60
 
 TOKEN_PATTERN = re.compile(
     r"[A-Za-z][A-Za-z0-9_.+-]*|[0-9]+(?:\.[0-9]+)*|[\u3400-\u4dbf\u4e00-\u9fff]+"
@@ -43,10 +67,13 @@ class HistoryChunk:
     role: str
     content: str
     search_text: str
+    parent_id: str
+    parent_content: str
+    source_kind: str
 
 
 class ChatHistoryRecall:
-    """SQLite FTS5/BM25 retrieval over one account's raw conversation sessions."""
+    """Hybrid retrieval over one account's raw conversation sessions."""
 
     def __init__(
         self,
@@ -54,6 +81,7 @@ class ChatHistoryRecall:
         conversation_id: str,
         *,
         project_id: str = "",
+        retrieval_backend: RetrievalBackend | None = None,
     ) -> None:
         clean_id = sanitize_conversation_id(conversation_id)
         if not clean_id:
@@ -62,6 +90,7 @@ class ChatHistoryRecall:
         self.conversation_id = clean_id
         self.project_id = str(project_id or "").strip()
         self.database_path = session_store.session_dir.parent / "history_search.sqlite3"
+        self.retrieval_backend = retrieval_backend or MlxRetrievalBackend.from_env()
 
     def search(self, args: dict[str, Any]) -> str:
         query = str(args.get("query") or "").strip()
@@ -81,8 +110,6 @@ class ChatHistoryRecall:
         terms = dedupe(
             [*extract_query_terms(" ".join(keywords)), *extract_query_terms(query)]
         )[:MAX_QUERY_TERMS]
-        if not terms:
-            raise ValueError("没有提取到可检索的关键词，请换用更具体的名称、数字或短语。")
         if scope in {"compressed", "current"} and current_message_limit <= 0:
             return json.dumps(
                 {
@@ -98,7 +125,12 @@ class ChatHistoryRecall:
                         if scope == "compressed"
                         else "当前聊天还没有可检索的历史消息。"
                     ),
-                    "retrieval": "sqlite-fts5-bm25",
+                    "retrieval": "hybrid-history-rag",
+                    "retrieval_status": {
+                        "mode": "empty",
+                        "bm25": True,
+                        "dense": False,
+                    },
                     "model_used": False,
                 },
                 ensure_ascii=False,
@@ -120,25 +152,67 @@ class ChatHistoryRecall:
             )
             for scoped_session, metadata in scoped_sessions:
                 ensure_conversation_index(connection, scoped_session, metadata=metadata)
-            candidates = fetch_candidates(
-                connection,
-                conversation_id=self.conversation_id,
-                project_id=self.project_id,
-                scope=scope,
+            allowed_conversation_ids = [item.id for item, _metadata in scoped_sessions]
+            lexical_rows = (
+                fetch_candidates(
+                    connection,
+                    conversation_id=self.conversation_id,
+                    scope=scope,
+                    terms=terms,
+                    current_message_limit=current_message_limit,
+                    candidate_limit=max(LEXICAL_CANDIDATE_LIMIT, limit * 12),
+                    allowed_conversation_ids=allowed_conversation_ids,
+                )
+                if terms
+                else []
+            )
+            lexical_ranked = rank_candidates(
+                lexical_rows,
+                query=query,
+                keywords=keywords,
                 terms=terms,
-                current_message_limit=current_message_limit,
-                candidate_limit=max(40, limit * 12),
+                total_messages=max(1, len(session.messages)),
+                current_conversation_id=self.conversation_id,
+                current_project_id=self.project_id,
             )
 
-        ranked = rank_candidates(
-            candidates,
-            query=query,
-            keywords=keywords,
-            terms=terms,
-            total_messages=max(1, len(session.messages)),
-            current_conversation_id=self.conversation_id,
-            current_project_id=self.project_id,
-        )[:limit]
+            degraded_reasons: list[str] = []
+            dense_ranked: list[dict[str, Any]] = []
+            vectors_indexed = 0
+            backend = self.retrieval_backend
+            if backend.enabled:
+                try:
+                    vectors_indexed = ensure_vector_indices(
+                        connection,
+                        scoped_sessions,
+                        backend=backend,
+                    )
+                except Exception as error:
+                    degraded_reasons.append(format_backend_error("向量索引", error))
+                try:
+                    semantic_query = query or " ".join(keywords)
+                    query_vector = normalize_vector(backend.embed_texts([semantic_query])[0])
+                    dense_ranked = fetch_dense_candidates(
+                        connection,
+                        query_vector=query_vector,
+                        model=backend.embedding_model,
+                        conversation_id=self.conversation_id,
+                        scope=scope,
+                        current_message_limit=current_message_limit,
+                        candidate_limit=max(DENSE_CANDIDATE_LIMIT, limit * 12),
+                        allowed_conversation_ids=allowed_conversation_ids,
+                    )
+                except Exception as error:
+                    degraded_reasons.append(format_backend_error("向量召回", error))
+            else:
+                degraded_reasons.append("向量召回已禁用")
+
+            hybrid_ranked = rrf_merge_results(
+                [lexical_ranked, dense_ranked],
+                top_n=max(RRF_CANDIDATE_LIMIT, limit * 6),
+            )
+            ranked = dedupe_message_results(hybrid_ranked)[:limit]
+
         memory_results = rank_memory_candidates(
             CrossChatMemoryStore(self.session_store).active_for_scope(
                 scope=scope,
@@ -157,15 +231,32 @@ class ChatHistoryRecall:
                 "query": query,
                 "query_terms": terms,
                 "indexed_conversation_count": len(scoped_sessions),
+                "indexed_vector_count": vectors_indexed,
                 "memory_results": memory_results,
                 "results": ranked,
                 "note": (
-                    "memory_results 是可查看、纠正和删除的聊天摘要记忆；results 是可核对的聊天原文片段。两者都保留来源聊天。"
+                    "memory_results 是少量核心记忆；results 是混合检索得到的可核对聊天原文。两者都保留来源聊天。"
                     if memory_results or ranked
-                    else "没有命中。请改用当时出现过的专名、数字、文件名或同义关键词重试。"
+                    else "没有命中。可换用当时出现过的专名、数字、文件名或另一种描述重试。"
                 ),
-                "retrieval": "sqlite-fts5-bm25",
-                "model_used": False,
+                "retrieval": "hybrid-history-rag",
+                "retrieval_status": {
+                    "mode": (
+                        "hybrid"
+                        if dense_ranked
+                        else "bm25_fallback"
+                    ),
+                    "bm25": True,
+                    "dense": bool(dense_ranked),
+                    "embedding_model": (
+                        self.retrieval_backend.embedding_model
+                        if dense_ranked
+                        else None
+                    ),
+                    "degraded": bool(degraded_reasons),
+                    "degraded_reasons": dedupe(degraded_reasons),
+                },
+                "model_used": bool(dense_ranked),
             },
             ensure_ascii=False,
             indent=2,
@@ -184,11 +275,11 @@ def register_history_recall_tool(
         Tool(
             name="recall_chat_history",
             description=(
-                "Search manageable cross-chat summary memories and exact raw passages across the current account's saved chats without using another model. "
+                "Search bounded core memories and raw passages across the current account's saved chats using hybrid BM25, MLX semantic retrieval, and RRF fusion. "
                 "Inside a project, auto scope searches chats from that project only; outside projects, auto scope searches non-project chats in the account. "
                 "Use when the user refers to something discussed earlier, the compressed summary lacks a detail, "
                 "or an exact name, number, decision, wording, path, or prior correction must be recovered. "
-                "Search with several distinctive keywords; retry with aliases or exact names when needed. "
+                "The natural-language query can retrieve paraphrases; keywords remain useful for exact names and numbers. "
                 "Results include the source conversation title and project. Account boundaries are always enforced."
             ),
             parameters={
@@ -224,14 +315,17 @@ def register_history_recall_tool(
 def render_history_recall_system_context(summary_message_count: int, *, project_id: str = "") -> str:
     covered = max(0, int(summary_message_count or 0))
     return (
-        "\n\n跨聊天记忆与原文回想能力：recall_chat_history 是只读 core 工具，不调用额外模型，"
-        "会先返回由历史聊天摘要同步而来的可管理 memory_results，并同时返回可核对的原文 results。"
+        "\n\n跨聊天记忆与原文回想能力：recall_chat_history 是只读 core 工具，"
+        "内部使用 BM25、MLX 语义向量和 RRF，并在模型不可用时自动退回 BM25。"
+        "它会返回少量核心 memory_results，并同时返回带来源、可核对的原文 results。"
         "当用户说‘之前、当时、你还记得、我们讨论过’或需要核对较早的名称、数字、决定、原话、文件路径、纠错时，"
         "如果最近 messages 或压缩摘要不能可靠回答，必须先调用该工具。"
         "通常使用 scope=auto：项目聊天只检索同一项目，普通聊天检索账号内非项目聊天；项目专属记忆不会泄漏到项目外。"
         "需要限定当前聊天时使用 scope=current，需要专门找被摘要覆盖的原文时使用 scope=compressed。"
-        "优先用多个有区分度的专名、数字和短语检索；无结果时换同义词或别名重试一次。"
+        "query 应写完整问题；核对名称、数字和原话时可补充 keywords。无结果时换同义词或别名重试一次。"
         "不得把未命中解释为用户从未说过。"
+        "日报、周报、双周报及其补写纠错必须优先使用 work-reports 技能的 collect_work_report_evidence 按日期取证；"
+        "不得用 scope=compressed 代替账户级日期证据检索，也不得把当前聊天未命中表述为全账户未命中。"
         "memory_results 如为 corrected 表示用户已纠正，应优先于原摘要；回答关键数字和原话时仍应用 results 核对。"
         f"当前已有 {covered} 条较早 runtime messages 被压缩摘要覆盖，可用 scope=compressed 找回其原文。"
         f"当前项目：{project_id or '无；auto 将检索账号全部聊天'}。"
@@ -268,6 +362,19 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS history_chunk_parent (
+            conversation_id TEXT NOT NULL,
+            message_index INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            parent_id TEXT NOT NULL,
+            parent_content TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            PRIMARY KEY(conversation_id, message_index, chunk_index)
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS history_index_meta (
             conversation_id TEXT PRIMARY KEY,
             signature TEXT NOT NULL,
@@ -289,6 +396,27 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS history_chunk_vectors (
+            conversation_id TEXT NOT NULL,
+            message_index INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            content_signature TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            embedding BLOB NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(conversation_id, message_index, chunk_index)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS history_chunk_vectors_model_idx
+        ON history_chunk_vectors(model)
+        """
+    )
 
 
 def ensure_conversation_index(
@@ -301,34 +429,34 @@ def ensure_conversation_index(
     project_id = str(metadata.get("project_id") or session.metadata.get("project_id") or "").strip()
     title = str(metadata.get("title") or session.metadata.get("title") or session.id).strip()
     updated_at = max(int(metadata.get("updated_at") or 0), int(session.updated_at or 0))
-    connection.execute(
-        """
-        INSERT INTO history_conversation_meta(conversation_id, title, project_id, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(conversation_id) DO UPDATE SET
-            title=excluded.title,
-            project_id=excluded.project_id,
-            updated_at=excluded.updated_at
-        """,
-        (session.id, title, project_id, updated_at),
-    )
-    signature = session_signature(session)
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO history_conversation_meta(conversation_id, title, project_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                title=excluded.title,
+                project_id=excluded.project_id,
+                updated_at=excluded.updated_at
+            """,
+            (session.id, title, project_id, updated_at),
+        )
+    signature = session_signature(session, title=title)
     row = connection.execute(
         "SELECT signature, message_count FROM history_index_meta WHERE conversation_id = ?", (session.id,)
     ).fetchone()
     if row is not None and str(row[0]) == signature:
         return
-    indexed_count = int(row[1]) if row is not None else 0
-    can_append = (
-        row is not None
-        and 0 <= indexed_count < len(session.messages)
-        and str(row[0]) == messages_signature(session.messages[:indexed_count])
-    )
-    start_index = indexed_count if can_append else 0
-    chunks = list(iter_session_chunks(session, start_index=start_index))
+    # Parent episodes can merge across the append boundary, so a changed
+    # conversation is projected atomically. The local corpus is small and this
+    # avoids maintaining two subtly different chunking paths.
+    chunks = list(iter_session_chunks(session, title=title))
     with connection:
-        if not can_append:
-            connection.execute("DELETE FROM chat_history_fts WHERE conversation_id = ?", (session.id,))
+        connection.execute("DELETE FROM chat_history_fts WHERE conversation_id = ?", (session.id,))
+        connection.execute(
+            "DELETE FROM history_chunk_parent WHERE conversation_id = ?",
+            (session.id,),
+        )
         connection.executemany(
             """
             INSERT INTO chat_history_fts(
@@ -337,6 +465,25 @@ def ensure_conversation_index(
             """,
             [
                 (session.id, chunk.message_index, chunk.chunk_index, chunk.role, chunk.content, chunk.search_text)
+                for chunk in chunks
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO history_chunk_parent(
+                conversation_id, message_index, chunk_index,
+                parent_id, parent_content, source_kind
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    session.id,
+                    chunk.message_index,
+                    chunk.chunk_index,
+                    chunk.parent_id,
+                    chunk.parent_content,
+                    chunk.source_kind,
+                )
                 for chunk in chunks
             ],
         )
@@ -353,12 +500,30 @@ def ensure_conversation_index(
         )
 
 
-def session_signature(session: ConversationSession) -> str:
-    return messages_signature(session.messages)
-
-
-def messages_signature(messages: Iterable[dict[str, Any]]) -> str:
+def session_signature(session: ConversationSession, *, title: str = "") -> str:
     digest = sha256()
+    digest.update(str(HISTORY_INDEX_FORMAT_VERSION).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(messages_signature(session.messages, title=title).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(
+        json.dumps(session.recall_episodes, ensure_ascii=False, sort_keys=True).encode(
+            "utf-8", errors="replace"
+        )
+    )
+    return digest.hexdigest()
+
+
+def messages_signature(
+    messages: Iterable[dict[str, Any]],
+    *,
+    title: str = "",
+) -> str:
+    digest = sha256()
+    digest.update(str(HISTORY_INDEX_FORMAT_VERSION).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(str(title or "").encode("utf-8", errors="replace"))
+    digest.update(b"\0")
     for message in messages:
         digest.update(str(message.get("role") or "").encode("utf-8"))
         digest.update(b"\0")
@@ -387,6 +552,23 @@ def load_conversation_archive(session_store: SessionStore) -> dict[str, dict[str
     items = data.get("items") if isinstance(data, dict) else data
     if not isinstance(items, list):
         return {}
+    if isinstance(data, dict) and data.get("storage") == "per_item":
+        raw_order = data.get("order") if isinstance(data.get("order"), list) else []
+        order = [str(value or "").strip() for value in raw_order]
+        if not order:
+            order = [str(item.get("id") or "").strip() for item in items if isinstance(item, dict)]
+        loaded_items: list[dict[str, Any]] = []
+        for conversation_id in order:
+            if not conversation_id:
+                continue
+            item_path = path.parent / "archive_items" / f"{conversation_id}.json"
+            try:
+                item = json.loads(item_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(item, dict) and sanitize_conversation_id(item.get("id")) == conversation_id:
+                loaded_items.append(item)
+        items = loaded_items
     archive: dict[str, dict[str, Any]] = {}
     for item in items:
         if not isinstance(item, dict):
@@ -437,14 +619,13 @@ def archive_metadata(
     session: ConversationSession,
 ) -> dict[str, Any]:
     item = item or {}
+    if "project_id" in session.metadata:
+        project_id = str(session.metadata.get("project_id") or "")
+    else:
+        project_id = str(item.get("projectId") or item.get("project_id") or "")
     return {
         "title": str(item.get("title") or session.metadata.get("title") or session.id),
-        "project_id": str(
-            item.get("projectId")
-            or item.get("project_id")
-            or session.metadata.get("project_id")
-            or ""
-        ),
+        "project_id": project_id,
         "updated_at": int(session.updated_at or 0),
     }
 
@@ -465,17 +646,73 @@ def iter_session_chunks(
     session: ConversationSession,
     *,
     start_index: int = 0,
+    title: str = "",
 ) -> Iterable[HistoryChunk]:
-    for message_index in range(max(0, start_index), len(session.messages)):
+    del start_index  # Semantic parents may merge across append boundaries.
+    covered_count = min(
+        max(0, int(session.summary_message_count or 0)),
+        len(session.messages),
+    )
+    archived = [
+        item for item in session.recall_episodes if isinstance(item, dict)
+    ] if covered_count else []
+    archive_is_stale = any(
+        int(item.get("archive_version") or 0) != RECALL_ARCHIVE_VERSION
+        for item in archived
+    )
+    if covered_count and (not archived or archive_is_stale):
+        archived = build_recall_episodes(session.messages[:covered_count])
+    live = build_recall_episodes(
+        session.messages[covered_count:],
+        start_message_index=covered_count,
+    )
+    episodes = [*archived, *live]
+    episode_covered_indexes: set[int] = set()
+    for episode in episodes:
+        start = max(0, int(episode.get("start_message_index") or 0))
+        end = max(start, int(episode.get("end_message_index") or start))
+        episode_covered_indexes.update(range(start, end))
+        parent_content = render_episode_text(episode)
+        parent_id = str(episode.get("id") or f"episode-{start}-{end}")
+        context_prefix = f"{title}\n" if title else ""
+        for chunk_index, chunk in enumerate(chunk_text(parent_content)):
+            search_text = " ".join(index_terms(f"{context_prefix}{chunk}"))
+            if search_text:
+                yield HistoryChunk(
+                    start,
+                    chunk_index,
+                    "episode",
+                    chunk,
+                    search_text,
+                    parent_id,
+                    parent_content,
+                    "recall_episode",
+                )
+
+    # Keep legacy/imported assistant-only records searchable. Normal completed
+    # user turns have already been projected into episodes above.
+    for message_index in range(len(session.messages)):
+        if message_index in episode_covered_indexes:
+            continue
         message = session.messages[message_index]
         content = message_text(message).strip()
         if not content:
             continue
         role = str(message.get("role") or "unknown")
         for chunk_index, chunk in enumerate(chunk_text(content)):
-            search_text = " ".join(index_terms(chunk))
+            search_text = " ".join(index_terms(f"{title}\n{chunk}" if title else chunk))
             if search_text:
-                yield HistoryChunk(message_index, chunk_index, role, chunk, search_text)
+                parent_id = f"message-{message_index}"
+                yield HistoryChunk(
+                    message_index,
+                    chunk_index,
+                    role,
+                    chunk,
+                    search_text,
+                    parent_id,
+                    content,
+                    "legacy_message",
+                )
 
 
 def message_text(message: dict[str, Any]) -> str:
@@ -496,13 +733,135 @@ def message_text(message: dict[str, Any]) -> str:
     return text
 
 
-def chunk_text(text: str, *, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> list[str]:
+def chunk_text(
+    text: str,
+    *,
+    target_units: int = CHUNK_TARGET_UNITS,
+    overlap_units: int = CHUNK_OVERLAP_UNITS,
+    min_units: int = CHUNK_MIN_UNITS,
+    max_units: int = CHUNK_MAX_UNITS,
+) -> list[str]:
+    value = str(text or "").strip()
+    if not value:
+        return []
+    if approx_units(value) <= max_units:
+        return [value]
+    blocks = semantic_blocks(value, max_units=max_units)
+    chunks: list[str] = []
+    start = 0
+    while start < len(blocks):
+        end = start
+        units = 0
+        while end < len(blocks):
+            next_units = approx_units(blocks[end])
+            if end > start and units + next_units > target_units:
+                break
+            units += next_units
+            end += 1
+            if units >= target_units:
+                break
+        if end == start:
+            end += 1
+        chunk = "\n\n".join(blocks[start:end]).strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(blocks):
+            break
+        overlap = 0
+        next_start = end
+        while next_start > start + 1 and overlap < overlap_units:
+            next_start -= 1
+            overlap += approx_units(blocks[next_start])
+        start = next_start
+
+    if len(chunks) >= 2 and approx_units(chunks[-1]) < min_units:
+        merged = f"{chunks[-2]}\n\n{chunks[-1]}".strip()
+        if approx_units(merged) <= max_units:
+            chunks[-2:] = [merged]
+    return chunks
+
+
+def split_model_input(
+    text: str,
+    *,
+    size: int = MODEL_INPUT_CHARS,
+    overlap: int = MODEL_INPUT_OVERLAP,
+) -> list[str]:
+    """Split one FTS passage for MLX, then mean-pool its segment vectors."""
+    return split_text_by_chars(text, size=size, overlap=overlap)
+
+
+def semantic_blocks(text: str, *, max_units: int) -> list[str]:
+    """Prefer Markdown/paragraph/sentence boundaries without dropping tails."""
+    paragraphs = [
+        part.strip()
+        for part in re.split(r"\n\s*\n+", str(text or "").replace("\r\n", "\n"))
+        if part.strip()
+    ]
+    blocks: list[str] = []
+    for paragraph in paragraphs:
+        if approx_units(paragraph) <= max_units:
+            blocks.append(paragraph)
+            continue
+        sentences = [
+            item.strip()
+            for item in re.split(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+(?=[A-Z0-9])", paragraph)
+            if item.strip()
+        ]
+        if len(sentences) <= 1:
+            blocks.extend(split_text_by_units(paragraph, max_units=max_units))
+            continue
+        current: list[str] = []
+        current_units = 0
+        for sentence in sentences:
+            sentence_units = approx_units(sentence)
+            if sentence_units > max_units:
+                if current:
+                    blocks.append(" ".join(current).strip())
+                    current = []
+                    current_units = 0
+                blocks.extend(split_text_by_units(sentence, max_units=max_units))
+                continue
+            if current and current_units + sentence_units > max_units:
+                blocks.append(" ".join(current).strip())
+                current = []
+                current_units = 0
+            current.append(sentence)
+            current_units += sentence_units
+        if current:
+            blocks.append(" ".join(current).strip())
+    return [block for block in blocks if block]
+
+
+def split_text_by_units(text: str, *, max_units: int) -> list[str]:
+    tokens = re.findall(
+        r"[\u3400-\u9fff]|[A-Za-z0-9_][A-Za-z0-9_.+-]*|\s+|.",
+        str(text or ""),
+        flags=re.DOTALL,
+    )
+    parts: list[str] = []
+    current: list[str] = []
+    units = 0
+    for token in tokens:
+        token_units = approx_units(token)
+        if current and units + token_units > max_units:
+            parts.append("".join(current).strip())
+            current = []
+            units = 0
+        current.append(token)
+        units += token_units
+    if current:
+        parts.append("".join(current).strip())
+    return [part for part in parts if part]
+
+
+def split_text_by_chars(text: str, *, size: int, overlap: int) -> list[str]:
     value = str(text or "").strip()
     if not value:
         return []
     if len(value) <= size:
         return [value]
-    chunks: list[str] = []
+    parts: list[str] = []
     start = 0
     while start < len(value):
         hard_end = min(len(value), start + size)
@@ -517,11 +876,11 @@ def chunk_text(text: str, *, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERL
             )
             if boundary > start:
                 end = boundary + 1
-        chunks.append(value[start:end].strip())
+        parts.append(value[start:end].strip())
         if end >= len(value):
             break
         start = max(start + 1, end - overlap)
-    return [chunk for chunk in chunks if chunk]
+    return [part for part in parts if part]
 
 
 def normalize_keywords(value: Any) -> list[str]:
@@ -585,19 +944,358 @@ def dedupe(items: Iterable[str]) -> list[str]:
     return result
 
 
+def chunk_signature(content: str) -> str:
+    return sha256(str(content or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def normalize_vector(vector: Iterable[float]) -> np.ndarray:
+    array = np.asarray(list(vector), dtype=np.float32)
+    if array.ndim != 1 or array.size <= 0:
+        raise RetrievalBackendError("embedding vector is empty")
+    norm = float(np.linalg.norm(array))
+    if not math.isfinite(norm) or norm <= 1e-12:
+        raise RetrievalBackendError("embedding vector norm is invalid")
+    return array / norm
+
+
+def ensure_vector_indices(
+    connection: sqlite3.Connection,
+    scoped_sessions: list[tuple[ConversationSession, dict[str, Any]]],
+    *,
+    backend: RetrievalBackend,
+) -> int:
+    """Incrementally backfill normalized vectors for the currently allowed scope."""
+    indexed = 0
+    for session, metadata in scoped_sessions:
+        # Tool payloads are retained in FTS for exact path/value recovery, but
+        # excluded from semantic indexing: they dominate chat volume and often
+        # contain protocol/debug noise rather than user-visible conversation.
+        chunks = [
+            chunk
+            for chunk in iter_session_chunks(
+                session,
+                title=str(metadata.get("title") or ""),
+            )
+            if chunk.role in {"user", "assistant", "episode"}
+        ]
+        valid = {
+            (chunk.message_index, chunk.chunk_index): chunk_signature(chunk.content)
+            for chunk in chunks
+        }
+        rows = connection.execute(
+            """
+            SELECT message_index, chunk_index, content_signature, model
+            FROM history_chunk_vectors
+            WHERE conversation_id = ?
+            """,
+            (session.id,),
+        ).fetchall()
+        existing = {
+            (int(row["message_index"]), int(row["chunk_index"])): (
+                str(row["content_signature"] or ""),
+                str(row["model"] or ""),
+            )
+            for row in rows
+        }
+        stale_keys = [
+            key
+            for key, (signature, model) in existing.items()
+            if key not in valid
+            or signature != valid[key]
+            or model != backend.embedding_model
+        ]
+        with connection:
+            for message_index, chunk_index in stale_keys:
+                connection.execute(
+                    """
+                    DELETE FROM history_chunk_vectors
+                    WHERE conversation_id = ? AND message_index = ? AND chunk_index = ?
+                    """,
+                    (session.id, message_index, chunk_index),
+                )
+
+        pending = [
+            chunk
+            for chunk in chunks
+            if existing.get((chunk.message_index, chunk.chunk_index))
+            != (chunk_signature(chunk.content), backend.embedding_model)
+        ]
+        for start in range(0, len(pending), VECTOR_BATCH_SIZE):
+            batch = pending[start : start + VECTOR_BATCH_SIZE]
+            segments: list[str] = []
+            owners: list[int] = []
+            for owner, chunk in enumerate(batch):
+                for segment in split_model_input(chunk.content):
+                    segments.append(segment)
+                    owners.append(owner)
+            segment_vectors = backend.embed_texts(segments)
+            if len(segment_vectors) != len(segments):
+                raise RetrievalBackendError(
+                    "embedding segment count mismatch: "
+                    f"expected={len(segments)} actual={len(segment_vectors)}"
+                )
+            grouped: list[list[np.ndarray]] = [[] for _chunk in batch]
+            for owner, vector in zip(owners, segment_vectors):
+                grouped[owner].append(normalize_vector(vector))
+            records: list[tuple[Any, ...]] = []
+            for chunk, group in zip(batch, grouped):
+                if not group:
+                    raise RetrievalBackendError("embedding chunk produced no segments")
+                normalized = normalize_vector(np.mean(np.vstack(group), axis=0))
+                records.append(
+                    (
+                        session.id,
+                        chunk.message_index,
+                        chunk.chunk_index,
+                        chunk_signature(chunk.content),
+                        backend.embedding_model,
+                        int(normalized.size),
+                        normalized.astype("<f4", copy=False).tobytes(),
+                        int(time.time()),
+                    )
+                )
+            with connection:
+                connection.executemany(
+                    """
+                    INSERT INTO history_chunk_vectors(
+                        conversation_id, message_index, chunk_index,
+                        content_signature, model, dimensions, embedding, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_id, message_index, chunk_index) DO UPDATE SET
+                        content_signature=excluded.content_signature,
+                        model=excluded.model,
+                        dimensions=excluded.dimensions,
+                        embedding=excluded.embedding,
+                        updated_at=excluded.updated_at
+                    """,
+                    records,
+                )
+            indexed += len(records)
+    return indexed
+
+
+def fetch_dense_candidates(
+    connection: sqlite3.Connection,
+    *,
+    query_vector: np.ndarray,
+    model: str,
+    conversation_id: str,
+    scope: str,
+    current_message_limit: int,
+    candidate_limit: int,
+    allowed_conversation_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not allowed_conversation_ids:
+        return []
+    placeholders = ", ".join("?" for _item in allowed_conversation_ids)
+    conditions = [
+        "vectors.model = ?",
+        "vectors.dimensions = ?",
+        f"vectors.conversation_id IN ({placeholders})",
+    ]
+    parameters: list[Any] = [model, int(query_vector.size), *allowed_conversation_ids]
+    if scope in {"compressed", "current"}:
+        conditions.extend(
+            [
+                "vectors.conversation_id = ?",
+                "vectors.message_index < ?",
+            ]
+        )
+        parameters.extend([conversation_id, current_message_limit])
+    else:
+        conditions.append(
+            "(vectors.conversation_id <> ? OR vectors.message_index < ?)"
+        )
+        parameters.extend([conversation_id, current_message_limit])
+    rows = connection.execute(
+        f"""
+        SELECT vectors.conversation_id,
+               vectors.message_index,
+               vectors.chunk_index,
+               vectors.dimensions,
+               vectors.embedding,
+               chat_history_fts.role,
+               chat_history_fts.content,
+               parent.parent_id,
+               parent.parent_content,
+               parent.source_kind,
+               meta.title AS conversation_title,
+               meta.project_id,
+               meta.updated_at
+        FROM history_chunk_vectors AS vectors
+        JOIN chat_history_fts
+          ON chat_history_fts.conversation_id = vectors.conversation_id
+         AND CAST(chat_history_fts.message_index AS INTEGER) = vectors.message_index
+         AND CAST(chat_history_fts.chunk_index AS INTEGER) = vectors.chunk_index
+        JOIN history_conversation_meta AS meta
+          ON meta.conversation_id = vectors.conversation_id
+        JOIN history_chunk_parent AS parent
+          ON parent.conversation_id = vectors.conversation_id
+         AND parent.message_index = vectors.message_index
+         AND parent.chunk_index = vectors.chunk_index
+        WHERE {" AND ".join(conditions)}
+        """,
+        parameters,
+    ).fetchall()
+    valid_rows: list[sqlite3.Row] = []
+    vectors: list[np.ndarray] = []
+    for row in rows:
+        vector = np.frombuffer(row["embedding"], dtype="<f4")
+        if vector.size != query_vector.size:
+            continue
+        valid_rows.append(row)
+        vectors.append(vector)
+    if not vectors:
+        return []
+    matrix = np.vstack(vectors)
+    scores = matrix @ query_vector
+    order = np.argsort(scores)[::-1][:candidate_limit]
+    results: list[dict[str, Any]] = []
+    for index in order:
+        row = valid_rows[int(index)]
+        similarity = float(scores[int(index)])
+        results.append(
+            {
+                "conversation_id": str(row["conversation_id"] or ""),
+                "conversation_title": str(
+                    row["conversation_title"] or row["conversation_id"] or ""
+                ),
+                "project_id": str(row["project_id"] or ""),
+                "conversation_updated_at": int(row["updated_at"] or 0),
+                "message_ordinal": int(row["message_index"]) + 1,
+                "chunk_ordinal": int(row["chunk_index"]) + 1,
+                "role": str(row["role"] or "unknown"),
+                "score": round(similarity, 6),
+                "matched_terms": [],
+                "matched_by": ["dense"],
+                "retrieval_scores": {"dense": round(similarity, 6)},
+                "content": str(row["parent_content"] or row["content"] or ""),
+                "matched_content": str(row["content"] or ""),
+                "parent_id": str(row["parent_id"] or ""),
+                "source_kind": str(row["source_kind"] or ""),
+                "return_mode": "parent_episode",
+            }
+        )
+    return results
+
+
+def result_key(result: dict[str, Any]) -> tuple[str, int, int]:
+    return (
+        str(result.get("conversation_id") or ""),
+        int(result.get("message_ordinal") or 0),
+        int(result.get("chunk_ordinal") or 0),
+    )
+
+
+def rrf_merge_results(
+    ranked_lists: list[list[dict[str, Any]]],
+    *,
+    top_n: int,
+    k: int = RRF_K,
+) -> list[dict[str, Any]]:
+    scores: dict[tuple[str, int, int], float] = {}
+    payloads: dict[tuple[str, int, int], dict[str, Any]] = {}
+    first_seen: dict[tuple[str, int, int], tuple[int, int]] = {}
+    channel_names = ("bm25", "dense")
+    for list_index, ranked in enumerate(ranked_lists):
+        channel = channel_names[list_index] if list_index < len(channel_names) else f"rank_{list_index}"
+        for rank, raw in enumerate(ranked):
+            key = result_key(raw)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            first_seen.setdefault(key, (list_index, rank))
+            payload = payloads.setdefault(key, dict(raw))
+            payload["matched_terms"] = dedupe(
+                [
+                    *list(payload.get("matched_terms") or []),
+                    *list(raw.get("matched_terms") or []),
+                ]
+            )
+            payload["matched_by"] = dedupe(
+                [
+                    *list(payload.get("matched_by") or []),
+                    channel,
+                ]
+            )
+            retrieval_scores = dict(payload.get("retrieval_scores") or {})
+            if channel == "bm25":
+                retrieval_scores.setdefault("bm25", raw.get("score"))
+            elif channel == "dense":
+                retrieval_scores.setdefault("dense", raw.get("score"))
+            payload["retrieval_scores"] = retrieval_scores
+    ordered = sorted(
+        scores,
+        key=lambda key: (
+            -scores[key],
+            first_seen[key][0],
+            first_seen[key][1],
+        ),
+    )
+    results: list[dict[str, Any]] = []
+    for key in ordered[:top_n]:
+        payload = payloads[key]
+        payload["rrf_score"] = round(scores[key], 8)
+        payload["score"] = round(scores[key], 8)
+        results.append(payload)
+    return results
+
+
+def dedupe_message_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    deduped: list[dict[str, Any]] = []
+    for result in results:
+        parent_key = (
+            str(result.get("conversation_id") or ""),
+            str(result.get("parent_id") or f"message-{result.get('message_ordinal')}"),
+        )
+        if parent_key in seen:
+            existing = seen[parent_key]
+            passages = list(existing.get("matched_passages") or [])
+            matched = str(result.get("matched_content") or "").strip()
+            if matched and matched not in passages:
+                passages.append(matched)
+            existing["matched_passages"] = passages[:3]
+            existing["matched_terms"] = dedupe(
+                [*list(existing.get("matched_terms") or []), *list(result.get("matched_terms") or [])]
+            )
+            existing["matched_by"] = dedupe(
+                [*list(existing.get("matched_by") or []), *list(result.get("matched_by") or [])]
+            )
+            continue
+        item = dict(result)
+        matched = str(item.get("matched_content") or "").strip()
+        item["matched_passages"] = [matched] if matched else []
+        seen[parent_key] = item
+        deduped.append(item)
+    return deduped
+
+
+def format_backend_error(stage: str, error: Exception) -> str:
+    text = re.sub(r"\s+", " ", str(error or "")).strip()
+    if len(text) > 240:
+        text = text[:237].rstrip() + "..."
+    return f"{stage}不可用：{text or type(error).__name__}"
+
+
 def fetch_candidates(
     connection: sqlite3.Connection,
     *,
     conversation_id: str,
-    project_id: str,
     scope: str,
     terms: list[str],
     current_message_limit: int,
     candidate_limit: int,
+    allowed_conversation_ids: list[str],
 ) -> list[sqlite3.Row]:
+    if not terms or not allowed_conversation_ids:
+        return []
     expression = " OR ".join(fts_quote(term) for term in terms)
-    conditions = ["chat_history_fts MATCH ?"]
+    placeholders = ", ".join("?" for _item in allowed_conversation_ids)
+    conditions = [
+        "chat_history_fts MATCH ?",
+        f"chat_history_fts.conversation_id IN ({placeholders})",
+    ]
     parameters: list[Any] = [expression]
+    parameters.extend(allowed_conversation_ids)
     if scope in {"compressed", "current"}:
         conditions.extend(
             [
@@ -607,11 +1305,6 @@ def fetch_candidates(
         )
         parameters.extend([conversation_id, current_message_limit])
     else:
-        if scope == "project":
-            conditions.append("meta.project_id = ?")
-            parameters.append(project_id)
-        elif scope == "account":
-            conditions.append("meta.project_id = ''")
         conditions.append(
             "(chat_history_fts.conversation_id <> ? OR CAST(chat_history_fts.message_index AS INTEGER) < ?)"
         )
@@ -627,6 +1320,9 @@ def fetch_candidates(
                    chat_history_fts.role,
                    chat_history_fts.content,
                    chat_history_fts.search_text,
+                   parent.parent_id,
+                   parent.parent_content,
+                   parent.source_kind,
                    meta.title AS conversation_title,
                    meta.project_id,
                    meta.updated_at,
@@ -634,6 +1330,10 @@ def fetch_candidates(
             FROM chat_history_fts
             JOIN history_conversation_meta AS meta
               ON meta.conversation_id = chat_history_fts.conversation_id
+            JOIN history_chunk_parent AS parent
+              ON parent.conversation_id = chat_history_fts.conversation_id
+             AND parent.message_index = CAST(chat_history_fts.message_index AS INTEGER)
+             AND parent.chunk_index = CAST(chat_history_fts.chunk_index AS INTEGER)
             WHERE {where_clause}
             ORDER BY bm25_score ASC
             LIMIT ?
@@ -671,8 +1371,9 @@ def rank_candidates(
         if not matched_terms:
             continue
         coverage = len(matched_terms) / max(1, len(terms))
-        content = str(row["content"] or "")
-        normalized_content = normalize_for_exact(content)
+        matched_content = str(row["content"] or "")
+        parent_content = str(row["parent_content"] or matched_content)
+        normalized_content = normalize_for_exact(parent_content)
         exact_hits = sum(1 for phrase in normalized_phrases if len(phrase) >= 2 and phrase in normalized_content)
         bm25_score = float(row["bm25_score"] or 0.0)
         lexical = math.log1p(max(0.0, -bm25_score) * 1000.0)
@@ -683,7 +1384,16 @@ def rank_candidates(
             if current_project_id and str(row["project_id"] or "") == current_project_id
             else 0.0
         )
-        score = coverage * 8.0 + exact_hits * 5.0 + lexical + recency * 0.2 + current_boost + project_boost
+        role_penalty = -1.5 if str(row["role"] or "") == "tool" else 0.0
+        score = (
+            coverage * 8.0
+            + exact_hits * 5.0
+            + lexical
+            + recency * 0.2
+            + current_boost
+            + project_boost
+            + role_penalty
+        )
         payload = {
             "conversation_id": source_conversation_id,
             "conversation_title": str(row["conversation_title"] or source_conversation_id),
@@ -694,7 +1404,13 @@ def rank_candidates(
             "role": str(row["role"] or "unknown"),
             "score": round(score, 4),
             "matched_terms": matched_terms,
-            "content": content,
+            "matched_by": ["bm25"],
+            "retrieval_scores": {"bm25": round(score, 4)},
+            "content": parent_content,
+            "matched_content": matched_content,
+            "parent_id": str(row["parent_id"] or ""),
+            "source_kind": str(row["source_kind"] or ""),
+            "return_mode": "parent_episode",
         }
         ranked.append((score, payload))
         per_message[message_key] = per_message.get(message_key, 0) + 1

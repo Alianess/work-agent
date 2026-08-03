@@ -141,7 +141,7 @@ def run_logged_process(
     stdout = "".join(stdout_parts)
     stderr = "".join(stderr_parts)
     if timed_out:
-        message = f"{label}超时，请缩短录音或稍后重试。"
+        message = f"{label}超时，请检查任务输入、拆分处理或稍后重试。"
         if heartbeat_emitted:
             elapsed_seconds = int(time.monotonic() - started_at)
             emit_command_heartbeat(

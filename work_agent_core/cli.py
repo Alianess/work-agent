@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
+from typing import Any, Callable
 import json
 import os
 import sys
@@ -18,7 +19,8 @@ from .skill_gateway import SkillGateway
 from .history_recall import register_history_recall_tool
 from .session_store import SessionStore
 from .tool_bus import LocalToolProvider, ToolBus
-from .tools import register_file_tools
+from .tools import Tool, register_file_tools
+from .work_reports import register_work_report_tools
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -111,11 +113,13 @@ def build_default_tools(
     profile,
     *,
     data_workspace: str | Path | None = None,
+    report_data_root: str | Path | None = None,
     include_shared_tools: bool = True,
     session_store: SessionStore | None = None,
     conversation_id: str | None = None,
     project_id: str | None = None,
     enabled_skill_ids: set[str] | None = None,
+    friday_notification_handler: Callable[[dict[str, Any]], str] | None = None,
 ) -> ToolBus:
     bus = ToolBus()
     private_workspace = data_workspace or workspace
@@ -130,10 +134,48 @@ def build_default_tools(
             conversation_id,
             project_id=str(project_id or ""),
         )
+    if friday_notification_handler is not None:
+        core_tools.registry.register(
+            Tool(
+                name="notify_user",
+                description=(
+                    "Friday-only delivery interface. Use kind=reminder for a one-way bell notification "
+                    "that needs no reply; use kind=conversation for an important proactive message that "
+                    "should appear in Friday's ongoing conversation and invite a response."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["reminder", "conversation"],
+                        },
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "deliver_at": {
+                            "type": "string",
+                            "description": (
+                                "Optional Unix seconds or ISO 8601 timestamp with timezone. "
+                                "Omit for immediate delivery."
+                            ),
+                        },
+                    },
+                    "required": ["kind", "body"],
+                },
+                handler=friday_notification_handler,
+            )
+        )
     bus.add_provider(core_tools)
 
     if not include_shared_tools:
         return bus
+
+    work_report_tools = LocalToolProvider("work-reports", provider_kind="skill")
+    register_work_report_tools(
+        work_report_tools.registry,
+        report_data_root or private_workspace,
+    )
+    bus.add_provider(work_report_tools)
 
     meeting_tools = LocalToolProvider("meeting", provider_kind="skill")
     register_meeting_minutes_skill(
@@ -164,7 +206,7 @@ def build_default_tools(
     skill_gateway.register(
         SkillGateway(
             workspace,
-            [core_tools, meeting_tools, skill_tools, mcp_tools],
+            [core_tools, work_report_tools, meeting_tools, skill_tools, mcp_tools],
             enabled_skill_ids=enabled_skill_ids,
         ).as_tool()
     )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +14,7 @@ import argparse
 import array
 import base64
 import hashlib
+import io
 import json
 import math
 import mimetypes
@@ -52,9 +53,14 @@ from .debug_trace import DebugTrace, list_debug_traces
 from .cross_chat_memory import CrossChatMemoryStore
 from .llm import OpenAICompatibleClient, chat_completions_endpoint, normalize_reasoning_effort
 from .memory import (
+    CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
     CHAT_SUMMARY_TRIGGER_TOKENS,
+    ContextCompactionError,
+    extract_recent_visible_turns,
     prepare_session_memory,
 )
+from .message_channel import ChannelMessage, ChannelReply
+from .notifications import NotificationStore
 from .history_recall import render_history_recall_system_context
 from .office_preview import OFFICE_TO_PDF_EXTENSIONS, convert_office_to_pdf
 from .react import (
@@ -75,6 +81,8 @@ from .skill_runtime import load_skill_manifests
 from .tools import WorkspaceFiles
 from .turn_runtime import TurnCancelled, TurnRuntime
 from .turn_store import TurnStore, sanitize_turn_id
+from .weixin_channel import WeixinGatewayManager
+from .work_reports import WorkReportStore
 
 
 WORKSPACE_ROOT = Path.cwd().resolve()
@@ -107,6 +115,7 @@ DEFAULT_ASR_SETTINGS: dict[str, Any] = {
     "hotwords": "",
 }
 DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
+    "assistant_name": "Friday",
     "nickname": "",
     "occupation": "",
     "details": "",
@@ -126,6 +135,11 @@ TEMP_SYNC_FILE_TTL_SECONDS = 60 * 60
 TEMP_SYNC_MAX_FILE_BYTES = 100 * 1024 * 1024
 TEMP_SYNC_MAX_TEXT_CHARS = 200_000
 TEMP_SYNC_FILE_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+CONVERSATION_ARCHIVE_LOCK = threading.RLock()
+CONVERSATION_ARCHIVE_SCHEMA_VERSION = 2
+WEIXIN_GATEWAY: WeixinGatewayManager | None = None
+FRIDAY_SCHEDULER_STOP = threading.Event()
+FRIDAY_SCHEDULER_THREAD: threading.Thread | None = None
 
 
 def get_auth_store() -> AuthStore:
@@ -179,6 +193,14 @@ def user_meeting_minutes_settings_path(user: AuthUser | None = None) -> Path:
     return user_data_dir(user) / MEETING_MINUTES_SETTINGS_PATH
 
 
+def user_weixin_state_dir(user: AuthUser | None = None) -> Path:
+    return user_data_dir(user) / "channels" / "weixin"
+
+
+def user_notification_path(user: AuthUser | None = None) -> Path:
+    return user_data_dir(user) / "notifications.json"
+
+
 def user_conversation_history_path(user: AuthUser | None = None) -> Path:
     return user_conversation_dir(user) / "conversations.json"
 
@@ -229,6 +251,348 @@ def get_turn_store() -> TurnStore:
             user.id,
             TurnStore(WORKSPACE_ROOT, turn_dir=user_conversation_dir(user) / "turns"),
         )
+
+
+def get_weixin_gateway() -> WeixinGatewayManager:
+    global WEIXIN_GATEWAY
+    if WEIXIN_GATEWAY is None:
+        WEIXIN_GATEWAY = WeixinGatewayManager(on_message=handle_weixin_channel_message)
+    return WEIXIN_GATEWAY
+
+
+def weixin_channel_status_payload() -> dict[str, Any]:
+    user = current_auth_user()
+    return get_weixin_gateway().status(user.id, user_weixin_state_dir(user))
+
+
+def start_weixin_login_payload(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    user = current_auth_user()
+    return get_weixin_gateway().start_login(
+        user.id,
+        user_weixin_state_dir(user),
+        force=bool((payload or {}).get("force")),
+    )
+
+
+def poll_weixin_login_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    user = current_auth_user()
+    return get_weixin_gateway().poll_login(
+        user.id,
+        user_weixin_state_dir(user),
+        session_id=required_string(payload, "session_id"),
+        verify_code=str(payload.get("verify_code") or ""),
+    )
+
+
+def disconnect_weixin_payload() -> dict[str, Any]:
+    user = current_auth_user()
+    return get_weixin_gateway().disconnect(user.id, user_weixin_state_dir(user))
+
+
+def notifications_payload() -> dict[str, Any]:
+    return NotificationStore(user_notification_path()).payload()
+
+
+def work_report_calendar_payload(year: int, month: int) -> dict[str, Any]:
+    return WorkReportStore(user_data_dir()).calendar_month(year=year, month=month)
+
+
+def work_report_day_payload(target_date: str) -> dict[str, Any]:
+    return WorkReportStore(user_data_dir()).day_detail(target_date=target_date)
+
+
+def mark_notifications_read_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    store = NotificationStore(user_notification_path())
+    store.mark_read(
+        str(payload.get("id") or "").strip(),
+        all_items=bool(payload.get("all")),
+    )
+    return store.payload()
+
+
+def delete_notification_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    store = NotificationStore(user_notification_path())
+    store.delete(str(payload.get("id") or "").strip())
+    return store.payload()
+
+
+def friday_notification_handler(args: dict[str, Any]) -> str:
+    kind = str(args.get("kind") or "").strip()
+    title = str(args.get("title") or "").strip()
+    body = str(args.get("body") or "").strip()
+    deliver_at = parse_friday_delivery_time(str(args.get("deliver_at") or ""))
+    if kind == "reminder":
+        item = NotificationStore(user_notification_path()).add(
+            kind=kind,
+            title=title,
+            body=body,
+            deliver_at=deliver_at,
+        )
+        return json.dumps(
+            {
+                "delivery": "bell",
+                "notification_id": item["id"],
+                "deliver_at": item["deliver_at"],
+            },
+            ensure_ascii=False,
+        )
+    if kind == "conversation":
+        if deliver_at <= int(time.time()):
+            append_friday_proactive_message(body)
+        else:
+            item = NotificationStore(user_notification_path()).add(
+                kind=kind,
+                title=title or "Friday 主动会话",
+                body=body,
+                deliver_at=deliver_at,
+            )
+        return json.dumps(
+            {
+                "delivery": "friday_conversation",
+                "conversation_id": "friday-main",
+                "deliver_at": deliver_at,
+            },
+            ensure_ascii=False,
+        )
+    raise ValueError("kind 必须是 reminder 或 conversation。")
+
+
+def parse_friday_delivery_time(value: str) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return int(time.time())
+    try:
+        return max(int(time.time()), int(float(text)))
+    except ValueError:
+        pass
+    normalized = text.replace("Z", "+00:00")
+    try:
+        return max(int(time.time()), int(datetime.fromisoformat(normalized).timestamp()))
+    except ValueError as error:
+        raise ValueError(
+            "deliver_at 必须是 Unix 秒数或 ISO 8601 时间，例如 2026-07-31T09:00:00+08:00。"
+        ) from error
+
+
+def start_friday_scheduler() -> None:
+    global FRIDAY_SCHEDULER_THREAD
+    if FRIDAY_SCHEDULER_THREAD and FRIDAY_SCHEDULER_THREAD.is_alive():
+        return
+    FRIDAY_SCHEDULER_STOP.clear()
+    FRIDAY_SCHEDULER_THREAD = threading.Thread(
+        target=friday_scheduler_loop,
+        name="friday-notification-scheduler",
+        daemon=True,
+    )
+    FRIDAY_SCHEDULER_THREAD.start()
+
+
+def stop_friday_scheduler() -> None:
+    FRIDAY_SCHEDULER_STOP.set()
+    thread = FRIDAY_SCHEDULER_THREAD
+    if thread and thread.is_alive():
+        thread.join(timeout=2)
+
+
+def friday_scheduler_loop() -> None:
+    while not FRIDAY_SCHEDULER_STOP.is_set():
+        for user in get_auth_store().list_users():
+            previous_user = getattr(REQUEST_AUTH, "user", None)
+            REQUEST_AUTH.user = user
+            try:
+                notification_store = NotificationStore(user_notification_path(user))
+                audit = WorkReportStore(user_data_dir(user)).audit_if_due()
+                if audit.get("notify"):
+                    notification_store.add(
+                        kind="conversation",
+                        title="日报缺失提醒",
+                        body=work_report_gap_message(audit),
+                    )
+                notification_store.claim_due(kind="reminder")
+                for item in notification_store.due_conversations():
+                    append_friday_proactive_message(str(item.get("body") or ""))
+                    notification_store.mark_delivered(str(item.get("id") or ""))
+            except Exception as error:
+                print(f"[friday-scheduler] user={user.id}: {type(error).__name__}: {error}")
+            finally:
+                if isinstance(previous_user, AuthUser):
+                    REQUEST_AUTH.user = previous_user
+                elif hasattr(REQUEST_AUTH, "user"):
+                    delattr(REQUEST_AUTH, "user")
+        FRIDAY_SCHEDULER_STOP.wait(5)
+
+
+def work_report_gap_message(audit: dict[str, Any]) -> str:
+    missing = [str(item) for item in audit.get("missing_daily_reports") or [] if str(item)]
+    counts = audit.get("evidence_counts_by_date") if isinstance(audit.get("evidence_counts_by_date"), dict) else {}
+    with_evidence = [day for day in missing if int(counts.get(day) or 0) > 0]
+    without_evidence = [day for day in missing if day not in with_evidence]
+    lines = [f"我检查到最近有 {len(missing)} 个工作日还没有日报：{'、'.join(missing)}。"]
+    if with_evidence:
+        lines.append(f"其中 {'、'.join(with_evidence)} 已有本地智能体工作记录，可以直接整理。")
+    if without_evidence:
+        lines.append(
+            f"{'、'.join(without_evidence)} 没有发现本地工作记录，可能包含外出开会、公司电脑或其他工具完成的事项。"
+        )
+    lines.append("你可以直接回复“补日报”，并补充无记录日期做了什么；我会先复用已有记录，不重复翻查聊天。")
+    return "\n".join(lines)
+
+
+def append_friday_proactive_message(text: str) -> None:
+    content = str(text or "").strip()
+    if not content:
+        raise ValueError("主动会话内容不能为空。")
+    store = get_session_store()
+    session = store.load("friday-main")
+    session.messages.append({"role": "assistant", "content": content})
+    store.save(session)
+    with CONVERSATION_ARCHIVE_LOCK:
+        payload = load_conversations_payload()
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        target = next(
+            (
+                item
+                for item in items
+                if isinstance(item, dict) and str(item.get("id") or "") == "friday-main"
+            ),
+            None,
+        )
+        if target is None:
+            target = {
+                "id": "friday-main",
+                "title": str(load_agent_settings().get("assistant_name") or "Friday"),
+                "group": "助理",
+                "messages": [],
+                "contextSummary": "",
+                "contextSummaryMessageCount": 0,
+            }
+            items.insert(0, target)
+        messages = target.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+            target["messages"] = messages
+        messages.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "channel": "friday",
+                "createdAt": int(time.time() * 1000),
+            }
+        )
+        save_result = save_conversations_payload(
+            {
+                "base_revision": payload.get("revision", 0),
+                "upserts": [target],
+            }
+        )
+        if not save_result.get("ok"):
+            raise RuntimeError("保存 Friday 主动消息时归档版本发生变化。")
+
+
+def handle_weixin_channel_message(user_id: int, message: ChannelMessage) -> ChannelReply:
+    user = get_auth_store().get_user_by_id(user_id)
+    if user is None:
+        return ChannelReply(text="这个微信连接对应的 Work Agent 账户已经不存在。")
+    previous_user = getattr(REQUEST_AUTH, "user", None)
+    REQUEST_AUTH.user = user
+    try:
+        final_text = ""
+        error_text = ""
+        payload = {
+            "conversation_id": message.conversation_id or "friday-main",
+            "messages": [{"role": "user", "content": message.text}],
+            "reasoning_effort": "medium",
+        }
+        for event in run_agent_chat_events(payload):
+            if event.get("event") == "final":
+                final_text = str(event.get("content") or "").strip()
+            elif event.get("event") == "error":
+                error_text = str(event.get("message") or event.get("detail") or "").strip()
+        if final_text:
+            reply_text = final_text
+        elif "Insufficient Balance" in error_text or "HTTP 402" in error_text:
+            reply_text = "Friday 当前使用的模型服务余额不足，请检查模型账户余额后重试。"
+        elif error_text:
+            reply_text = f"这条消息处理失败：{error_text}"
+        else:
+            reply_text = "这条消息没有形成完整回复，请稍后重试。"
+        append_weixin_exchange_to_archive(
+            message.conversation_id or "friday-main",
+            message.text,
+            reply_text,
+            timestamp_ms=message.timestamp_ms,
+        )
+        return ChannelReply(text=reply_text)
+    except Exception as error:
+        print(f"[weixin] failed to process message for user={user_id}: {type(error).__name__}: {error}")
+        return ChannelReply(text=f"Friday 暂时无法处理这条消息：{error}")
+    finally:
+        if isinstance(previous_user, AuthUser):
+            REQUEST_AUTH.user = previous_user
+        elif hasattr(REQUEST_AUTH, "user"):
+            delattr(REQUEST_AUTH, "user")
+
+
+def append_weixin_exchange_to_archive(
+    conversation_id: str,
+    user_text: str,
+    assistant_text: str,
+    *,
+    timestamp_ms: int,
+) -> None:
+    with CONVERSATION_ARCHIVE_LOCK:
+        payload = load_conversations_payload()
+        items = payload.get("items")
+        if not isinstance(items, list):
+            items = []
+        target = next(
+            (
+                item
+                for item in items
+                if isinstance(item, dict) and str(item.get("id") or "") == conversation_id
+            ),
+            None,
+        )
+        if target is None:
+            settings = load_agent_settings()
+            target = {
+                "id": conversation_id,
+                "title": str(settings.get("assistant_name") or "Friday"),
+                "group": "助理",
+                "messages": [],
+                "contextSummary": "",
+                "contextSummaryMessageCount": 0,
+            }
+            items.insert(0, target)
+        messages = target.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+            target["messages"] = messages
+        created_at = max(0, int(timestamp_ms or int(time.time() * 1000)))
+        messages.extend(
+            [
+                {
+                    "role": "user",
+                    "content": user_text,
+                    "channel": "weixin",
+                    "createdAt": created_at,
+                },
+                {
+                    "role": "assistant",
+                    "content": assistant_text,
+                    "channel": "weixin",
+                    "createdAt": int(time.time() * 1000),
+                },
+            ]
+        )
+        save_result = save_conversations_payload(
+            {
+                "base_revision": payload.get("revision", 0),
+                "upserts": [target],
+            }
+        )
+        if not save_result.get("ok"):
+            raise RuntimeError("保存微信对话时归档版本发生变化。")
 
 
 class LocalQwen3ASRWorker:
@@ -546,6 +910,30 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/settings/meeting-minutes":
                 self._send_json(meeting_minutes_settings_payload())
                 return
+            if parsed.path == "/api/channels/weixin":
+                self._send_json(weixin_channel_status_payload())
+                return
+            if parsed.path == "/api/notifications":
+                self._send_json(notifications_payload())
+                return
+            if parsed.path == "/api/work-reports/calendar":
+                params = parse_qs(parsed.query)
+                today = date.today()
+                self._send_json(
+                    work_report_calendar_payload(
+                        int(first(params, "year", str(today.year))),
+                        int(first(params, "month", str(today.month))),
+                    )
+                )
+                return
+            if parsed.path == "/api/work-reports/day":
+                params = parse_qs(parsed.query)
+                self._send_json(work_report_day_payload(first(params, "date", date.today().isoformat())))
+                return
+            if parsed.path == "/api/channels/weixin/login/qr":
+                params = parse_qs(parsed.query)
+                self._send_weixin_qr(first(params, "session_id", ""))
+                return
             if parsed.path == "/api/memories":
                 params = parse_qs(parsed.query)
                 project_values = params.get("project_id")
@@ -794,6 +1182,21 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/settings/meeting-minutes":
                 self._send_json(save_meeting_minutes_settings_payload(payload))
                 return
+            if parsed.path == "/api/channels/weixin/login/start":
+                self._send_json(start_weixin_login_payload(payload))
+                return
+            if parsed.path == "/api/channels/weixin/login/poll":
+                self._send_json(poll_weixin_login_payload(payload))
+                return
+            if parsed.path == "/api/channels/weixin/disconnect":
+                self._send_json(disconnect_weixin_payload())
+                return
+            if parsed.path == "/api/notifications/read":
+                self._send_json(mark_notifications_read_payload(payload))
+                return
+            if parsed.path == "/api/notifications/delete":
+                self._send_json(delete_notification_payload(payload))
+                return
             if parsed.path == "/api/memories/update":
                 self._send_json(update_cross_chat_memory_payload(payload))
                 return
@@ -879,6 +1282,15 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                     return
                 if suffix == "sync-meeting":
                     self._send_json(sync_meeting_to_project_payload(project_id, payload))
+                    return
+                if suffix == "timeline/create":
+                    self._send_json(create_project_timeline_payload(project_id), status=201)
+                    return
+                if suffix == "timeline/select":
+                    self._send_json(select_project_timeline_payload(project_id, payload))
+                    return
+                if suffix == "timeline/changes":
+                    self._send_json(update_project_timeline_payload(project_id, payload))
                     return
             if parsed.path == "/api/file/open":
                 if not self._require_admin():
@@ -978,6 +1390,26 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
         self._send_common_headers()
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _send_weixin_qr(self, session_id: str) -> None:
+        if not session_id:
+            raise ValueError("缺少微信登录会话。")
+        user = current_auth_user()
+        qr_url = get_weixin_gateway().qr_url(user.id, session_id)
+        try:
+            import qrcode
+        except ImportError as error:
+            raise RuntimeError("缺少 qrcode 运行依赖，请更新项目统一运行环境。") from error
+        image = qrcode.make(qr_url)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        body = buffer.getvalue()
+        self.send_response(200)
+        self._send_common_headers()
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_common_headers(self) -> None:
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -1400,6 +1832,9 @@ def load_agent_settings() -> dict[str, Any]:
         except json.JSONDecodeError:
             data = {}
     settings = {**DEFAULT_AGENT_SETTINGS, **data}
+    settings["assistant_name"] = (
+        normalize_multiline_text(str(settings.get("assistant_name") or "Friday")).strip() or "Friday"
+    )
     settings["nickname"] = normalize_multiline_text(str(settings.get("nickname") or ""))
     settings["occupation"] = normalize_multiline_text(str(settings.get("occupation") or ""))
     settings["details"] = normalize_multiline_text(
@@ -1458,6 +1893,12 @@ def agent_settings_payload(message: str | None = None) -> dict[str, Any]:
 def save_agent_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
     current = load_agent_settings()
     settings = {
+        "assistant_name": (
+            normalize_multiline_text(
+                str(payload.get("assistant_name", current.get("assistant_name")) or "Friday")
+            ).strip()
+            or "Friday"
+        ),
         "nickname": normalize_multiline_text(str(payload.get("nickname", current.get("nickname")) or "")),
         "occupation": normalize_multiline_text(str(payload.get("occupation", current.get("occupation")) or "")),
         "details": normalize_multiline_text(str(payload.get("details", current.get("details")) or "")),
@@ -1574,15 +2015,28 @@ def save_skill_instruction_payload(skill_id: str, payload: dict[str, Any]) -> di
 def cross_chat_memories_payload(*, project_id: str | None = None, query: str = "") -> dict[str, Any]:
     store = CrossChatMemoryStore(get_session_store())
     memories = store.list(project_id=project_id, query=query)
+    account_count = len(store.list(project_id="", limit=500))
+    project_count = len(store.list(project_id=None, limit=500)) - account_count
     return {
         "memories": memories,
         "count": len(memories),
+        "counts": {
+            "account": account_count,
+            "projects": max(0, project_count),
+        },
         "automatic": True,
-        "source": "automatic_memory",
+        "source": "core_memory",
         "enabled": bool(load_agent_settings().get("memory_enabled", True)),
-        "profile": store.profile_for_scope(
-            scope="project" if project_id else "account", project_id=str(project_id or "")
-        ),
+        "profile": None,
+        "policy": {
+            "account_limit": 32,
+            "project_limit": 24,
+            "automatic_account_limit": 12,
+            "automatic_project_limit": 10,
+            "minimum_user_turns": 12,
+            "refresh_interval_user_turns": 8,
+            "history_recall": "hybrid-history-rag",
+        },
         "project_id": project_id,
     }
 
@@ -1685,6 +2139,7 @@ def tools_payload() -> dict[str, Any]:
         client,
         profile,
         data_workspace=account_workspace_root(),
+        report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
         enabled_skill_ids=enabled_skill_ids(),
     )
@@ -1705,16 +2160,63 @@ def tools_payload() -> dict[str, Any]:
     }
 
 
-def agent_system_context() -> str:
+def assistant_runtime_mode(conversation_id: str) -> str:
+    return "friday" if str(conversation_id or "").strip() == "friday-main" else "task"
+
+
+def is_compact_command(text: str) -> bool:
+    return str(text or "").strip().lower() == "/compact"
+
+
+def compact_command_result(prepared: Any) -> str:
+    if prepared.compacted:
+        return (
+            "已调用当前模型的专用压缩链路，压缩当前任务上下文。"
+            f"已归纳到第 {prepared.summary_message_count} 条后端消息，"
+            "最近两轮问答仍作为原文承接；完整执行轨迹已进入可检索存档。"
+        )
+    return (
+        "当前没有新的、已经形成最终答复的完整轮次可交给模型压缩；"
+        "进行中的工作不会被 /compact 误当成已完成任务改写。"
+    )
+
+
+def clear_completed_task_plan(session: Any) -> None:
+    state = session.metadata.get("active_task_plan")
+    if not isinstance(state, dict):
+        return
+    steps = state.get("steps")
+    if isinstance(steps, list) and steps and all(
+        isinstance(item, dict) and item.get("status") == "completed" for item in steps
+    ):
+        session.metadata.pop("active_task_plan", None)
+
+
+def agent_system_context(*, mode: str = "task") -> str:
     settings = load_agent_settings()
+    assistant_name = str(settings.get("assistant_name") or "Friday").strip() or "Friday"
     nickname = str(settings.get("nickname") or "").strip()
     occupation = str(settings.get("occupation") or "").strip()
     details = str(settings.get("details") or "").strip()
     company_document_format = str(settings.get("company_document_format") or "").strip()
-    if not nickname and not occupation and not details and not company_document_format:
-        return ""
-    blocks: list[str] = []
-    if nickname or occupation or details:
+    if mode == "friday":
+        blocks: list[str] = [
+            (
+                f"你是用户唯一、持续存在的项目经理助理“{assistant_name}”。"
+                "微信、网页持续会话、项目节点和提醒属于同一个助理运行时；"
+                "用户无需使用 /new，你应保持连续主体与跨工作回忆。"
+                "日历等尚未提供的接口不得声称已经接入。"
+            )
+        ]
+    else:
+        blocks = [
+            (
+                "你正在一个普通任务聊天中工作。它是可独立创建、可结束的任务工作区，"
+                "不具备持续主体、跨任务人格、外部消息通道或主动提醒能力。"
+                "只围绕本聊天和当前项目材料完成用户交办，不要主动介绍其他助理运行时。"
+            )
+        ]
+    if mode == "friday" and (nickname or occupation or details):
         blocks.append(
             "用户主动填写的个性化资料（优先级高于自动记忆）：\n"
             f"- 称呼：{nickname or '未设置'}\n"
@@ -1736,21 +2238,68 @@ def agent_system_context() -> str:
 
 
 def memory_context_for_reply(*, query: str, project_id: str = "") -> str:
-    """Retrieve a small, relevant memory slice before each model call."""
+    """Inject bounded core memory; leave details to raw-history retrieval."""
     if not load_agent_settings().get("memory_enabled", True):
         return ""
     store = CrossChatMemoryStore(get_session_store())
-    scope = "project" if project_id else "account"
-    profile = store.profile_for_scope(scope=scope, project_id=project_id)
-    items = store.relevant_for_scope(query=query, scope=scope, project_id=project_id, limit=6)
-    if not profile and not items:
+    account_items = store.list(project_id="", limit=16)
+    project_items = store.list(project_id=project_id, limit=12) if project_id else []
+    if not account_items and not project_items:
         return ""
-    blocks = ["自动记忆（由历史聊天提炼，仅在与当前问题相关时参考；不确定或冲突时先核验原文）："]
-    if profile:
-        blocks.append(f"记忆摘要：\n{profile['content']}")
-    if items:
-        blocks.append("相关记忆：\n" + "\n".join(f"- [{item['kind']}] {item['content']}" for item in items))
+    blocks = [
+        "核心记忆（数量固定、低频更新，只包含跨任务稳定信息；"
+        "具体数字、文件、某次讨论和阶段进度必须调用 recall_chat_history 检索原文）："
+    ]
+    if account_items:
+        blocks.append(
+            "关于用户：\n"
+            + "\n".join(f"- {item['content']}" for item in account_items)
+        )
+    if project_items:
+        blocks.append(
+            "关于当前项目：\n"
+            + "\n".join(f"- {item['content']}" for item in project_items)
+        )
     return "\n\n".join(blocks) + "\n"
+
+
+AUTO_MEMORY_MIN_USER_TURNS = 12
+AUTO_MEMORY_REFRESH_INTERVAL_USER_TURNS = 8
+AUTO_MEMORY_MAX_VISIBLE_TURNS = 12
+EXPLICIT_MEMORY_PATTERN = re.compile(
+    r"(?:请|帮我)?记住|以后(?:都|一直)|长期(?:记住|有效|偏好)|"
+    r"这是我(?:的)?(?:固定|长期|一贯)|我一贯|我一直(?:都)?",
+)
+EXPLICIT_MEMORY_CAPTURE_PATTERN = re.compile(
+    r"(?:^|[。！？\n])\s*(?:请|帮我)?记住(?:一下)?(?:[：:,，\s]+)?(?P<content>[^\n]{6,280})",
+)
+
+
+def should_refresh_core_memory(*, user_messages: list[dict[str, Any]], last_count: int) -> bool:
+    if not user_messages:
+        return False
+    latest_user_text = str(user_messages[-1].get("content") or "")
+    if EXPLICIT_MEMORY_PATTERN.search(latest_user_text):
+        return True
+    return (
+        len(user_messages) >= AUTO_MEMORY_MIN_USER_TURNS
+        and len(user_messages) - max(0, int(last_count)) >= AUTO_MEMORY_REFRESH_INTERVAL_USER_TURNS
+    )
+
+
+def explicit_memory_content(user_text: str) -> str:
+    """Capture a direct user memory request without delegating it to a model.
+
+    Direct requests are user authority, not an automatic inference.  The
+    conservative automatic extractor remains separate below.
+    """
+    match = EXPLICIT_MEMORY_CAPTURE_PATTERN.search(str(user_text or "").strip())
+    if not match:
+        return ""
+    content = re.sub(r"\s+", " ", str(match.group("content") or "").strip(" ：:,，。"))
+    if not content or content.endswith(("吗", "么", "？", "?")):
+        return ""
+    return content[:280]
 
 
 def schedule_memory_refresh(
@@ -1763,34 +2312,80 @@ def schedule_memory_refresh(
     messages = list(getattr(session, "messages", []) or [])
     user_messages = [item for item in messages if isinstance(item, dict) and item.get("role") == "user"]
     last_count = int(getattr(session, "metadata", {}).get("memory_extracted_user_count", 0) or 0)
-    if len(user_messages) < 3 or len(user_messages) <= last_count:
+    latest_user_text = str(user_messages[-1].get("content") or "") if user_messages else ""
+    direct_content = explicit_memory_content(latest_user_text)
+    if direct_content:
+        kind = "project" if project_id else "preference"
+        try:
+            CrossChatMemoryStore(get_session_store()).upsert_many(
+                [{
+                    "kind": kind,
+                    "content": direct_content,
+                    "importance": 1.0,
+                    "confidence": 1.0,
+                    "durability": "permanent",
+                    "evidence": "explicit",
+                }],
+                conversation_id=conversation_id,
+                conversation_title=conversation_title or conversation_id,
+                project_id=project_id,
+                source_excerpt=latest_user_text,
+                state="explicit",
+            )
+        except Exception as error:
+            # This runs after the visible answer; retain an explicit diagnostic
+            # instead of pretending a direct user memory was stored.
+            print(f"[core-memory] explicit save failed: {type(error).__name__}: {error}")
+        return
+    explicit_request = bool(EXPLICIT_MEMORY_PATTERN.search(latest_user_text))
+    if not should_refresh_core_memory(user_messages=user_messages, last_count=last_count):
+        return
+    visible_turns = extract_recent_visible_turns(
+        messages,
+        turn_limit=AUTO_MEMORY_MAX_VISIBLE_TURNS,
+    )
+    transcript = serialize_runtime_messages_for_context(visible_turns)[:18_000]
+    if len(transcript) < 600 and not explicit_request:
         return
     session.metadata["memory_extracted_user_count"] = len(user_messages)
     get_session_store().save(session)
-    transcript = serialize_runtime_messages_for_context(messages[-24:])[:24_000]
 
     def refresh() -> None:
         try:
+            scope_rules = (
+                "这是项目核心记忆。只允许记录跨项目阶段仍成立的项目目标、稳定约束、"
+                "固定合作边界或长期决策；kind 主要使用 project。"
+                if project_id
+                else
+                "这是用户全局核心记忆。只允许记录跨多数任务都有帮助的稳定身份、"
+                "长期工作方式、明确反复表达的偏好或长期目标；不得记录某个项目事实。"
+            )
             response = client.chat(
                 [
                     {"role": "system", "content": (
-                        "从聊天中提炼未来跨聊天确实有帮助的信息。只保留稳定偏好、身份背景、"
-                        "持续目标、已确认项目事实；不要保存一次性闲聊、敏感推断、未经确认的时间状态。"
-                        "返回严格 JSON：{\"memories\":[{\"kind\":\"preference|identity|goal|project|fact\",\"content\":\"...\"}],\"profile\":\"简短分主题摘要\"}。"
+                        "你是极其保守的核心记忆筛选器，不是聊天摘要器。"
+                        f"{scope_rules}\n"
+                        "宁可返回空数组，也不要保存细节。以下内容一律不保存：具体工资福利和金额、"
+                        "日期和临时时点、一次性待办或进度、会议内容、文件名或路径、ASR 状态、"
+                        "查询结果、某份材料的结论、助手自己的建议、可从聊天原文检索到的细节。"
+                        "只有用户明确要求长期记住，或同一稳定特征在多轮中反复出现，才可输出。"
+                        "最多 2 条，每条不超过 120 个中文字符。返回严格 JSON："
+                        "{\"memories\":[{\"kind\":\"preference|identity|goal|project\","
+                        "\"content\":\"...\",\"importance\":0.0,\"confidence\":0.0,"
+                        "\"durability\":\"long_term|temporary\","
+                        "\"evidence\":\"explicit|repeated|inferred\"}]}。"
+                        "importance 和 confidence 均须达到 0.90 才可能入库；不得虚高评分。"
                     )},
                     {"role": "user", "content": transcript},
-                ], profile=profile, max_tokens=1_200,
+                ], profile=profile, max_tokens=700,
             )
             parsed = parse_memory_refresh_json(response.content)
             memory_store = CrossChatMemoryStore(get_session_store())
             memory_store.upsert_many(
-                parsed.get("memories", []), conversation_id=conversation_id,
+                list(parsed.get("memories", []))[:2], conversation_id=conversation_id,
                 conversation_title=conversation_title or conversation_id, project_id=project_id,
                 source_excerpt=transcript, state="automatic",
             )
-            profile_text = str(parsed.get("profile") or "")
-            if profile_text:
-                memory_store.set_profile(profile_text, project_id=project_id)
         except Exception:
             # Automatic memory is best-effort and must never break a chat.
             return
@@ -2003,29 +2598,252 @@ def meeting_archive_output_payload(raw_path: str) -> dict[str, Any] | None:
 
 
 def load_conversations_payload() -> dict[str, Any]:
-    path = user_conversation_history_path()
-    if not path.is_file():
-        return {"items": []}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(data, dict) and isinstance(data.get("items"), list):
-        return {"items": hydrate_conversation_archive_projects(data["items"])}
-    if isinstance(data, list):
-        return {"items": hydrate_conversation_archive_projects(data)}
-    return {"items": []}
+    """Read the account archive as one consistent, versioned snapshot."""
+    with CONVERSATION_ARCHIVE_LOCK:
+        items, revision = _read_conversation_archive_snapshot(user_conversation_history_path())
+    return {
+        "items": hydrate_conversation_archive_projects(items),
+        "revision": revision,
+    }
 
 
 def save_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    items = payload.get("items")
-    if not isinstance(items, list):
+    """Persist a conversation archive change without accepting a stale overwrite.
+
+    The browser normally sends ``upserts`` and ``deleted_ids`` with the revision
+    it last read.  The legacy ``items`` form is kept for local maintenance
+    callers, but it is still written atomically.  A revision mismatch is a
+    visible conflict rather than an implicit last-writer-wins replacement.
+    """
+    has_legacy_items = "items" in payload
+    legacy_items = payload.get("items")
+    upserts = payload.get("upserts")
+    deleted_ids = payload.get("deleted_ids")
+    raw_revision = payload.get("base_revision")
+
+    if has_legacy_items and not isinstance(legacy_items, list):
         raise ValueError("items must be a list.")
-    sanitized_items = sanitize_conversation_archive_items(items)
+    if upserts is not None and not isinstance(upserts, list):
+        raise ValueError("upserts must be a list.")
+    if deleted_ids is not None and not isinstance(deleted_ids, list):
+        raise ValueError("deleted_ids must be a list.")
+    if not has_legacy_items and upserts is None and deleted_ids is None:
+        raise ValueError("需要提供 items 或增量归档变更。")
+    if raw_revision is not None and (isinstance(raw_revision, bool) or not isinstance(raw_revision, int) or raw_revision < 0):
+        raise ValueError("base_revision 无效。")
+
     path = user_conversation_history_path()
+    with CONVERSATION_ARCHIVE_LOCK:
+        current_items, current_revision = _read_conversation_archive_snapshot(path)
+        if raw_revision is not None and raw_revision != current_revision:
+            return {
+                "ok": False,
+                "conflict": True,
+                "revision": current_revision,
+                "items": hydrate_conversation_archive_projects(current_items),
+                "count": len(current_items),
+            }
+
+        if has_legacy_items:
+            next_items = sanitize_conversation_archive_items(legacy_items)
+        else:
+            next_items = _apply_conversation_archive_patch(
+                current_items,
+                upserts or [],
+                deleted_ids or [],
+            )
+
+        next_revision = current_revision + 1
+        changed_ids = (
+            {sanitize_conversation_id(item.get("id")) for item in next_items if isinstance(item, dict)}
+            if has_legacy_items
+            else {sanitize_conversation_id(item.get("id")) for item in upserts or [] if isinstance(item, dict)}
+        )
+        current_ids = {
+            sanitize_conversation_id(item.get("id"))
+            for item in current_items
+            if isinstance(item, dict) and sanitize_conversation_id(item.get("id"))
+        }
+        next_ids = {
+            sanitize_conversation_id(item.get("id"))
+            for item in next_items
+            if isinstance(item, dict) and sanitize_conversation_id(item.get("id"))
+        }
+        requested_deleted_ids = {sanitize_conversation_id(raw_id) for raw_id in deleted_ids or []}
+        _write_conversation_archive_snapshot(
+            path,
+            next_items,
+            next_revision,
+            changed_ids=changed_ids,
+            deleted_ids=(current_ids - next_ids) | requested_deleted_ids,
+        )
+
+    return {
+        "ok": True,
+        "conflict": False,
+        "path": str(path.relative_to(WORKSPACE_ROOT)),
+        "count": len(next_items),
+        "revision": next_revision,
+    }
+
+
+def _read_conversation_archive_snapshot(path: Path) -> tuple[list[Any], int]:
+    if not path.is_file():
+        return [], 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"对话归档读取失败：{path.name} 已损坏或无法读取。") from error
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        raw_revision = data.get("revision", 0)
+        revision = raw_revision if isinstance(raw_revision, int) and raw_revision >= 0 else 0
+        if data.get("storage") == "per_item":
+            raw_order = data.get("order")
+            order = raw_order if isinstance(raw_order, list) else [item.get("id") for item in data["items"] if isinstance(item, dict)]
+            items: list[Any] = []
+            for raw_id in order:
+                conversation_id = sanitize_conversation_id(raw_id)
+                if not conversation_id:
+                    continue
+                item_path = _conversation_archive_item_path(path, conversation_id)
+                try:
+                    item = json.loads(item_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    raise ValueError(f"对话归档读取失败：{conversation_id} 条目不可用。") from error
+                if not isinstance(item, dict) or sanitize_conversation_id(item.get("id")) != conversation_id:
+                    raise ValueError(f"对话归档读取失败：{conversation_id} 条目无效。")
+                items.append(item)
+            return sanitize_conversation_archive_items(items), revision
+        return sanitize_conversation_archive_items(data["items"]), revision
+    if isinstance(data, list):
+        # v1 browser archives did not store metadata.  They become revision 0
+        # and are upgraded on the first successful write.
+        return sanitize_conversation_archive_items(data), 0
+    return [], 0
+
+
+def _write_conversation_archive_snapshot(
+    path: Path,
+    items: list[Any],
+    revision: int,
+    *,
+    changed_ids: set[str],
+    deleted_ids: set[str],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"items": sanitized_items, "saved_at": int(time.time())}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    normalized_items: list[dict[str, Any]] = []
+    current_ids: set[str] = set()
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+        item = sanitize_conversation_archive_item(raw_item)
+        conversation_id = sanitize_conversation_id(item.get("id"))
+        if not conversation_id or conversation_id in current_ids:
+            continue
+        item["id"] = conversation_id
+        normalized_items.append(item)
+        current_ids.add(conversation_id)
+
+    item_dir = _conversation_archive_items_dir(path)
+    item_dir.mkdir(parents=True, exist_ok=True)
+    for item in normalized_items:
+        conversation_id = str(item["id"])
+        item_path = _conversation_archive_item_path(path, conversation_id)
+        if conversation_id in changed_ids or not item_path.exists():
+            _write_json_atomically(item_path, item)
+    for conversation_id in deleted_ids - current_ids:
+        _conversation_archive_item_path(path, conversation_id).unlink(missing_ok=True)
+
+    payload = {
+        "schema_version": CONVERSATION_ARCHIVE_SCHEMA_VERSION,
+        "storage": "per_item",
+        "revision": revision,
+        "order": [str(item["id"]) for item in normalized_items],
+        "items": [_conversation_archive_manifest_item(item) for item in normalized_items],
+        "saved_at": int(time.time()),
+    }
+    _write_json_atomically(path, payload)
+
+
+def _conversation_archive_items_dir(path: Path) -> Path:
+    return path.parent / "archive_items"
+
+
+def _conversation_archive_item_path(path: Path, conversation_id: str) -> Path:
+    return _conversation_archive_items_dir(path) / f"{conversation_id}.json"
+
+
+def _conversation_archive_manifest_item(item: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "id",
+        "title",
+        "group",
+        "contextSummary",
+        "contextSummaryMessageCount",
+        "pinned",
+        "projectId",
     )
-    return {"ok": True, "path": str(path.relative_to(WORKSPACE_ROOT)), "count": len(sanitized_items)}
+    return {key: item[key] for key in keys if key in item}
+
+
+def _write_json_atomically(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_path.replace(path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+
+
+def _apply_conversation_archive_patch(
+    current_items: list[Any],
+    raw_upserts: list[Any],
+    raw_deleted_ids: list[Any],
+) -> list[Any]:
+    deleted_ids = {
+        conversation_id
+        for raw_id in raw_deleted_ids
+        if (conversation_id := sanitize_conversation_id(raw_id))
+    }
+    upserts: list[dict[str, Any]] = []
+    for raw_item in raw_upserts:
+        if not isinstance(raw_item, dict):
+            raise ValueError("upserts 中包含无效对话。")
+        item = sanitize_conversation_archive_item(raw_item)
+        conversation_id = sanitize_conversation_id(item.get("id"))
+        if not conversation_id:
+            raise ValueError("归档对话缺少有效 id。")
+        item["id"] = conversation_id
+        upserts.append(item)
+
+    replacement_by_id = {str(item["id"]): item for item in upserts}
+    next_items: list[Any] = []
+    seen: set[str] = set()
+    for current in sanitize_conversation_archive_items(current_items):
+        if not isinstance(current, dict):
+            next_items.append(current)
+            continue
+        conversation_id = sanitize_conversation_id(current.get("id"))
+        if conversation_id and conversation_id in deleted_ids:
+            continue
+        replacement = replacement_by_id.get(conversation_id) if conversation_id else None
+        if replacement is not None:
+            next_items.append(replacement)
+            seen.add(conversation_id)
+        else:
+            next_items.append(current)
+            if conversation_id:
+                seen.add(conversation_id)
+    for item in upserts:
+        conversation_id = str(item["id"])
+        if conversation_id not in seen and conversation_id not in deleted_ids:
+            next_items.insert(0, item)
+    return next_items
 
 
 def move_conversation_to_project_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2034,31 +2852,41 @@ def move_conversation_to_project_payload(payload: dict[str, Any]) -> dict[str, A
     project_id = sanitize_project_id(raw_project_id) if raw_project_id else ""
     project = read_project(project_id) if project_id else None
 
-    archive = load_conversations_payload()
-    items = archive.get("items", [])
-    matched = False
-    for item in items:
-        if not isinstance(item, dict) or item.get("id") != conversation_id:
-            continue
-        matched = True
+    with CONVERSATION_ARCHIVE_LOCK:
+        archive = load_conversations_payload()
+        items = archive.get("items", [])
+        item = next(
+            (
+                candidate
+                for candidate in items
+                if isinstance(candidate, dict) and candidate.get("id") == conversation_id
+            ),
+            None,
+        )
+        if item is None:
+            raise ValueError("未找到要移动的历史对话。")
         if project_id:
             item["projectId"] = project_id
         else:
             item.pop("projectId", None)
-        break
-    if not matched:
-        raise ValueError("未找到要移动的历史对话。")
 
-    file_sync = (
-        sync_conversation_files_to_project(item, project)
-        if project
-        else {"files": [], "copied_count": 0, "unchanged_count": 0}
-    )
-    session_store = get_session_store()
-    session = session_store.load(conversation_id)
-    session.metadata["project_id"] = project_id
-    session_store.save(session)
-    save_conversations_payload({"items": items})
+        file_sync = (
+            sync_conversation_files_to_project(item, project)
+            if project
+            else {"files": [], "copied_count": 0, "unchanged_count": 0}
+        )
+        session_store = get_session_store()
+        session = session_store.load(conversation_id)
+        session.metadata["project_id"] = project_id
+        session_store.save(session)
+        save_result = save_conversations_payload(
+            {
+                "base_revision": archive.get("revision", 0),
+                "upserts": [item],
+            }
+        )
+        if not save_result.get("ok"):
+            raise RuntimeError("移动聊天时归档版本发生变化，请重新操作。")
     return {
         "ok": True,
         "conversation_id": conversation_id,
@@ -2349,9 +3177,225 @@ def project_files(project_id: str) -> list[dict[str, Any]]:
     return items
 
 
-def project_payload(data: dict[str, Any], *, include_files: bool = True) -> dict[str, Any]:
+PROJECT_MATERIAL_CATEGORIES = (
+    ("decision", "决策与汇报"),
+    ("deliverable", "核心成果"),
+    ("plan", "方案与计划"),
+    ("meeting", "会议纪要"),
+    ("reference", "基础资料"),
+    ("other", "其他材料"),
+)
+PROJECT_MATERIAL_CATEGORY_LABELS = dict(PROJECT_MATERIAL_CATEGORIES)
+PROJECT_MATERIAL_FINAL_MARKERS = (
+    "最终版", "定稿", "正式版", "审议版", "工作提交版", "完善版", "签署版", "盖章版",
+)
+PROJECT_MATERIAL_DRAFT_MARKERS = (
+    "初稿", "草稿", "中间稿", "过程稿", "沟通稿", "讨论稿", "待修改", "待确认", "提纲",
+)
+PROJECT_MATERIAL_RAW_MARKERS = (
+    "转写", "录音", "office_extract", "extract", "临时", "缓存", "识别结果",
+)
+PROJECT_MATERIAL_EXTENSION_RANK = {
+    ".pdf": 6,
+    ".docx": 5,
+    ".xlsx": 5,
+    ".pptx": 5,
+    ".md": 3,
+    ".txt": 2,
+}
+
+
+def classify_project_material(file: dict[str, Any]) -> str:
+    name = str(file.get("name") or "")
+    path = str(file.get("path") or "")
+    text = f"{name} {path}".lower()
+    if any(marker in text for marker in ("上会", "汇报", "请示", "决策", "审议")):
+        return "decision"
+    if any(marker in text for marker in ("会议纪要", "座谈", "会议沟通", "工作提交版", "内部留档版")):
+        return "meeting"
+    if any(marker in text for marker in ("可研", "研究报告", "成果报告", "总结报告", "测算报告")):
+        return "deliverable"
+    if any(
+        marker in text
+        for marker in (
+            "方案", "计划", "推进", "进度", "排期", "时间节点", "装修", "课程", "运营",
+            "预算", "测算", "清单", "协议", "合同",
+        )
+    ):
+        return "plan"
+    if any(
+        marker in text
+        for marker in (
+            "政策", "大纲", "参考", "企业资料", "公司介绍", "营业执照", "工商",
+            "附件", "原始资料", "基础资料",
+        )
+    ):
+        return "reference"
+    return "other"
+
+
+def project_material_status(file: dict[str, Any]) -> tuple[str, str, int]:
+    text = f"{file.get('name') or ''} {file.get('path') or ''}".lower()
+    if any(marker.lower() in text for marker in PROJECT_MATERIAL_RAW_MARKERS):
+        return "process", "过程材料", 0
+    if any(marker.lower() in text for marker in PROJECT_MATERIAL_FINAL_MARKERS):
+        return "final", "定稿", 4
+    if any(marker.lower() in text for marker in PROJECT_MATERIAL_DRAFT_MARKERS):
+        return "draft", "编制中", 1
+    return "current", "当前版", 3
+
+
+def project_material_logical_name(file: dict[str, Any]) -> str:
+    stem = Path(str(file.get("name") or "材料")).stem
+    normalized = stem.lower()
+    normalized = re.sub(r"^(?:[0-9]{4,8}[-_ .]*)+", "", normalized)
+    normalized = re.sub(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}[-_ .]*", "", normalized)
+    normalized = re.sub(r"[-_ ]+[0-9a-f]{8}$", "", normalized)
+    normalized = re.sub(
+        r"(最终版|定稿|正式版|审议版|工作提交版|完善版|签署版|盖章版|"
+        r"内部留档版|初稿|草稿|中间稿|过程稿|沟通稿|讨论稿|待修改|待确认|提纲|"
+        r"精简沟通版|精简版|修订版|v\d+(?:\.\d+)*)",
+        "",
+        normalized,
+    )
+    normalized = re.sub(r"[\s_（）()\[\]【】\-—.]+", "", normalized)
+    normalized = re.sub(
+        r"(座谈沟通(?:会议沟通内容整理|会议纪要)|会议沟通内容整理|会议纪要)",
+        "会议纪要",
+        normalized,
+    )
+    return normalized or _normalize_material_display_name(stem).lower()
+
+
+def _normalize_material_display_name(stem: str) -> str:
+    name = re.sub(r"^(?:[0-9]{4,8}[-_ .]*)+", "", str(stem or "")).strip()
+    name = re.sub(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}[-_ .]*", "", name, flags=re.I)
+    return name or str(stem or "未命名材料")
+
+
+def project_material_groups_from_files(files: list[dict[str, Any]]) -> dict[str, Any]:
+    families: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for file in files:
+        category = classify_project_material(file)
+        status, status_label, status_rank = project_material_status(file)
+        item = {
+            **file,
+            "category": category,
+            "category_label": PROJECT_MATERIAL_CATEGORY_LABELS[category],
+            "document_status": status,
+            "document_status_label": status_label,
+            "display_name": _normalize_material_display_name(Path(str(file["name"])).stem),
+            "_status_rank": status_rank,
+        }
+        family_key = (category, project_material_logical_name(file))
+        families.setdefault(family_key, []).append(item)
+
+    visible_by_category: dict[str, list[dict[str, Any]]] = {
+        category: [] for category, _label in PROJECT_MATERIAL_CATEGORIES
+    }
+    omitted_files: list[dict[str, Any]] = []
+    for (category, _logical_name), family in families.items():
+        family.sort(
+            key=lambda item: (
+                int(item["_status_rank"]),
+                PROJECT_MATERIAL_EXTENSION_RANK.get(str(item.get("extension") or ""), 1),
+                int(item.get("modified") or 0),
+            ),
+            reverse=True,
+        )
+        unique_family: list[dict[str, Any]] = []
+        seen_versions: set[str] = set()
+        for item in family:
+            version_key = project_material_content_key(item)
+            if version_key in seen_versions:
+                omitted_files.append(item)
+                continue
+            seen_versions.add(version_key)
+            unique_family.append(item)
+        family = unique_family
+        representative = family[0]
+        history = family[1:]
+        if representative["document_status"] == "process":
+            omitted_files.extend(family)
+            continue
+        representative = {
+            key: value
+            for key, value in representative.items()
+            if not key.startswith("_")
+        }
+        representative["history"] = [
+            {key: value for key, value in item.items() if not key.startswith("_")}
+            for item in history
+        ]
+        representative["version_count"] = len(family)
+        visible_by_category[category].append(representative)
+
+    groups: list[dict[str, Any]] = []
+    for category, label in PROJECT_MATERIAL_CATEGORIES:
+        materials = visible_by_category[category]
+        materials.sort(
+            key=lambda item: (
+                item["document_status"] == "final",
+                int(item.get("modified") or 0),
+                str(item.get("display_name") or ""),
+            ),
+            reverse=True,
+        )
+        if materials:
+            groups.append(
+                {
+                    "id": category,
+                    "label": label,
+                    "materials": materials,
+                    "count": len(materials),
+                }
+            )
+    hidden_count = len(omitted_files) + sum(
+        len(material.get("history") or [])
+        for group in groups
+        for material in group["materials"]
+    )
+    return {
+        "groups": groups,
+        "material_count": sum(group["count"] for group in groups),
+        "hidden_file_count": hidden_count,
+    }
+
+
+def project_material_content_key(file: dict[str, Any]) -> str:
+    raw_path = str(file.get("path") or "")
+    try:
+        path = WorkspaceFiles(account_workspace_root()).resolve(raw_path)
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except (OSError, RuntimeError, ValueError):
+        return f"{file.get('name') or ''}:{file.get('size') or 0}"
+
+
+def project_payload(
+    data: dict[str, Any],
+    *,
+    include_files: bool = True,
+    include_timeline: bool = True,
+) -> dict[str, Any]:
     project_id = sanitize_project_id(data.get("id"))
     files = project_files(project_id) if include_files else []
+    material_catalog = (
+        project_material_groups_from_files(files)
+        if include_files
+        else {"groups": None, "material_count": int(data.get("material_count") or 0), "hidden_file_count": 0}
+    )
+    timeline = None
+    if include_timeline:
+        from .project_timeline import project_timeline_payload
+
+        timeline = project_timeline_payload(project_dir(project_id))
+        raw_timeline_path = timeline.get("path")
+        if raw_timeline_path:
+            timeline["path"] = account_relative_path(Path(str(raw_timeline_path)))
     return {
         "id": project_id,
         "name": str(data.get("name") or "未命名项目"),
@@ -2362,6 +3406,10 @@ def project_payload(data: dict[str, Any], *, include_files: bool = True) -> dict
         "root": account_relative_path(project_dir(project_id)),
         "file_count": len(files) if include_files else int(data.get("file_count") or 0),
         "files": files if include_files else None,
+        "material_count": material_catalog["material_count"],
+        "hidden_file_count": material_catalog["hidden_file_count"],
+        "material_groups": material_catalog["groups"],
+        "timeline": timeline,
     }
 
 
@@ -2372,7 +3420,7 @@ def list_projects_payload() -> dict[str, Any]:
             data = json.loads(manifest.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 continue
-            payload = project_payload(data, include_files=True)
+            payload = project_payload(data, include_files=True, include_timeline=False)
             payload.pop("files", None)
             projects.append(payload)
         except Exception as error:
@@ -2428,6 +3476,51 @@ def update_project_payload(project_id: str, payload: dict[str, Any]) -> dict[str
     data["updated_at"] = int(time.time())
     write_project(data)
     return {"project": project_payload(data, include_files=True)}
+
+
+def create_project_timeline_payload(project_id: str) -> dict[str, Any]:
+    from .project_timeline import create_project_timeline
+
+    project = read_project(project_id)
+    create_project_timeline(
+        project_dir(project_id),
+        project_name=str(project.get("name") or "项目"),
+    )
+    project = read_project(project_id)
+    return {"ok": True, "project": project_payload(project, include_files=True)}
+
+
+def select_project_timeline_payload(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from .project_timeline import select_project_timeline
+
+    project = read_project(project_id)
+    raw_path = required_string(payload, "path")
+    selected = WorkspaceFiles(account_workspace_root()).resolve(raw_path)
+    select_project_timeline(project_dir(project_id), selected)
+    project = read_project(project_id)
+    return {"ok": True, "project": project_payload(project, include_files=True)}
+
+
+def update_project_timeline_payload(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from .project_timeline import apply_project_timeline_changes
+
+    project = read_project(project_id)
+    changes = payload.get("changes")
+    if not isinstance(changes, list) or not changes:
+        raise ValueError("请提供至少一项时间节点变更。")
+    if len(changes) > 100:
+        raise ValueError("单次最多修改 100 个时间节点。")
+    result = apply_project_timeline_changes(
+        project_dir(project_id),
+        changes=changes,
+        change_source=str(payload.get("change_source") or "项目页面"),
+    )
+    project = read_project(project_id)
+    response = project_payload(project, include_files=True)
+    history_path = result.get("history_path")
+    if history_path:
+        result["history_path"] = account_relative_path(Path(str(history_path)))
+    return {"ok": True, "result": result, "project": response}
 
 
 def decode_uploaded_file(payload: dict[str, Any]) -> tuple[str, str, bytes]:
@@ -3578,6 +4671,7 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         client,
         profile,
         data_workspace=account_workspace_root(),
+        report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
         enabled_skill_ids=enabled_skill_ids(),
     )
@@ -3667,6 +4761,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
     max_steps = max(1, min(max_steps, 60))
     reasoning_effort = normalize_reasoning_effort(payload.get("reasoning_effort"))
+    auto_approve = payload.get("auto_approve") is True
     debug_trace = DebugTrace(
         WORKSPACE_ROOT,
         conversation_id=conversation_id,
@@ -3704,8 +4799,69 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             payload.get("conversation_summary_message_count")
         )
     session.metadata["project_id"] = project_id
+    if is_compact_command(messages[-1]["content"]):
+        try:
+            prepared_context = prepare_session_memory(
+                client,
+                profile,
+                session,
+                reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+                force=True,
+            )
+        except ContextCompactionError as error:
+            debug_trace.emit("explicit_compaction_failed", error=str(error))
+            content = f"压缩失败：{error}"
+            return {
+                "message": {"role": "assistant", "content": content},
+                "steps_used": 0,
+                "model_profile": profile.name,
+                "used_tools": False,
+                "selected_skill": None,
+                "conversation_id": conversation_id,
+                **debug_trace.context_payload(),
+                "context_summary": session.summary,
+                "context_summary_message_count": session.summary_message_count,
+                "context_compacted": False,
+            }
+        store.save(session)
+        content = compact_command_result(prepared_context)
+        return {
+            "message": {"role": "assistant", "content": content},
+            "steps_used": 0,
+            "model_profile": profile.name,
+            "used_tools": False,
+            "selected_skill": None,
+            "conversation_id": conversation_id,
+            **debug_trace.context_payload(),
+            "context_summary": session.summary,
+            "context_summary_message_count": session.summary_message_count,
+            "context_compacted": prepared_context.compacted,
+            "context_estimated_tokens": prepared_context.estimated_tokens,
+        }
     store.append_user_message(session, messages[-1]["content"])
-    prepared_context = prepare_session_memory(client, profile, session)
+    try:
+        prepared_context = prepare_session_memory(
+            client,
+            profile,
+            session,
+            reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+        )
+    except ContextCompactionError as error:
+        store.save(session)
+        debug_trace.emit("automatic_compaction_failed", error=str(error))
+        content = f"当前请求未执行：{error}"
+        return {
+            "message": {"role": "assistant", "content": content},
+            "steps_used": 0,
+            "model_profile": profile.name,
+            "used_tools": False,
+            "selected_skill": None,
+            "conversation_id": conversation_id,
+            **debug_trace.context_payload(),
+            "context_summary": session.summary,
+            "context_summary_message_count": session.summary_message_count,
+            "context_compacted": False,
+        }
     store.save(session)
     debug_trace.emit(
         "session_prepared",
@@ -3723,24 +4879,48 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         client,
         profile,
         data_workspace=account_workspace_root(),
+        report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
         session_store=store,
         conversation_id=conversation_id,
         project_id=project_id,
         enabled_skill_ids=enabled_skill_ids(),
+        friday_notification_handler=(
+            friday_notification_handler
+            if assistant_runtime_mode(conversation_id) == "friday"
+            else None
+        ),
     )
+
+    def persist_task_plan(plan: list[dict[str, str]], explanation: str) -> None:
+        plan_state = {
+            "steps": plan,
+            "explanation": explanation,
+            "updated_at": int(time.time()),
+        }
+        session.metadata["active_task_plan"] = plan_state
+        store.save(session)
+        debug_trace.emit("task_plan_updated", plan=plan, explanation=explanation)
+
     agent = ReActAgent(
         client=client,
         profile=profile,
         tools=tools,
         max_steps=max_steps,
         debug_trace=debug_trace,
-        extra_system_context=agent_system_context()
-        + memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
+        auto_approve=auto_approve,
+        plan_update_callback=persist_task_plan,
+        initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
+        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id))
+        + (
+            memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
+            if assistant_runtime_mode(conversation_id) == "friday"
+            else ""
+        )
         + project_context
         + render_history_recall_system_context(session.summary_message_count, project_id=project_id)
         + build_chat_session_system_context(
-            session.messages,
+            prepared_context.messages,
             skill_hint=skill_hint,
             context_file_paths=context_file_paths,
         ),
@@ -3761,11 +4941,13 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
         if session.messages and session.messages[-1].get("role") == "assistant":
             session.messages[-1]["content"] = final_content
+    clear_completed_task_plan(session)
     store.save(session)
-    schedule_memory_refresh(
-        client=client, profile=profile, session=session, conversation_id=conversation_id,
-        conversation_title=str(session.metadata.get("title") or ""), project_id=project_id,
-    )
+    if assistant_runtime_mode(conversation_id) == "friday":
+        schedule_memory_refresh(
+            client=client, profile=profile, session=session, conversation_id=conversation_id,
+            conversation_title=str(session.metadata.get("title") or ""), project_id=project_id,
+        )
     debug_trace.emit(
         "http_chat_final",
         steps_used=result.steps_used,
@@ -3827,6 +5009,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
     max_steps = max(1, min(max_steps, 60))
     reasoning_effort = normalize_reasoning_effort(payload.get("reasoning_effort"))
+    auto_approve = payload.get("auto_approve") is True
     debug_trace = DebugTrace(
         WORKSPACE_ROOT,
         conversation_id=conversation_id,
@@ -3859,6 +5042,10 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         yield from approve_turn_events(resume_turn_id, redirected_payload)
         return
 
+    interrupted_turns = get_turn_store().fail_interrupted_running_for_conversation(conversation_id)
+    if interrupted_turns:
+        debug_trace.emit("interrupted_running_turns_reconciled", count=interrupted_turns)
+
     turn_runtime = TurnRuntime.start(
         get_turn_store(),
         conversation_id=conversation_id,
@@ -3872,6 +5059,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             "project_id": project_id,
             "max_steps": max_steps,
             "reasoning_effort": reasoning_effort,
+            "auto_approve": auto_approve,
         },
     )
     debug_trace.emit("turn_started", turn_id=turn_runtime.turn_id)
@@ -3906,8 +5094,89 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             payload.get("conversation_summary_message_count")
         )
     session.metadata["project_id"] = project_id
+    if is_compact_command(messages[-1]["content"]):
+        try:
+            prepared_context = prepare_session_memory(
+                client,
+                profile,
+                session,
+                reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+                force=True,
+            )
+        except ContextCompactionError as error:
+            content = f"压缩失败：{error}"
+            debug_trace.emit("explicit_stream_compaction_failed", error=str(error))
+            yield turn_runtime.emit(
+                {
+                    "event": "activity",
+                    "phase": "error",
+                    "title": "压缩当前任务失败",
+                    "detail": content,
+                    "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+                }
+            )
+            yield turn_runtime.emit(
+                {
+                    "event": "final",
+                    "content": content,
+                    "steps_used": 0,
+                    "used_tools": False,
+                    "model_profile": profile.name,
+                    "selected_skill": None,
+                    "context_summary": session.summary,
+                    "context_summary_message_count": session.summary_message_count,
+                    "context_compacted": False,
+                    **debug_trace.context_payload(),
+                }
+            )
+            return
+        store.save(session)
+        content = compact_command_result(prepared_context)
+        yield turn_runtime.emit(
+            {
+                "event": "activity",
+                "phase": "thinking",
+                "title": "压缩当前任务",
+                "detail": content,
+                "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+            }
+        )
+        yield turn_runtime.emit(
+            {
+                "event": "final",
+                "content": content,
+                "steps_used": 0,
+                "used_tools": False,
+                "model_profile": profile.name,
+                "selected_skill": None,
+                "context_summary": session.summary,
+                "context_summary_message_count": session.summary_message_count,
+                "context_compacted": prepared_context.compacted,
+                "context_estimated_tokens": prepared_context.estimated_tokens,
+                **debug_trace.context_payload(),
+            }
+        )
+        return
     store.append_user_message(session, messages[-1]["content"])
-    prepared_context = prepare_session_memory(client, profile, session)
+    try:
+        prepared_context = prepare_session_memory(
+            client,
+            profile,
+            session,
+            reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+        )
+    except ContextCompactionError as error:
+        store.save(session)
+        debug_trace.emit("automatic_stream_compaction_failed", error=str(error))
+        yield turn_runtime.emit(
+            {
+                "event": "error",
+                "message": str(error),
+                "type": type(error).__name__,
+                "detail": "当前请求没有继续调用模型；原始会话和已完成工具结果均保持原样。",
+            }
+        )
+        return
     store.save(session)
     debug_trace.emit(
         "session_prepared",
@@ -3948,12 +5217,31 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         client,
         profile,
         data_workspace=account_workspace_root(),
+        report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
         session_store=store,
         conversation_id=conversation_id,
         project_id=project_id,
         enabled_skill_ids=enabled_skill_ids(),
+        friday_notification_handler=(
+            friday_notification_handler
+            if assistant_runtime_mode(conversation_id) == "friday"
+            else None
+        ),
     )
+
+    def persist_stream_task_plan(plan: list[dict[str, str]], explanation: str) -> None:
+        plan_state = {
+            "steps": plan,
+            "explanation": explanation,
+            "updated_at": int(time.time()),
+            "turn_id": turn_runtime.turn_id,
+        }
+        session.metadata["active_task_plan"] = plan_state
+        store.save(session)
+        get_turn_store().update_metadata(turn_runtime.turn_id, {"task_plan": plan_state})
+        debug_trace.emit("task_plan_updated", plan=plan, explanation=explanation)
+
     agent = ReActAgent(
         client=client,
         profile=profile,
@@ -3962,12 +5250,19 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         debug_trace=debug_trace,
         cancel_check=turn_runtime.cancelled,
         reasoning_effort=reasoning_effort,
-        extra_system_context=agent_system_context()
-        + memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
+        auto_approve=auto_approve,
+        plan_update_callback=persist_stream_task_plan,
+        initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
+        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id))
+        + (
+            memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
+            if assistant_runtime_mode(conversation_id) == "friday"
+            else ""
+        )
         + project_context
         + render_history_recall_system_context(session.summary_message_count, project_id=project_id)
         + build_chat_session_system_context(
-            session.messages,
+            prepared_context.messages,
             skill_hint=skill_hint,
             context_file_paths=context_file_paths,
         ),
@@ -4003,6 +5298,8 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                     last_runtime_message = runtime_messages[-1] if runtime_messages else None
                     if isinstance(last_runtime_message, dict) and last_runtime_message.get("role") == "assistant":
                         last_runtime_message["content"] = event["content"]
+                if not event.get("waiting_approval"):
+                    clear_completed_task_plan(session)
                 session.messages.extend(
                     message
                     for message in runtime_messages[runtime_message_count_before_run:]
@@ -4011,10 +5308,11 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 session.summary = prepared_context.summary
                 session.summary_message_count = prepared_context.summary_message_count
                 store.save(session)
-                schedule_memory_refresh(
-                    client=client, profile=profile, session=session, conversation_id=conversation_id,
-                    conversation_title=str(session.metadata.get("title") or ""), project_id=project_id,
-                )
+                if assistant_runtime_mode(conversation_id) == "friday":
+                    schedule_memory_refresh(
+                        client=client, profile=profile, session=session, conversation_id=conversation_id,
+                        conversation_title=str(session.metadata.get("title") or ""), project_id=project_id,
+                    )
                 session_saved_after_run = True
                 debug_trace.emit(
                     "http_chat_stream_final",
@@ -4106,7 +5404,10 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
     )
     runtime_message_count_before_run = len(runtime_messages)
     system_context = str(pending_approval.get("system_context") or "")
-    extra_system_context = str(pending_approval.get("extra_system_context") or agent_system_context())
+    extra_system_context = str(
+        pending_approval.get("extra_system_context")
+        or agent_system_context(mode=assistant_runtime_mode(conversation_id))
+    )
     skill_hint = pending_approval.get("selected_skill")
     skill_hint = str(skill_hint) if skill_hint else None
 
@@ -4117,6 +5418,7 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         client,
         profile,
         data_workspace=account_workspace_root(),
+        report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
         session_store=session_store,
         conversation_id=conversation_id,
@@ -4132,6 +5434,7 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         cancel_check=turn_runtime.cancelled,
         extra_system_context=extra_system_context,
         reasoning_effort=normalize_reasoning_effort(pending_approval.get("reasoning_effort")),
+        auto_approve=pending_approval.get("auto_approve") is True,
     )
 
     session_saved_after_run = False
@@ -4476,9 +5779,28 @@ def resolve_project_chat_context(
     project_id = sanitize_project_id(raw_project_id)
     project = read_project(project_id)
     files = project_files(project_id)
+    material_catalog = project_material_groups_from_files(files)
+    from .project_timeline import project_timeline_payload
+
+    timeline = project_timeline_payload(project_dir(project_id))
+    timeline_path = (
+        account_relative_path(Path(str(timeline["path"])))
+        if timeline.get("path")
+        else ""
+    )
+    current_materials = [
+        material
+        for group in material_catalog["groups"]
+        for material in group["materials"]
+    ]
     merged_paths: list[str] = []
     seen: set[str] = set()
-    for path in [*(str(item.get("path") or "") for item in files), *context_file_paths]:
+    for path in [
+        timeline_path,
+        *(str(item.get("path") or "") for item in current_materials),
+        *(str(item.get("path") or "") for item in files),
+        *context_file_paths,
+    ]:
         normalized = normalize_workspace_reference_path(path)
         if not normalized or normalized in seen:
             continue
@@ -4486,8 +5808,34 @@ def resolve_project_chat_context(
         merged_paths.append(normalized)
 
     root = account_relative_path(project_dir(project_id))
-    file_lines = [f"- {item['path']}" for item in files[:120]]
-    file_block = "\n".join(file_lines) if file_lines else "- 当前项目还没有资料文件"
+    material_lines: list[str] = []
+    for group in material_catalog["groups"]:
+        material_lines.append(f"- {group['label']}：")
+        material_lines.extend(
+            f"  - [{item['document_status_label']}] {item['path']}"
+            for item in group["materials"]
+        )
+    file_block = "\n".join(material_lines) if material_lines else "- 当前项目还没有有效材料"
+    timeline_lines: list[str] = []
+    for item in timeline.get("nodes") or []:
+        date_label = str(item.get("planned_date") or "待排期")
+        status_label = str(item.get("status") or "未开始")
+        title = str(item.get("title") or item.get("completion_criteria") or "未命名节点")
+        next_action = str(item.get("next_action") or "").strip()
+        line = f"- {item.get('node_id') or item.get('row')}｜{date_label}｜{status_label}｜{title}"
+        if next_action:
+            line += f"｜下一步：{next_action}"
+        timeline_lines.append(line)
+    timeline_block = "\n".join(timeline_lines[:80]) if timeline_lines else "- 当前项目尚无时间节点"
+    timeline_instruction = (
+        f"时间线 Excel：{timeline_path}\n"
+        "该 Excel 是时间节点唯一事实源。涉及节点、日期、状态、进展、下一步或责任方时，"
+        "先依据下列节点；需要写入时调用 sys_skill 打开 xlsx 技能，再使用 "
+        f"manage_project_timeline(project_id={project_id}) 执行批量变更。"
+        "不得仅在回答中声称已更新。\n"
+        if timeline_path
+        else "时间线 Excel：尚未创建。需要时提醒用户在项目页创建时间线。\n"
+    )
     instructions = str(project.get("instructions") or "").strip()
     instructions_block = instructions or "未设置额外项目指令。"
     context = (
@@ -4497,10 +5845,14 @@ def resolve_project_chat_context(
         "项目记忆范围：仅项目。不要主动引用其他项目的文件或对话。\n"
         "项目指令：\n"
         f"{instructions_block}\n\n"
-        "项目资料清单：\n"
+        "项目当前有效材料（已按用途归类并省略中间版本）：\n"
         f"{file_block}\n"
+        "\n项目关键节点：\n"
+        f"{timeline_instruction}"
+        f"{timeline_block}\n"
         "当用户的任务需要事实、数据、模板或既有材料时，先使用本地文件工具读取相关项目资料；"
-        "不需要用户重复上传。资料很多时先列出或搜索项目目录，再读取最相关文件。"
+        "不需要用户重复上传。需要追溯原稿或历史版本时，再列出项目资料目录；"
+        "不要默认把过程稿当作当前有效版本。"
     )
     return merged_paths, context, project_id
 
@@ -5369,15 +6721,22 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    global WORKSPACE_ROOT, CONFIG_PATH, STATIC_DIR, AUTH_STORE
+    global WORKSPACE_ROOT, CONFIG_PATH, STATIC_DIR, AUTH_STORE, WEIXIN_GATEWAY
     args = parse_args()
     WORKSPACE_ROOT = Path(args.workspace).resolve()
     CONFIG_PATH = Path(args.config)
     STATIC_DIR = Path(args.static_dir)
     AUTH_STORE = None
-    get_auth_store()
+    WEIXIN_GATEWAY = None
+    auth_store = get_auth_store()
     atexit.register(stop_asr_worker)
     atexit.register(lambda: VAD_WORKER.stop() if VAD_WORKER else None)
+    gateway = get_weixin_gateway()
+    for user in auth_store.list_users():
+        gateway.ensure_worker(user.id, user_weixin_state_dir(user))
+    atexit.register(gateway.stop_all)
+    start_friday_scheduler()
+    atexit.register(stop_friday_scheduler)
     server = ThreadingHTTPServer((args.host, args.port), WorkAgentHandler)
     print(f"Work Agent web server running at http://{args.host}:{args.port}")
     print(f"Workspace: {WORKSPACE_ROOT}")

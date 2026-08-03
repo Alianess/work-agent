@@ -71,19 +71,21 @@ class AuthStoreTests(unittest.TestCase):
             web_server.save_conversations_payload({"items": [{"id": "first-chat", "messages": []}]})
             web_server.save_agent_settings_payload(
                 {
+                    "assistant_name": "周五",
                     "work_background": "first background",
                     "company_document_format": "标题：二号小标宋",
                 }
             )
             from work_agent_core.cross_chat_memory import CrossChatMemoryStore
             CrossChatMemoryStore(web_server.get_session_store()).upsert_many(
-                [{"kind": "fact", "content": "仅属于第一个账户的自动记忆。"}],
-                conversation_id="first-memory-chat", conversation_title="first", source_excerpt="证据",
+                [{"kind": "identity", "content": "仅属于第一个账户的核心记忆。"}],
+                conversation_id="first-memory-chat", conversation_title="first",
+                source_excerpt="证据", state="explicit",
             )
             self.assertEqual(web_server.cross_chat_memories_payload()["count"], 1)
 
             web_server.REQUEST_AUTH.user = second
-            self.assertEqual(web_server.load_conversations_payload(), {"items": []})
+            self.assertEqual(web_server.load_conversations_payload(), {"items": [], "revision": 0})
             self.assertEqual(web_server.cross_chat_memories_payload()["count"], 0)
             self.assertNotEqual(
                 web_server.load_agent_settings()["work_background"],
@@ -99,13 +101,19 @@ class AuthStoreTests(unittest.TestCase):
             first_items = web_server.load_conversations_payload()["items"]
             self.assertEqual([item["id"] for item in first_items], ["first-chat"])
             self.assertEqual(web_server.load_agent_settings()["work_background"], "first background")
+            self.assertEqual(web_server.load_agent_settings()["assistant_name"], "周五")
             self.assertEqual(
                 web_server.load_agent_settings()["company_document_format"],
                 "标题：二号小标宋",
             )
-            context = web_server.agent_system_context()
+            context = web_server.agent_system_context(mode="friday")
+            self.assertIn("项目经理助理“周五”", context)
             self.assertIn("公司标准文件格式（纯文字设置）", context)
             self.assertIn("official-document", context)
+            task_context = web_server.agent_system_context(mode="task")
+            self.assertNotIn("周五", task_context)
+            self.assertNotIn("微信", task_context)
+            self.assertIn("普通任务聊天", task_context)
         finally:
             web_server.WORKSPACE_ROOT = original_root
             web_server.AUTH_STORE = original_store
@@ -117,6 +125,36 @@ class AuthStoreTests(unittest.TestCase):
                     pass
             else:
                 web_server.REQUEST_AUTH.user = original_user
+
+    def test_core_memory_refresh_is_deliberately_infrequent(self) -> None:
+        ordinary = [
+            {"role": "user", "content": f"继续处理第 {index} 个普通问题"}
+            for index in range(12)
+        ]
+        self.assertFalse(
+            web_server.should_refresh_core_memory(
+                user_messages=ordinary[:11],
+                last_count=0,
+            )
+        )
+        self.assertTrue(
+            web_server.should_refresh_core_memory(
+                user_messages=ordinary,
+                last_count=0,
+            )
+        )
+        self.assertFalse(
+            web_server.should_refresh_core_memory(
+                user_messages=ordinary + [{"role": "user", "content": "补充一个普通问题"}],
+                last_count=12,
+            )
+        )
+        self.assertTrue(
+            web_server.should_refresh_core_memory(
+                user_messages=[{"role": "user", "content": "请记住我一直偏好先给结论。"}],
+                last_count=0,
+            )
+        )
 
 
 if __name__ == "__main__":

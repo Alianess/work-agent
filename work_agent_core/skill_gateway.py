@@ -17,11 +17,23 @@ SKILL_TOOL_ALIASES: dict[str, set[str]] = {
     "docx": {"process_office_document", "create_docx_from_markdown"},
     "pdf": {"process_office_document", "create_pdf_from_markdown"},
     "pptx": {"process_office_document", "create_pptx_from_outline"},
-    "xlsx": {"process_office_document", "create_xlsx_from_markdown"},
+    "xlsx": {
+        "process_office_document",
+        "create_xlsx_from_markdown",
+        "manage_timeline_xlsx",
+        "manage_project_timeline",
+    },
     "skill-creator": {
         "validate_work_agent_skill",
         "scaffold_work_agent_skill",
         "inspect_skill_health",
+    },
+    "work-reports": {
+        "collect_work_report_evidence",
+        "save_work_report",
+        "read_saved_work_report",
+        "check_work_report_status",
+        "update_workday_calendar",
     },
     "edge-browser": {
         "browser_click", "browser_close", "browser_fill_form", "browser_find",

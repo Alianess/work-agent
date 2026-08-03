@@ -1,0 +1,15 @@
+{
+  "id": "work-reports",
+  "label": "日报周报双周报",
+  "mention": "@工作汇报",
+  "description": "基于本地时间戳、聊天成果、项目记录和产物生成日报、周报、双周报，并识别缺失工作日。",
+  "when_to_use": "用户要求日报、每日简报、周报、双周报、阶段工作总结，或需要补齐遗漏工作日记录时使用。",
+  "tool_name": "collect_work_report_evidence",
+  "outputs": [
+    "每日工作证据账",
+    "日报 Markdown",
+    "周报 Markdown",
+    "双周报 Markdown",
+    "缺失工作日提醒"
+  ]
+}

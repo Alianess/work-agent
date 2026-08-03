@@ -10,6 +10,7 @@ from __future__ import annotations
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from difflib import SequenceMatcher
 import json
 import re
 import sqlite3
@@ -19,11 +20,28 @@ import uuid
 from .session_store import SessionStore
 
 
-MEMORY_SCHEMA_VERSION = 2
-MAX_MEMORY_CONTENT_CHARS = 1_200
-MAX_PROFILE_CHARS = 8_000
+MEMORY_SCHEMA_VERSION = 3
+MAX_MEMORY_CONTENT_CHARS = 280
+MAX_PROFILE_CHARS = 1_200
+MAX_ACCOUNT_CORE_MEMORIES = 32
+MAX_PROJECT_CORE_MEMORIES = 24
+MAX_ACCOUNT_AUTOMATIC_MEMORIES = 12
+MAX_PROJECT_AUTOMATIC_MEMORIES = 10
+AUTOMATIC_MEMORY_MIN_IMPORTANCE = 0.90
+AUTOMATIC_MEMORY_MIN_CONFIDENCE = 0.90
 MEMORY_KINDS = {"preference", "identity", "goal", "project", "fact"}
 MEMORY_STATES = {"automatic", "explicit", "corrected", "deleted"}
+ACCOUNT_AUTOMATIC_KINDS = {"preference", "identity", "goal"}
+PROJECT_AUTOMATIC_KINDS = {"preference", "goal", "project"}
+TRANSIENT_MEMORY_MARKERS = {
+    "当前", "正在", "已完成", "下一步", "本轮", "本次", "这次", "今天", "明天",
+    "本周", "初稿", "转写", "文件路径", "归档目录", "输出目录", "已经生成",
+}
+FILE_DETAIL_PATTERN = re.compile(
+    r"(?:meet_files|work_agent_core|web_frontend|/Users/|\\\\Users\\\\|"
+    r"\.(?:docx|xlsx|pptx|pdf|md|txt|json|m4a|wav)\b)",
+    flags=re.IGNORECASE,
+)
 
 
 class CrossChatMemoryStore:
@@ -61,7 +79,9 @@ class CrossChatMemoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 f"""SELECT * FROM memory_items {where}
-                ORDER BY updated_at DESC, created_at DESC LIMIT ?""",
+                ORDER BY
+                    CASE state WHEN 'corrected' THEN 3 WHEN 'explicit' THEN 2 ELSE 1 END DESC,
+                    importance DESC, updated_at DESC, created_at DESC LIMIT ?""",
                 parameters,
             ).fetchall()
         return [memory_payload(row) for row in rows]
@@ -110,10 +130,21 @@ class CrossChatMemoryStore:
         now = int(time.time())
         saved: list[dict[str, Any]] = []
         with self._connect() as connection:
-            for raw in records[:30]:
+            for raw in records[:8]:
                 content = normalize_memory_content(str(raw.get("content") or ""))
                 kind = str(raw.get("kind") or "fact").strip().lower()
                 if not content or kind not in MEMORY_KINDS:
+                    continue
+                importance = normalize_score(raw.get("importance"), default=1.0 if state != "automatic" else 0.0)
+                confidence = normalize_score(raw.get("confidence"), default=1.0 if state != "automatic" else 0.0)
+                if state == "automatic" and not qualifies_as_automatic_core_memory(
+                    raw,
+                    content=content,
+                    kind=kind,
+                    project_id=project_id,
+                    importance=importance,
+                    confidence=confidence,
+                ):
                     continue
                 fingerprint = memory_fingerprint(kind, content, project_id)
                 existing = connection.execute(
@@ -125,17 +156,62 @@ class CrossChatMemoryStore:
                 if existing:
                     connection.execute(
                         """UPDATE memory_items SET content=?, conversation_id=?, conversation_title=?,
-                        project_id=?, source_excerpt=?, kind=?, state=?, updated_at=? WHERE id=?""",
-                        (content, conversation_id, conversation_title, project_id, source_excerpt[:1600], kind, state, now, existing["id"]),
+                        project_id=?, source_excerpt=?, kind=?, state=?, importance=?, confidence=?,
+                        updated_at=? WHERE id=?""",
+                        (
+                            content, conversation_id, conversation_title, project_id,
+                            source_excerpt[:1600], kind, state, importance, confidence, now,
+                            existing["id"],
+                        ),
                     )
                     row = connection.execute("SELECT * FROM memory_items WHERE id = ?", (existing["id"],)).fetchone()
                 else:
+                    similar = find_similar_automatic_memory(
+                        connection,
+                        kind=kind,
+                        content=content,
+                        project_id=project_id,
+                    ) if state == "automatic" else None
+                    if similar is not None:
+                        if importance + 0.02 < float(similar["importance"] or 0):
+                            saved.append(memory_payload(similar))
+                            continue
+                        connection.execute(
+                            """UPDATE memory_items SET content=?, conversation_id=?,
+                            conversation_title=?, source_excerpt=?, importance=?, confidence=?,
+                            updated_at=? WHERE id=?""",
+                            (
+                                content, conversation_id, conversation_title,
+                                source_excerpt[:1600], importance, confidence, now,
+                                similar["id"],
+                            ),
+                        )
+                        row = connection.execute(
+                            "SELECT * FROM memory_items WHERE id = ?", (similar["id"],)
+                        ).fetchone()
+                        if row:
+                            saved.append(memory_payload(row))
+                        continue
+                    if not make_room_for_core_memory(
+                        connection,
+                        project_id=project_id,
+                        candidate_importance=importance,
+                        candidate_state=state,
+                    ):
+                        continue
                     memory_id = f"memory-{uuid.uuid4().hex[:16]}"
                     connection.execute(
                         """INSERT INTO memory_items(id, fingerprint, kind, content, conversation_id,
                         conversation_title, project_id, source_excerpt, state, created_at, updated_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (memory_id, fingerprint, kind, content, conversation_id, conversation_title, project_id, source_excerpt[:1600], state, now, now),
+                        (
+                            memory_id, fingerprint, kind, content, conversation_id,
+                            conversation_title, project_id, source_excerpt[:1600], state, now, now,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE memory_items SET importance=?, confidence=? WHERE id=?",
+                        (importance, confidence, memory_id),
                     )
                     row = connection.execute("SELECT * FROM memory_items WHERE id = ?", (memory_id,)).fetchone()
                 if row:
@@ -162,7 +238,8 @@ class CrossChatMemoryStore:
             raise ValueError("记忆内容不能为空。")
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE memory_items SET content=?, state='corrected', updated_at=? WHERE id=? AND state <> 'deleted'",
+                """UPDATE memory_items SET content=?, state='corrected', importance=1,
+                confidence=1, updated_at=? WHERE id=? AND state <> 'deleted'""",
                 (clean, int(time.time()), str(memory_id or "").strip()),
             )
             if cursor.rowcount != 1:
@@ -197,7 +274,9 @@ class CrossChatMemoryStore:
                     content TEXT NOT NULL, conversation_id TEXT NOT NULL, conversation_title TEXT NOT NULL,
                     project_id TEXT NOT NULL DEFAULT '', source_excerpt TEXT NOT NULL DEFAULT '',
                     state TEXT NOT NULL CHECK(state IN ('automatic','explicit','corrected','deleted')),
-                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                    importance REAL NOT NULL DEFAULT 0.5,
+                    confidence REAL NOT NULL DEFAULT 0.5
                 );
                 CREATE INDEX IF NOT EXISTS memory_items_scope_idx ON memory_items(project_id, state, updated_at DESC);
                 CREATE TABLE IF NOT EXISTS memory_profiles (
@@ -205,12 +284,33 @@ class CrossChatMemoryStore:
                 );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(memory_items)").fetchall()
+            }
+            if "importance" not in columns:
+                connection.execute(
+                    "ALTER TABLE memory_items ADD COLUMN importance REAL NOT NULL DEFAULT 0.5"
+                )
+            if "confidence" not in columns:
+                connection.execute(
+                    "ALTER TABLE memory_items ADD COLUMN confidence REAL NOT NULL DEFAULT 0.5"
+                )
+            previous_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             # Earlier releases stored one long session summary per chat. Those
             # raw records remain available through chat-history recall, but are
             # intentionally never exposed or injected as the new memory profile.
             connection.execute(
                 "DELETE FROM memory_profiles WHERE content LIKE '历史聊天摘要（导入，建议后续核验）：%'"
             )
+            if previous_version < MEMORY_SCHEMA_VERSION:
+                # V2 automatic records were produced after only three user
+                # messages with no importance threshold or hard cap. They mix
+                # salaries, paths and one-off task progress into global memory
+                # and are unsafe to carry forward. Raw chats remain intact and
+                # searchable through history recall.
+                connection.execute("UPDATE memory_items SET state='deleted' WHERE state='automatic'")
+                connection.execute("DELETE FROM memory_profiles")
             connection.execute(f"PRAGMA user_version = {MEMORY_SCHEMA_VERSION}")
 
 
@@ -220,6 +320,111 @@ def normalize_memory_content(content: str) -> str:
 
 def normalize_profile(content: str) -> str:
     return str(content or "").strip()[:MAX_PROFILE_CHARS]
+
+
+def normalize_score(value: Any, *, default: float) -> float:
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def qualifies_as_automatic_core_memory(
+    raw: dict[str, Any],
+    *,
+    content: str,
+    kind: str,
+    project_id: str,
+    importance: float,
+    confidence: float,
+) -> bool:
+    allowed_kinds = PROJECT_AUTOMATIC_KINDS if project_id else ACCOUNT_AUTOMATIC_KINDS
+    if kind not in allowed_kinds:
+        return False
+    if importance < AUTOMATIC_MEMORY_MIN_IMPORTANCE:
+        return False
+    if confidence < AUTOMATIC_MEMORY_MIN_CONFIDENCE:
+        return False
+    durability = str(raw.get("durability") or "").strip().lower()
+    evidence = str(raw.get("evidence") or "").strip().lower()
+    if durability not in {"long_term", "permanent"}:
+        return False
+    if evidence not in {"explicit", "repeated"}:
+        return False
+    if len(content) < 8 or FILE_DETAIL_PATTERN.search(content):
+        return False
+    if any(marker in content for marker in TRANSIENT_MEMORY_MARKERS):
+        return False
+    return True
+
+
+def find_similar_automatic_memory(
+    connection: sqlite3.Connection,
+    *,
+    kind: str,
+    content: str,
+    project_id: str,
+) -> sqlite3.Row | None:
+    rows = connection.execute(
+        """SELECT * FROM memory_items
+        WHERE project_id=? AND kind=? AND state='automatic'""",
+        (str(project_id or ""), kind),
+    ).fetchall()
+    normalized = content.casefold()
+    best: tuple[float, sqlite3.Row] | None = None
+    for row in rows:
+        score = SequenceMatcher(
+            None,
+            normalized,
+            str(row["content"] or "").casefold(),
+        ).ratio()
+        if score >= 0.72 and (best is None or score > best[0]):
+            best = (score, row)
+    return best[1] if best else None
+
+
+def make_room_for_core_memory(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    candidate_importance: float,
+    candidate_state: str,
+) -> bool:
+    total_limit = MAX_PROJECT_CORE_MEMORIES if project_id else MAX_ACCOUNT_CORE_MEMORIES
+    automatic_limit = MAX_PROJECT_AUTOMATIC_MEMORIES if project_id else MAX_ACCOUNT_AUTOMATIC_MEMORIES
+    active_count = int(connection.execute(
+        """SELECT COUNT(*) FROM memory_items
+        WHERE project_id=? AND state <> 'deleted'""",
+        (str(project_id or ""),),
+    ).fetchone()[0])
+    automatic_count = int(connection.execute(
+        """SELECT COUNT(*) FROM memory_items
+        WHERE project_id=? AND state='automatic'""",
+        (str(project_id or ""),),
+    ).fetchone()[0])
+    if candidate_state != "automatic" and active_count < total_limit:
+        return True
+    if candidate_state == "automatic" and active_count < total_limit and automatic_count < automatic_limit:
+        return True
+    automatic_rows = connection.execute(
+        """SELECT * FROM memory_items
+        WHERE project_id=? AND state='automatic'
+        ORDER BY importance ASC, updated_at ASC""",
+        (str(project_id or ""),),
+    ).fetchall()
+    if not automatic_rows:
+        return False
+    weakest = automatic_rows[0]
+    if (
+        candidate_state == "automatic"
+        and candidate_importance <= float(weakest["importance"] or 0) + 0.02
+    ):
+        return False
+    connection.execute(
+        "UPDATE memory_items SET state='deleted', updated_at=? WHERE id=?",
+        (int(time.time()), weakest["id"]),
+    )
+    return True
 
 
 def memory_fingerprint(kind: str, content: str, project_id: str) -> str:
@@ -246,6 +451,7 @@ def memory_payload(row: sqlite3.Row) -> dict[str, Any]:
         "conversation_id": str(row["conversation_id"]), "conversation_title": str(row["conversation_title"]),
         "project_id": str(row["project_id"]), "source_excerpt": str(row["source_excerpt"]),
         "state": str(row["state"]), "created_at": int(row["created_at"]), "updated_at": int(row["updated_at"]),
+        "importance": float(row["importance"]), "confidence": float(row["confidence"]),
     }
 
 

@@ -7,6 +7,33 @@ description: "Use whenever the user wants to turn Chinese meeting audio, noisy r
 
 This skill handles Chinese meeting-recording workflows inside the local work agent. It is a workflow skill, not a single black-box tool: read this file, then combine the available lower-level tools.
 
+## Completion gate
+
+For a requested meeting-minutes deliverable, classification, source reading,
+drafting decisions, opening downstream skills, viewing tool schemas, and
+environment prechecks are preparation only. They are never a completed result.
+Do not emit a content-only final response while any required output below has
+not been written and verified.
+
+A meeting-minutes task is complete only after all of these conditions hold:
+
+1. A complete ASR Markdown exists and `canonical_outputs.asr` points to it.
+   Reuse an existing completed transcript in place; do not duplicate it merely
+   to place another copy in the stable meeting archive folder. The internal
+   archive Markdown and work-submission Markdown exist in that archive folder.
+2. The work-submission Word file exists and has passed the applicable DOCX
+   validation and rendered-page visual QA.
+3. `manifest.json` exists, has a non-empty `meeting_time.display`, and its four
+   `canonical_outputs` paths were read back and confirmed to exist.
+4. The final response cites the verified artifact paths and describes only work
+   that actually completed.
+
+If any condition is still false, continue with the next native write,
+generation, or verification tool call in the same assistant turn. Phrases such
+as `会保留`, `将记录`, `按某文种处理`, or `准备生成` do not satisfy this gate.
+Never satisfy this gate by feeding an already complete ASR transcript back into
+`write_text_file` or `edit_text_file` under a second filename.
+
 ## Trigger
 
 Use this skill when the user mentions any of:
@@ -54,11 +81,12 @@ Prefer this composable workflow:
 3. If the input is an existing `.md` / `.txt` transcript, read it directly with `read_text_file`.
 4. For supplemental `.docx` files, open the `docx` skill and use its extraction capability. For `.pdf` / `.pptx` / `.xlsx` / `.csv`, open the corresponding format skill before extracting a preview.
 5. Draft the internal archive as Markdown and write it with `write_text_file`.
-6. Draft the work-submission version as conservative Markdown content. This completes the meeting skill's content responsibility.
-7. If a Word deliverable is required, perform the modular handoff:
+6. Draft the work-submission version as conservative Markdown content and write it with `write_text_file`. This is an intermediate artifact, not completion.
+7. Perform the modular Word handoff for the canonical deliverable:
    - Open `official-document` when the requested output is a formal `纪要`, carries formal issuing elements, or otherwise clearly involves official-document content. Let it decide between a full statutory document and a company public-document-style text material.
    - Then open `docx` and use the complete Word workflow for creation, editing, comments, tracked changes, validation, and rendered-page QA. Pass the company document-format setting and any template without rewriting them in this skill.
-8. Use `shell_exec` only when a skill instruction or deterministic script is needed; safe read-only commands may run directly, while script/write/install/long commands need user approval.
+8. Write `manifest.json`, then read it back and verify the four canonical paths, DOCX validation, and rendered-page QA before finalizing.
+9. Use `shell_exec` only when a skill instruction or deterministic script is needed; safe read-only commands may run directly, while script/write/install/long commands need user approval.
 
 ### Recording time metadata
 
@@ -87,6 +115,11 @@ Store the per-recording ASR outputs under a supporting folder such as
 archive. The manifest `canonical_outputs.asr` must point to the combined ASR
 file for the whole meeting, while `supporting_outputs` may point to segment
 folders or legacy drafts.
+
+This concatenation rule applies only when multiple recordings need one combined
+view. For a single recording with an existing complete `transcript.md`, point
+`canonical_outputs.asr` directly to that file and do not create another ASR
+copy in the archive folder.
 
 ### Public-source lookup and background notes
 
@@ -149,16 +182,25 @@ For every completed meeting-minutes task, create or update one meeting archive f
 
 Do not delete intermediate ASR, audio, or previous scattered files. The archive folder is the stable frontend contract for final display.
 
-Always produce these canonical files in that archive folder:
+Always produce these meeting deliverables in that archive folder:
 
-- ASR transcript Markdown: named like `会议名称_会议沟通内容整理_ASR转写稿_Qwen3.md`.
-  This file must contain the full ASR transcript body, not an index, pointer, or
-  "see original transcript.txt" placeholder. If `transcript.md` exists, copy its
-  complete content into this canonical archive file; otherwise embed the full
-  `transcript.txt` text in the Markdown file.
 - Internal archive Markdown: named like `会议名称_会议沟通内容整理_内部留档版.md`.
 - Work-submission Markdown draft: named like `会议名称_会议纪要_工作提交版.md`.
 - Work-submission Word `.docx`, produced by the `docx` skill after the content handoff: named like `MMDD会议主题会议纪要.docx` when the date is known, otherwise `会议主题会议纪要.docx`.
+
+For ASR, preserve and reuse the completed source instead of producing another
+copy:
+
+- If a single recording already has a complete `transcript.md`, use that
+  existing path as `canonical_outputs.asr`.
+- If only `transcript.txt` exists, create one Markdown representation only when
+  the frontend needs Markdown; do not create both a public copy and an archive
+  copy.
+- If multiple recordings must be combined, create one combined canonical ASR
+  Markdown in the archive folder as described above.
+- Never manually replay a large ASR through repeated `write_text_file` or
+  `edit_text_file` calls. Existing complete ASR content is an immutable source,
+  not a draft to rewrite.
 
 After writing these files, create or update `manifest.json` in the same folder. Its `canonical_outputs` must point to the four final display files:
 
@@ -177,7 +219,7 @@ After writing these files, create or update `manifest.json` in the same folder. 
     "source": "user_confirmed | transcript | embedded_recording_time"
   },
   "canonical_outputs": {
-    "asr": "meet_files/会议项目/<会议名称>/<ASR转写稿>.md",
+    "asr": "meet_files/asr_full/.../transcript.md",
     "internal": "meet_files/会议项目/<会议名称>/<内部留档版>.md",
     "work_md": "meet_files/会议项目/<会议名称>/<工作提交版>.md",
     "work_docx": "meet_files/会议项目/<会议名称>/<工作提交版>.docx"
@@ -195,7 +237,7 @@ After writing these files, create or update `manifest.json` in the same folder. 
 }
 ```
 
-Before reporting completion, read back `manifest.json` and verify that `meeting_time.display` is non-empty, all four `canonical_outputs` paths exist, and the archive API can classify them. A manifest without `meeting_time.display` is incomplete even when all four files were generated successfully.
+Before reporting completion, read back `manifest.json` and verify that `meeting_time.display` is non-empty, all four `canonical_outputs` paths exist, and the archive API can classify them. The ASR path may point to the existing completed transcript outside the archive folder. A manifest without `meeting_time.display` is incomplete even when all four files were generated successfully.
 
 The meeting archive page reads this manifest. Do not rely on filename guessing for final display.
 

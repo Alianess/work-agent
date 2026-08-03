@@ -66,6 +66,34 @@ class SkillLayeringTests(unittest.TestCase):
             )
             self.assertIn("recall_chat_history", {item["name"] for item in opened["available_tools"]})
 
+    def test_work_report_store_can_be_separate_from_file_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_workspace = root / "workspace"
+            report_account = root / "account"
+            bus = build_default_tools(
+                WORKSPACE,
+                OpenAICompatibleClient(),
+                PROFILE,
+                data_workspace=file_workspace,
+                report_data_root=report_account,
+            )
+
+            result = json.loads(bus.get_model_tool("sys_skill").handler({
+                "op": "call",
+                "skill_id": "work-reports",
+                "tool_name": "save_work_report",
+                "arguments": {
+                    "report_type": "daily",
+                    "target_date": "2026-07-09",
+                    "content": "# test",
+                },
+            }))
+
+            self.assertTrue(result["ok"])
+            self.assertTrue((report_account / "work_reports/daily/2026-07-09.md").is_file())
+            self.assertFalse((file_workspace / "work_reports/daily/2026-07-09.md").exists())
+
     def test_sys_skill_lists_opens_and_reveals_one_schema_on_demand(self) -> None:
         gateway = self.bus.get_model_tool("sys_skill")
 
@@ -90,6 +118,16 @@ class SkillLayeringTests(unittest.TestCase):
         )
         self.assertIn("docx", official["instructions"])
         self.assertIn("GB/T 9704", official["instructions"])
+
+        reports = json.loads(
+            gateway.handler({"op": "open", "skill_id": "work-reports", "max_chars": 8000})
+        )
+        report_tools = {item["name"] for item in reports["available_tools"]}
+        self.assertIn("collect_work_report_evidence", report_tools)
+        self.assertIn("save_work_report", report_tools)
+        self.assertIn("read_saved_work_report", report_tools)
+        self.assertIn("check_work_report_status", report_tools)
+        self.assertIn("update_workday_calendar", report_tools)
 
         progress = json.loads(
             gateway.handler(

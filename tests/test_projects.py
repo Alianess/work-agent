@@ -4,10 +4,14 @@ import base64
 import json
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
+from openpyxl import load_workbook
+
 from work_agent_core import web_server
+from work_agent_core.project_timeline import parse_timeline_date
 
 
 class ProjectPayloadTests(unittest.TestCase):
@@ -59,6 +63,12 @@ class ProjectPayloadTests(unittest.TestCase):
         self.assertTrue(deleted["ok"])
         self.assertEqual(deleted["project"]["file_count"], 0)
 
+    def test_project_timeline_understands_common_chinese_dates(self) -> None:
+        self.assertEqual(
+            parse_timeline_date("7月31日", reference_year=2026),
+            date(2026, 7, 31),
+        )
+
     def test_invalid_or_foreign_project_paths_are_rejected(self) -> None:
         created = web_server.create_project_payload({"name": "项目 A"})["project"]
         foreign = self.workspace / "meet_files" / "projects" / "project-deadbeefdead" / "sources"
@@ -74,6 +84,108 @@ class ProjectPayloadTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "项目不存在"):
             web_server.resolve_project_chat_context("project-aaaaaaaaaaaa", [])
+
+    def test_project_materials_are_grouped_and_only_current_versions_are_prominent(self) -> None:
+        project = web_server.create_project_payload({"name": "本轮科技"})["project"]
+        names = [
+            "本轮科技项目可研报告初稿.docx",
+            "本轮科技项目可研报告定稿.pdf",
+            "项目启动会_会议沟通内容整理_内部留档版.md",
+            "项目启动会_会议纪要_工作提交版.docx",
+            "项目启动会_录音转写.md",
+            "人工智能教育政策依据.pdf",
+        ]
+        for index, name in enumerate(names):
+            web_server.add_project_file_payload(
+                project["id"],
+                {
+                    "name": name,
+                    "mime_type": "application/octet-stream",
+                    "content_base64": base64.b64encode(f"file-{index}".encode()).decode(),
+                },
+            )
+
+        payload = web_server.project_detail_payload(project["id"])["project"]
+        groups = {group["id"]: group for group in payload["material_groups"]}
+
+        self.assertEqual(payload["file_count"], 6)
+        self.assertEqual(payload["material_count"], 3)
+        self.assertEqual(payload["hidden_file_count"], 3)
+        self.assertEqual(
+            groups["deliverable"]["materials"][0]["name"],
+            "本轮科技项目可研报告定稿.pdf",
+        )
+        self.assertEqual(groups["deliverable"]["materials"][0]["document_status"], "final")
+        self.assertEqual(len(groups["deliverable"]["materials"][0]["history"]), 1)
+        self.assertEqual(
+            groups["meeting"]["materials"][0]["name"],
+            "项目启动会_会议纪要_工作提交版.docx",
+        )
+        self.assertNotIn(
+            "项目启动会_录音转写.md",
+            [
+                material["name"]
+                for group in payload["material_groups"]
+                for material in group["materials"]
+            ],
+        )
+
+        _paths, context, _project_id = web_server.resolve_project_chat_context(project["id"], [])
+        self.assertIn("当前有效材料", context)
+        self.assertIn("本轮科技项目可研报告定稿.pdf", context)
+        self.assertNotIn("本轮科技项目可研报告初稿.docx", context)
+
+    def test_project_timeline_is_one_excel_source_for_web_and_agent(self) -> None:
+        project = web_server.create_project_payload({"name": "本轮科技"})["project"]
+        self.assertFalse(project["timeline"]["exists"])
+
+        created = web_server.create_project_timeline_payload(project["id"])["project"]
+        timeline = created["timeline"]
+        self.assertTrue(timeline["exists"])
+        self.assertEqual(timeline["nodes"], [])
+        timeline_path = self.workspace / timeline["path"]
+        self.assertTrue(timeline_path.is_file())
+
+        updated = web_server.update_project_timeline_payload(
+            project["id"],
+            {
+                "changes": [
+                    {
+                        "action": "add",
+                        "values": {
+                            "workstream": "设计装修",
+                            "planned_date": "2026-08-20",
+                            "title": "装修方案定稿",
+                            "status": "推进中",
+                            "next_action": "确认预算",
+                            "owner": "合作方",
+                        },
+                    }
+                ]
+            },
+        )["project"]
+        self.assertEqual(updated["timeline"]["summary"]["total"], 1)
+        self.assertEqual(updated["timeline"]["nodes"][0]["node_id"], "M-001")
+        self.assertEqual(updated["timeline"]["nodes"][0]["planned_date"], "2026-08-20")
+        self.assertEqual(updated["timeline"]["nodes"][0]["next_action"], "确认预算")
+
+        workbook = load_workbook(timeline_path)
+        sheet = workbook["项目推进"]
+        sheet["F4"] = "已完成"
+        workbook.save(timeline_path)
+        workbook.close()
+
+        refreshed = web_server.project_detail_payload(project["id"])["project"]
+        self.assertEqual(refreshed["timeline"]["nodes"][0]["status"], "已完成")
+        self.assertEqual(refreshed["timeline"]["summary"]["completed"], 1)
+        self.assertTrue(
+            any((self.workspace / created["root"] / "history" / "timeline").glob("*.xlsx"))
+        )
+
+        paths, context, _project_id = web_server.resolve_project_chat_context(project["id"], [])
+        self.assertIn(timeline["path"], paths)
+        self.assertIn("manage_project_timeline", context)
+        self.assertIn("装修方案定稿", context)
 
     def test_conversation_payload_restores_project_id_from_session_metadata(self) -> None:
         project = web_server.create_project_payload({"name": "本轮科技"})["project"]

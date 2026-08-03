@@ -156,6 +156,14 @@ class TurnStore:
             self._write(turn)
             return turn
 
+    def update_metadata(self, turn_id: str, values: dict[str, Any]) -> AgentTurn:
+        with _TURN_LOCK:
+            turn = self.load(turn_id)
+            turn.metadata.update(sanitize_json_value(values))
+            turn.updated_at = int(time.time())
+            self._write(turn)
+            return turn
+
     def pending_approval(self, turn_id: str) -> dict[str, Any]:
         turn = self.load(turn_id)
         pending = turn.metadata.get("pending_approval")
@@ -244,6 +252,59 @@ class TurnStore:
                 self._write(turn)
                 discarded += 1
         return discarded
+
+    def compact_terminal_history(
+        self,
+        conversation_id: str,
+        *,
+        keep_recent: int = 2,
+    ) -> int:
+        """Retain complete runtime logs for audit and bug diagnosis.
+
+        The compact Activity view is derived in the frontend, while task recall
+        is maintained separately in the conversation archive. Runtime events
+        must therefore never be destructively rewritten.
+        """
+
+        del conversation_id, keep_recent
+        return 0
+
+    def fail_interrupted_running_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        reason: str = "上一轮连接或服务进程已中断，可安全重新继续。",
+    ) -> int:
+        """Retire persisted running turns before a new in-process run starts.
+
+        The web runtime already prevents concurrent live runs for one
+        conversation. If a new run is allowed while disk still says
+        ``running``, that record belongs to a disconnected request or an older
+        service process and must not remain permanently active in the UI.
+        """
+
+        safe_conversation_id = sanitize_conversation_ref(conversation_id)
+        if not safe_conversation_id:
+            return 0
+        failed = 0
+        with _TURN_LOCK:
+            if not self.turn_dir.is_dir():
+                return 0
+            for path in self.turn_dir.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                turn = AgentTurn.from_payload(payload, fallback_id=path.stem)
+                if turn.conversation_id != safe_conversation_id or turn.status != "running":
+                    continue
+                turn.status = "failed"
+                turn.error = reason
+                self._write(turn)
+                failed += 1
+        return failed
 
     def request_cancel(self, turn_id: str) -> AgentTurn:
         with _TURN_LOCK:
@@ -362,6 +423,85 @@ def sanitize_turn_event(raw_event: Any) -> dict[str, Any]:
     if not isinstance(raw_event, dict):
         return {}
     return sanitize_json_value(raw_event)
+
+
+def compact_turn_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    public_notes: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    final_event: dict[str, Any] | None = None
+    command_ids: set[str] = set()
+    tool_names: set[str] = set()
+    edited_files: set[str] = set()
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_name = str(event.get("event") or "")
+        title = str(event.get("title") or "")
+        activity_type = str(event.get("activity_type") or "")
+        if (
+            activity_type == "work_note"
+            or title in {"实施路径", "模型行动说明", "执行计划"}
+        ):
+            note = {
+                "event": "activity",
+                "phase": "thinking",
+                "title": "实施路径",
+                "detail": str(event.get("detail") or event.get("content") or "").strip(),
+                "activity_type": "work_note",
+                "step": event.get("step"),
+            }
+            if note["detail"] and note not in public_notes:
+                public_notes.append(note)
+            continue
+        if event_name == "final":
+            final_event = {
+                "event": "final",
+                "content": str(event.get("content") or ""),
+                "steps_used": event.get("steps_used"),
+                "used_tools": bool(event.get("used_tools")),
+            }
+            continue
+        if event_name == "error" or event.get("phase") == "error":
+            errors.append(
+                {
+                    "event": "error",
+                    "phase": "error",
+                    "title": title or "运行异常",
+                    "message": str(event.get("message") or event.get("detail") or "").strip()[:1200],
+                }
+            )
+            continue
+        if activity_type == "command":
+            command_ids.add(str(event.get("id") or event.get("command") or title))
+        tool_name = str(event.get("tool_name") or "").strip()
+        if tool_name:
+            tool_names.add(tool_name)
+        if activity_type == "file_edit":
+            edited_files.add(str(event.get("file_path") or event.get("detail") or "文件"))
+
+    summary_parts: list[str] = []
+    if command_ids:
+        summary_parts.append(f"运行 {len(command_ids)} 组命令")
+    if tool_names:
+        summary_parts.append(f"调用 {len(tool_names)} 个工具")
+    if edited_files:
+        summary_parts.append(f"编辑 {len(edited_files)} 个文件")
+    compacted: list[dict[str, Any]] = list(public_notes)
+    if summary_parts:
+        compacted.append(
+            {
+                "event": "activity",
+                "phase": "observation",
+                "title": "执行细节已折叠",
+                "detail": "、".join(summary_parts) + "；原始参数、回显和重复状态不进入长期运行记录。",
+                "activity_type": "runtime_summary",
+            }
+        )
+    compacted.extend(errors[-3:])
+    if final_event is not None:
+        compacted.append(final_event)
+    return compacted
 
 
 def sanitize_json_value(value: Any, *, depth: int = 0) -> Any:

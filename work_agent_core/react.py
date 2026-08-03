@@ -11,6 +11,7 @@ import time
 import traceback
 from pathlib import Path
 
+from .approval_review import ApprovalReview, ApprovalReviewer
 from .config import ModelProfile
 from .debug_trace import compact_message_summary
 from .llm import (
@@ -19,8 +20,15 @@ from .llm import (
     OpenAICompatibleClient,
     normalize_reasoning_effort,
 )
+from .memory import (
+    ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS,
+    ContextCompactionError,
+    estimate_messages_tokens,
+    summarize_active_react_checkpoint,
+)
 from .progress import compact_preview_text, set_tool_progress_sink
 from .session_store import repair_runtime_message_sequence
+from .shell_tools import issue_internal_approval_grant
 from .tool_bus import ToolBus
 
 
@@ -58,6 +66,10 @@ class ReActAgent:
         debug_trace: Any | None = None,
         cancel_check: Callable[[], bool] | None = None,
         reasoning_effort: str = "medium",
+        auto_approve: bool = False,
+        approval_reviewer: ApprovalReviewer | None = None,
+        plan_update_callback: Callable[[list[dict[str, str]], str], None] | None = None,
+        initial_task_plan: list[dict[str, str]] | None = None,
     ) -> None:
         self.client = client
         self.profile = profile
@@ -68,6 +80,17 @@ class ReActAgent:
         self.debug_trace = debug_trace
         self.cancel_check = cancel_check
         self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+        self.auto_approve = bool(auto_approve)
+        self.approval_reviewer = approval_reviewer or ApprovalReviewer(
+            client=client,
+            profile=profile,
+        )
+        self.plan_update_callback = plan_update_callback
+        self.task_plan = [
+            {"step": str(item.get("step") or ""), "status": str(item.get("status") or "pending")}
+            for item in (initial_task_plan or [])
+            if isinstance(item, dict) and str(item.get("step") or "").strip()
+        ]
 
     def run(self, goal: str) -> AgentResult:
         return self.run_messages([{"role": "user", "content": goal}])
@@ -92,6 +115,7 @@ class ReActAgent:
 
         for step in range(1, self.max_steps + 1):
             self._raise_if_cancelled()
+            self._maybe_compact_active_runtime(messages, step=step)
             started_at = time.monotonic()
             self._trace(
                 "llm_start",
@@ -158,6 +182,7 @@ class ReActAgent:
             batch_session_start = len(session_messages)
             batch_model_start = len(messages)
             completed_tool_messages: list[Message] = []
+            deterministic_final: str | None = None
             assistant_history = assistant_message_for_history(assistant_message, tool_calls=tool_calls)
             session_messages.append(assistant_history)
             messages.append(assistant_history)
@@ -175,8 +200,7 @@ class ReActAgent:
                     arguments=tool_input,
                 )
                 try:
-                    tool = self.tools.get_model_tool(tool_name)
-                    observation = tool.handler(tool_input)
+                    observation = self._execute_model_tool(tool_name, tool_input)
                 except Exception as error:
                     observation = f"TOOL_ERROR: {type(error).__name__}: {error}"
                     self._trace(
@@ -200,6 +224,25 @@ class ReActAgent:
                     )
 
                 approval_payload = parse_shell_approval_required_observation(tool_name, observation)
+                review: ApprovalReview | None = None
+                if (
+                    approval_payload is not None
+                    and self.auto_approve
+                    and approval_payload.get("reviewable_by_model") is True
+                ):
+                    review = self._review_approval(session_messages, approval_payload, step=step)
+                    approval_payload = approval_payload_with_review(approval_payload, review)
+                    if review.approved:
+                        observation = self._execute_model_tool(
+                            tool_name,
+                            approval_granted_tool_input(
+                                tool_call,
+                                approval_payload,
+                                source="reviewer",
+                            ),
+                            trusted_approval=True,
+                        )
+                        approval_payload = parse_shell_approval_required_observation(tool_name, observation)
                 tool_message: Message = {
                     "role": "tool",
                     "tool_call_id": tool_call.id or f"call_{step}_{index}",
@@ -231,6 +274,31 @@ class ReActAgent:
                     )
                 session_messages.append(tool_message)
                 messages.append(tool_message)
+                terminal_text = deterministic_tool_success_final(
+                    tool_name,
+                    tool_input,
+                    observation,
+                )
+                if terminal_text and len(tool_calls) == 1:
+                    deterministic_final = terminal_text
+
+            if deterministic_final:
+                final_message: Message = {"role": "assistant", "content": deterministic_final}
+                session_messages.append(final_message)
+                messages.append(final_message)
+                self._trace(
+                    "agent_deterministic_final",
+                    step=step,
+                    used_tools=True,
+                    final_chars=len(deterministic_final),
+                )
+                return AgentResult(
+                    final=deterministic_final,
+                    steps_used=step,
+                    model_profile=self.profile.name,
+                    used_tools=True,
+                    messages=session_messages,
+                )
 
         final = f"Reached max ReAct steps ({self.max_steps}) without final answer."
         final_message: Message = {"role": "assistant", "content": final}
@@ -276,17 +344,19 @@ class ReActAgent:
 
         for step in range(1, self.max_steps + 1):
             self._raise_if_cancelled()
-            yield {
-                "event": "activity",
-                "phase": "thinking",
-                "title": f"第 {step} 轮模型规划",
-                "detail": (
-                    "模型正在通过原生 tool calling 判断下一步。"
-                    f"模型={self.profile.name}/{self.profile.model}，"
-                    f"首个有效流超时={self.profile.timeout_seconds}s；持续返回时按流活跃度续期。"
-                ),
-                "step": step,
-            }
+            try:
+                checkpoint_event = self._maybe_compact_active_runtime(messages, step=step)
+            except ContextCompactionError as error:
+                self._trace("active_runtime_compaction_failed", step=step, error=str(error))
+                yield {
+                    "event": "error",
+                    "message": str(error),
+                    "type": type(error).__name__,
+                    "detail": "本轮未继续调用模型；完整原始运行轨迹仍保留，可在模型恢复后继续本轮。",
+                }
+                return
+            if checkpoint_event is not None:
+                yield checkpoint_event
             try:
                 response = yield from self._plan_with_progress(
                     messages=messages,
@@ -369,13 +439,15 @@ class ReActAgent:
                 yield {
                     "event": "activity",
                     "phase": "thinking",
-                    "title": "模型行动说明",
+                    "title": "实施路径",
                     "detail": visible_text,
+                    "activity_type": "work_note",
                     "step": step,
                 }
             batch_session_start = len(session_messages)
             batch_model_start = len(messages)
             completed_tool_messages: list[Message] = []
+            deterministic_final: str | None = None
             assistant_history = assistant_message_for_history(assistant_message, tool_calls=tool_calls)
             session_messages.append(assistant_history)
             messages.append(assistant_history)
@@ -410,6 +482,78 @@ class ReActAgent:
                 observation = yield from self._execute_tool_with_progress(tool_name, tool_input, step)
                 self._raise_if_cancelled()
                 approval_payload = parse_shell_approval_required_observation(tool_name, observation)
+                review: ApprovalReview | None = None
+                if (
+                    approval_payload is not None
+                    and self.auto_approve
+                    and approval_payload.get("reviewable_by_model") is True
+                ):
+                    yield {
+                        "event": "activity",
+                        "phase": "thinking",
+                        "title": "独立审查智能体正在审批",
+                        "detail": "仅审查当前精确动作；固定安全边界不会交给模型改写。",
+                        "content": str(approval_payload.get("preview") or ""),
+                        "activity_type": "approval_review",
+                        "command": str(approval_payload.get("command") or ""),
+                        "risk_category": str(approval_payload.get("risk_category") or "EXECUTE"),
+                        "step": step,
+                        "tool_name": tool_name,
+                    }
+                    review = self._review_approval(session_messages, approval_payload, step=step)
+                    approval_payload = approval_payload_with_review(approval_payload, review)
+                    yield {
+                        "event": "activity",
+                        "phase": "action" if review.approved else ("error" if review.failed else "thinking"),
+                        "title": "独立审查已批准" if review.approved else "独立审查未放行",
+                        "detail": review.reason,
+                        "content": str(approval_payload.get("preview") or ""),
+                        "activity_type": "approval_review",
+                        "command": str(approval_payload.get("command") or ""),
+                        "command_status": "running" if review.approved else "approval_required",
+                        "risk_category": str(approval_payload.get("risk_category") or "EXECUTE"),
+                        "approval_resolved": review.approved,
+                        "reviewer_profile": review.reviewer_profile,
+                        "step": step,
+                        "tool_name": tool_name,
+                    }
+                if approval_payload is not None and review is not None and review.approved:
+                    yield {
+                        "event": "activity",
+                        "phase": "action",
+                        "title": "执行审查已批准的动作",
+                        "detail": (
+                            f"{approval_payload.get('risk_category') or 'EXECUTE'} · "
+                            f"{review.reason}"
+                        ),
+                        "content": str(approval_payload.get("preview") or ""),
+                        "activity_type": "command",
+                        "command": str(approval_payload.get("command") or ""),
+                        "command_status": "running",
+                        "risk_category": str(approval_payload.get("risk_category") or "EXECUTE"),
+                        "approval_resolved": True,
+                        "step": step,
+                        "tool_name": tool_name,
+                    }
+                    self._trace(
+                        "approval_auto_approved",
+                        step=step,
+                        tool_name=tool_name,
+                        command=approval_payload.get("command"),
+                        risk_category=approval_payload.get("risk_category"),
+                    )
+                    observation = yield from self._execute_tool_with_progress(
+                        tool_name,
+                        approval_granted_tool_input(
+                            tool_call,
+                            approval_payload,
+                            source="reviewer",
+                        ),
+                        step,
+                        trusted_approval=True,
+                    )
+                    self._raise_if_cancelled()
+                    approval_payload = parse_shell_approval_required_observation(tool_name, observation)
                 if approval_payload is not None:
                     pending_approval = pending_tool_batch_state(
                         runtime_messages_before_batch=session_messages[:batch_session_start],
@@ -425,6 +569,7 @@ class ReActAgent:
                         extra_system_context=self.extra_system_context,
                         approval_payload=approval_payload,
                         reasoning_effort=self.reasoning_effort,
+                        auto_approve=self.auto_approve,
                     )
                     del session_messages[batch_session_start:]
                     del messages[batch_model_start:]
@@ -473,14 +618,20 @@ class ReActAgent:
                     }
                     return
 
+                observation_failed = tool_observation_failed(observation)
+                if tool_name == "update_plan" and not observation_failed:
+                    yield self._task_plan_activity(step)
                 yield {
                     "event": "activity_delta",
                     "id": tool_activity_id,
                     "append_mode": "replace",
-                    "phase": "observation",
-                    "title": f"{tool_name} 返回结果",
+                    "phase": "error" if observation_failed else "observation",
+                    "title": f"{tool_name} 执行失败" if observation_failed else f"{tool_name} 返回结果",
                     "content": "",
-                    "detail": truncate_text(observation, 360),
+                    "detail": observation if observation_failed else truncate_text(observation, 360),
+                    "input_summary": summarize_tool_input(tool_input),
+                    "result_summary": truncate_text(observation, 360),
+                    "command_status": "error" if observation_failed else "success",
                     "step": step,
                     "tool_name": tool_name,
                 }
@@ -494,6 +645,41 @@ class ReActAgent:
                 session_messages.append(tool_message)
                 messages.append(tool_message)
                 completed_tool_messages.append(tool_message)
+
+                terminal_text = deterministic_tool_success_final(
+                    tool_name,
+                    tool_input,
+                    observation,
+                )
+                if terminal_text and len(tool_calls) == 1:
+                    deterministic_final = terminal_text
+
+            if deterministic_final:
+                final_message: Message = {"role": "assistant", "content": deterministic_final}
+                session_messages.append(final_message)
+                messages.append(final_message)
+                self._trace(
+                    "agent_deterministic_final",
+                    step=step,
+                    used_tools=True,
+                    final_chars=len(deterministic_final),
+                )
+                yield {
+                    "event": "activity",
+                    "phase": "complete",
+                    "title": "工作汇报已保存",
+                    "detail": "保存工具已返回明确成功结果，无需再次请求模型组织收尾话术。",
+                    "step": step,
+                }
+                yield {
+                    "event": "final",
+                    "content": deterministic_final,
+                    "steps_used": step,
+                    "model_profile": self.profile.name,
+                    "used_tools": True,
+                    "deterministic_tool_final": True,
+                }
+                return
 
         final = f"Reached max ReAct steps ({self.max_steps}) without final answer."
         final_message: Message = {"role": "assistant", "content": final}
@@ -522,11 +708,12 @@ class ReActAgent:
         *,
         system_context: str = "",
     ) -> Iterator[dict[str, Any]]:
-        """Resume a paused assistant tool_call batch after user approval.
+        """Resume one exact approved action within a paused tool batch.
 
-        Approval is scoped to the model's single assistant message: every
-        shell_exec in that same tool_calls list gets approved_by_user=True, and
-        then the normal ReAct loop continues from the resulting tool messages.
+        A pending batch is a model transport detail, not an approval scope.  A
+        user grant applies only to ``approval_index``.  If a later shell call
+        needs approval, persist a new pending state for that exact call instead
+        of silently replaying it under the prior grant.
         """
 
         assistant_history = pending_approval.get("assistant_message")
@@ -548,6 +735,7 @@ class ReActAgent:
         step = max(1, int(pending_approval.get("step") or 1))
         assistant_history = assistant_message_for_history(assistant_history, tool_calls=tool_calls)
 
+        runtime_messages_before_batch = list(session_messages)
         messages = self._model_messages(session_messages, system_context=system_context)
         session_messages.append(assistant_history)
         messages.append(assistant_history)
@@ -560,7 +748,7 @@ class ReActAgent:
             "event": "activity",
             "phase": "action",
             "title": "终端审批已确认",
-            "detail": "将继续执行同一批工具调用；本批次内的 shell_exec 均按已确认处理。",
+            "detail": "仅执行当前已确认的精确动作；后续命令如需权限，会单独再次确认。",
             "approval_resolved": True,
             "step": step,
         }
@@ -568,7 +756,7 @@ class ReActAgent:
         for index, tool_call in enumerate(tool_calls[approval_index:], start=approval_index):
             self._raise_if_cancelled()
             tool_name = tool_call.name
-            tool_input = approved_batch_tool_input(tool_call)
+            tool_input = dict(tool_call.arguments)
             tool_activity_id = f"tool-{step}-{index}-{tool_call.id or tool_name}"
             yield {
                 "event": "activity",
@@ -587,21 +775,130 @@ class ReActAgent:
                 "step": step,
                 "tool_name": tool_name,
             }
-            observation = yield from self._execute_tool_with_progress(tool_name, tool_input, step)
+            if tool_name == "shell_exec" and index == approval_index:
+                tool_input = approval_granted_tool_input(
+                    tool_call,
+                    pending_approval.get("approval_payload") or {},
+                    source="user",
+                )
+            observation = yield from self._execute_tool_with_progress(
+                tool_name,
+                tool_input,
+                step,
+                trusted_approval=(tool_name == "shell_exec" and index == approval_index),
+            )
             self._raise_if_cancelled()
             approval_payload = parse_shell_approval_required_observation(tool_name, observation)
-            if approval_payload is not None:
-                observation = (
-                    "TOOL_ERROR: 已确认的批次仍返回 approval_required。"
-                    "这通常表示审批状态没有正确传入工具运行时。"
+            review: ApprovalReview | None = None
+            if (
+                approval_payload is not None
+                and self.auto_approve
+                and approval_payload.get("reviewable_by_model") is True
+            ):
+                yield {
+                    "event": "activity",
+                    "phase": "thinking",
+                    "title": "独立审查智能体正在审批",
+                    "detail": "仅审查当前精确动作；固定安全边界不会交给模型改写。",
+                    "activity_type": "approval_review",
+                    "command": str(approval_payload.get("command") or ""),
+                    "risk_category": str(approval_payload.get("risk_category") or "EXECUTE"),
+                    "step": step,
+                    "tool_name": tool_name,
+                }
+                review = self._review_approval(session_messages, approval_payload, step=step)
+                approval_payload = approval_payload_with_review(approval_payload, review)
+                yield {
+                    "event": "activity",
+                    "phase": "action" if review.approved else ("error" if review.failed else "thinking"),
+                    "title": "独立审查已批准" if review.approved else "独立审查未放行",
+                    "detail": review.reason,
+                    "activity_type": "approval_review",
+                    "command": str(approval_payload.get("command") or ""),
+                    "command_status": "running" if review.approved else "approval_required",
+                    "risk_category": str(approval_payload.get("risk_category") or "EXECUTE"),
+                    "approval_resolved": review.approved,
+                    "reviewer_profile": review.reviewer_profile,
+                    "step": step,
+                    "tool_name": tool_name,
+                }
+            if approval_payload is not None and review is not None and review.approved:
+                tool_input = approval_granted_tool_input(
+                    tool_call,
+                    approval_payload,
+                    source="reviewer",
                 )
+                observation = yield from self._execute_tool_with_progress(
+                    tool_name,
+                    tool_input,
+                    step,
+                    trusted_approval=True,
+                )
+                self._raise_if_cancelled()
+                approval_payload = parse_shell_approval_required_observation(tool_name, observation)
+            if approval_payload is not None:
+                next_pending = pending_tool_batch_state(
+                    runtime_messages_before_batch=runtime_messages_before_batch,
+                    assistant_message=assistant_history,
+                    tool_calls=tool_calls,
+                    approval_index=index,
+                    completed_tool_messages=completed_tool_messages,
+                    step=step,
+                    profile_name=self.profile.name,
+                    model=self.profile.model,
+                    max_steps=self.max_steps,
+                    system_context=system_context,
+                    extra_system_context=self.extra_system_context,
+                    approval_payload=approval_payload,
+                    reasoning_effort=self.reasoning_effort,
+                    auto_approve=self.auto_approve,
+                )
+                yield {
+                    "event": "activity",
+                    "phase": "action",
+                    "title": "等待单项审批",
+                    "detail": (
+                        str(approval_payload.get("reason") or "该命令需要用户确认后才能执行。")
+                        + " 本次确认仅覆盖这一条命令。"
+                    ),
+                    "content": str(approval_payload.get("preview") or ""),
+                    "activity_type": "command",
+                    "command": str(approval_payload.get("command") or ""),
+                    "command_status": "approval_required",
+                    "risk_category": str(approval_payload.get("risk_category") or "EXECUTE"),
+                    "approval_required": True,
+                    "approval_preview": str(approval_payload.get("preview") or ""),
+                    "approval_batch_count": len(tool_calls),
+                    "approval_batch_remaining": len(tool_calls) - index,
+                    "approval_batch_commands": next_pending.get("approval_batch_commands", []),
+                    "step": step,
+                    "tool_name": tool_name,
+                }
+                yield {
+                    "event": "final",
+                    "content": approval_required_final_text(
+                        approval_payload,
+                        batch_count=len(tool_calls),
+                        batch_remaining=len(tool_calls) - index,
+                    ),
+                    "steps_used": step,
+                    "model_profile": self.profile.name,
+                    "used_tools": True,
+                    "waiting_approval": True,
+                    "pending_approval": next_pending,
+                }
+                return
+            observation_failed = tool_observation_failed(observation)
             yield {
                 "event": "activity_delta",
                 "id": tool_activity_id,
                 "append_mode": "replace",
-                "phase": "observation",
-                "title": f"{tool_name} 返回结果",
-                "detail": truncate_text(observation, 360),
+                "phase": "error" if observation_failed else "observation",
+                "title": f"{tool_name} 执行失败" if observation_failed else f"{tool_name} 返回结果",
+                "detail": observation if observation_failed else truncate_text(observation, 360),
+                "input_summary": summarize_tool_input(tool_input),
+                "result_summary": truncate_text(observation, 360),
+                "command_status": "error" if observation_failed else "success",
                 "step": step,
                 "tool_name": tool_name,
             }
@@ -613,6 +910,7 @@ class ReActAgent:
             }
             session_messages.append(tool_message)
             messages.append(tool_message)
+            completed_tool_messages.append(tool_message)
 
         # The approved batch is now structurally complete: assistant(tool_calls)
         # is followed by one tool message per tool_call_id. Continue normal
@@ -628,13 +926,34 @@ class ReActAgent:
             "你是本地工作智能体。你可以使用工具读取/写入工作区文件，并调用已注册技能或 MCP 工具。\n"
             "工具定义只通过 API 的 tools 字段提供；你必须使用原生 tool calling 调用工具，"
             "不要在正文中模拟任何工具标签、XML、JSON 或伪协议。\n"
-            "如果不需要工具，或工具调用完成后，请直接用Markdown正文回复；不要把整段答复放进代码围栏。\n\n"
+            "必须牢记 ReAct 的终止语义：只输出 assistant content 而不输出 tool_calls，会被运行时立即视为最终答复并结束整个 ReAct。"
+            "因此，只要用户要求的工作仍有任何一步未实际执行，或你的正文中还会出现‘我会’‘现在开始’‘下面’‘接下来’‘随后’"
+            "等尚待执行的动作，就不得只输出 content；必须在同一条 assistant 消息中同时发起完成下一步所需的原生 tool_calls。"
+            "只有任务已经交付并验证、无需工具即可完整回答，或确实需要用户补充信息/批准而无法继续时，才可以只输出 Markdown 正文结束本轮。"
+            "最终正文应陈述已经发生并核验的结果，不得用未来时计划冒充交付；不要把整段答复放进代码围栏。\n\n"
+            "文件交付任务还有更严格的完成条件：只要用户要求生成、整理、修改或交付文件，而本轮尚未成功执行写入/生成类工具并完成相应核验，"
+            "就绝对不得输出 content-only 最终答复。读取文件、打开技能、确定文种或方案、查看工具参数、环境预检以及描述‘会保留/将记录/按某方式处理’，"
+            "都不构成交付；必须继续在同一条 assistant 消息中发起实际写入、生成或核验所需的原生 tool_calls。"
+            "文件任务的最终答复必须引用已经存在且已核验的产物路径。\n\n"
             "最多工具调用轮数由运行时控制。不要编造工具结果。\n\n"
-            "展示规则：ReAct 过程（例如读取技能、准备搜索、执行脚本、检查环境、工具参数和中间观察）只应体现在活动/工具调用中，"
-            "最终答复只写用户要的结论、摘要、文件路径或下一步建议；不要在最终答复中复述“先读取技能说明”“正在调用工具”“搜索词是……”等过程。\n\n"
+            "展示规则：在需要工具的复杂工作中，如果你形成了会影响后续理解的路线选择、范围判断、"
+            "关键发现或修正，请在发起 tool_calls 的同一条 assistant content 中先写一小段自然语言工作说明；"
+            "它是用户可见、可长期保留的实施路径原文。不要逐条播报机械操作，也不要输出隐私思维链。"
+            "具体命令、参数、回显和中间观察只应体现在活动/工具调用中。"
+            "最终答复只写用户要的结论、摘要、文件路径或下一步建议；不要在最终答复中重复整条过程。\n\n"
+            "计划执行规则：简单问答、单一读取、单文件小改和一步即可验证的任务直接处理，不要建立计划。"
+            "当任务包含三个及以上相互依赖的动作、跨多个文件或材料、研究后还要形成产物、存在显著不确定性，"
+            "或预计需要较长时间执行时，先调用 update_plan 建立 2 至 7 个以结果为导向的步骤，再继续调用实际工具。"
+            "计划不是最终答复，也不是 DAG：任何时刻至多一个步骤为 in_progress；完成并验证后标 completed，"
+            "再推进下一步。只有新证据使原路线失效时才修改计划；不得为展示进度而频繁改写。复杂任务结束前，"
+            "必须把所有已完成步骤更新为 completed；确实无法完成的步骤保留 pending，并在最终答复说明原因。\n\n"
             "终端权限规则：需要终端时调用 shell_exec。只读查看类命令会自动执行；脚本、安装、长任务或写入类命令"
             "会返回 approval_required，并附带风险类别、工作目录、超时和命令预览；"
-            "你必须先向用户说明命令和原因，获得明确同意后才能带 approved_by_user=true 重试；"
+            "系统会交由独立审查智能体或用户审批；模型不得自行伪造审批状态或重试绕过；"
+            "不得因为预计某个后续动作可能需要权限，就提前在正文中要求用户回复‘允许执行’‘确认’等口令。"
+            "必须先优先调用现有 core 文件工具或技能专用工具；只有确实必须使用 shell_exec 时，先实际调用 shell_exec，"
+            "并且仅当工具真实返回 approval_required 后才暂停。审批由系统审批卡处理，不得用 content-only 正文模拟审批、"
+            "不得让用户手工输入许可，也不得把尚未发起的命令描述成待审批状态。"
             "被拒绝的危险命令不能绕过。shell_exec 是 argv 执行，不是完整 shell：不要传 2>&1、管道、重定向或依赖 ls 的通配符；"
             "需要按文件名模式检查时使用 find 或 rg --files。任何非零 returncode 都是失败，最终答复不得把含失败命令的验证概括为“全部通过”。\n\n"
             "运行环境规则：本项目只有一套受支持的 Python 环境，即工作区根目录 `.venv`；"
@@ -668,6 +987,17 @@ class ReActAgent:
 
     def _model_messages(self, session_messages: list[Message], *, system_context: str = "") -> list[Message]:
         messages: list[Message] = [{"role": "system", "content": self.system_prompt}]
+        if self.task_plan:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "上一执行断点留下的活计划如下。先结合用户当前请求判断是否仍是同一任务；"
+                        "若是则从未完成步骤继续，若不是则不要机械沿用，并在确有必要时用 update_plan 替换：\n"
+                        + json.dumps(self.task_plan, ensure_ascii=False)
+                    ),
+                }
+            )
         if system_context.strip():
             messages.append({"role": "system", "content": system_context.strip()})
         messages.extend(session_messages)
@@ -697,7 +1027,7 @@ class ReActAgent:
             raise AgentCancelled("用户停止了当前轮。")
 
     def _tool_schemas(self) -> list[dict[str, Any]]:
-        return [
+        schemas = [
             {
                 "type": "function",
                 "function": {
@@ -708,12 +1038,194 @@ class ReActAgent:
             }
             for tool in self.tools.list_model_tools()
         ]
+        schemas.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_plan",
+                    "description": (
+                        "Create or update a short living execution plan for a genuinely complex task. "
+                        "Do not use for simple questions or one-step work."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "explanation": {
+                                "type": "string",
+                                "description": "Only explain a material plan change; otherwise keep empty.",
+                            },
+                            "plan": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 7,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "step": {"type": "string"},
+                                        "status": {
+                                            "type": "string",
+                                            "enum": ["pending", "in_progress", "completed"],
+                                        },
+                                    },
+                                    "required": ["step", "status"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["plan"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+        return schemas
+
+    def _execute_model_tool(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        *,
+        trusted_approval: bool = False,
+    ) -> str:
+        if tool_name == "update_plan":
+            return self._apply_task_plan(tool_input)
+        tool = self.tools.get_model_tool(tool_name)
+        safe_input = dict(tool_input)
+        if tool_name == "shell_exec" and not trusted_approval:
+            safe_input.pop("approved_by_user", None)
+            safe_input.pop("_approval_source", None)
+            safe_input.pop("_approval_action_id", None)
+            safe_input.pop("_approval_grant", None)
+        return str(tool.handler(safe_input))
+
+    def _review_approval(
+        self,
+        session_messages: list[Message],
+        approval_payload: dict[str, Any],
+        *,
+        step: int,
+    ) -> ApprovalReview:
+        review = self.approval_reviewer.review(session_messages, approval_payload)
+        self._trace(
+            "approval_review_completed",
+            step=step,
+            command=approval_payload.get("command"),
+            risk_category=approval_payload.get("risk_category"),
+            decision=review.decision,
+            reason=review.reason,
+            action_id=review.action_id,
+            reviewer_profile=review.reviewer_profile,
+            failed=review.failed,
+        )
+        return review
+
+    def _apply_task_plan(self, tool_input: dict[str, Any]) -> str:
+        raw_plan = tool_input.get("plan")
+        if not isinstance(raw_plan, list) or not 2 <= len(raw_plan) <= 7:
+            return "TOOL_ERROR: ValueError: plan must contain 2 to 7 steps"
+        plan: list[dict[str, str]] = []
+        in_progress = 0
+        for item in raw_plan:
+            if not isinstance(item, dict):
+                return "TOOL_ERROR: ValueError: each plan item must be an object"
+            step = str(item.get("step") or "").strip()
+            status = str(item.get("status") or "").strip()
+            if not step or status not in {"pending", "in_progress", "completed"}:
+                return "TOOL_ERROR: ValueError: invalid plan step or status"
+            in_progress += int(status == "in_progress")
+            plan.append({"step": step, "status": status})
+        if in_progress > 1:
+            return "TOOL_ERROR: ValueError: at most one plan step may be in_progress"
+        explanation = str(tool_input.get("explanation") or "").strip()
+        self.task_plan = plan
+        if self.plan_update_callback is not None:
+            self.plan_update_callback([dict(item) for item in plan], explanation)
+        return json.dumps(
+            {"ok": True, "plan": plan, "explanation": explanation},
+            ensure_ascii=False,
+        )
+
+    def _task_plan_activity(self, step: int) -> dict[str, Any]:
+        completed = sum(item["status"] == "completed" for item in self.task_plan)
+        total = len(self.task_plan)
+        current = next(
+            (item["step"] for item in self.task_plan if item["status"] == "in_progress"),
+            "计划已更新",
+        )
+        return {
+            "event": "activity",
+            "phase": "thinking",
+            "title": "执行计划",
+            "detail": current,
+            "activity_type": "plan",
+            "plan": [dict(item) for item in self.task_plan],
+            "plan_completed": completed,
+            "plan_total": total,
+            "step": step,
+        }
+
+    def _maybe_compact_active_runtime(
+        self,
+        messages: list[Message],
+        *,
+        step: int,
+    ) -> dict[str, Any] | None:
+        estimated = estimate_messages_tokens(messages)
+        if estimated < ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS:
+            return None
+        user_indexes = [index for index, message in enumerate(messages) if message.get("role") == "user"]
+        if not user_indexes:
+            return None
+        active_start = user_indexes[-1]
+        active_messages = messages[active_start:]
+        # A user prompt by itself has no completed implementation path to fold.
+        if len(active_messages) < 3:
+            return None
+        checkpoint = summarize_active_react_checkpoint(
+            self.client,
+            self.profile,
+            active_messages,
+            task_plan=self.task_plan,
+        )
+        if not checkpoint:
+            return None
+        original_count = len(active_messages)
+        messages[active_start:] = [
+            active_messages[0],
+            {
+                "role": "assistant",
+                "content": (
+                    "本轮运行上下文已压缩。以下是继续执行所需的高保真检查点；"
+                    "它不是最终答复：\n\n" + checkpoint
+                ),
+            },
+        ]
+        self._trace(
+            "active_runtime_compacted",
+            step=step,
+            estimated_tokens=estimated,
+            original_message_count=original_count,
+            checkpoint_chars=len(checkpoint),
+        )
+        return {
+            "event": "activity",
+            "phase": "thinking",
+            "title": "压缩运行上下文",
+            "detail": (
+                f"本轮约 {estimated} tokens；已将 {original_count} 条正在执行的 ReAct 消息整理为检查点，"
+                "完整原始轨迹仍保留在后端日志。"
+            ),
+            "activity_type": "runtime_summary",
+            "step": step,
+        }
 
     def _execute_tool_with_progress(
         self,
         tool_name: str,
         tool_input: dict[str, Any],
         step: int,
+        *,
+        trusted_approval: bool = False,
     ) -> Iterator[dict[str, Any]]:
         result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
         progress_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -724,8 +1236,11 @@ class ReActAgent:
         def run_tool() -> None:
             previous_sink = set_tool_progress_sink(progress_queue.put)
             try:
-                tool = self.tools.get_model_tool(tool_name)
-                observation = tool.handler(tool_input)
+                observation = self._execute_model_tool(
+                    tool_name,
+                    tool_input,
+                    trusted_approval=trusted_approval,
+                )
             except Exception as error:
                 observation = f"TOOL_ERROR: {type(error).__name__}: {error}"
                 self._trace(
@@ -1191,23 +1706,13 @@ class ReActAgent:
                         else ""
                     )
                     success_content = (
-                        model_stream_preview(
-                            elapsed_seconds=elapsed_seconds,
-                            content=content_buffer or final_content,
-                            reasoning=reasoning_buffer,
-                            tool_name=tool_name_buffer,
-                            tool_arguments=tool_arguments_buffer,
-                        )
-                        + f"\n\n{recovery_note}✓ 最终答复已写入对话气泡，用时 {elapsed_seconds}s。"
+                        f"{recovery_note}✓ 最终答复已写入对话气泡，用时 {elapsed_seconds}s。"
                     )
                 else:
-                    success_content = model_stream_preview(
-                        elapsed_seconds=elapsed_seconds,
-                        content=content_buffer,
-                        reasoning=reasoning_buffer,
-                        tool_name=tool_name_buffer,
-                        tool_arguments=tool_arguments_buffer,
-                    ) + f"\n\n✓ 本轮思考完成，用时 {elapsed_seconds}s。"
+                    tool_names = "、".join(call.name for call in parsed_tool_calls)
+                    success_content = (
+                        f"✓ 已确定下一步：{tool_names or '调用工具'}，用时 {elapsed_seconds}s。"
+                    )
                 yield {
                     "event": "activity_delta",
                     "id": request_id,
@@ -1676,6 +2181,19 @@ def parse_shell_approval_required_observation(tool_name: str, observation: str) 
     return payload
 
 
+def approval_payload_with_review(
+    payload: dict[str, Any],
+    review: ApprovalReview,
+) -> dict[str, Any]:
+    enriched = dict(payload)
+    enriched["review_decision"] = review.decision
+    enriched["review_reason"] = review.reason
+    enriched["reviewer_profile"] = review.reviewer_profile
+    enriched["review_failed"] = review.failed
+    enriched["action_id"] = review.action_id
+    return enriched
+
+
 def approval_required_final_text(
     payload: dict[str, Any],
     *,
@@ -1684,6 +2202,7 @@ def approval_required_final_text(
 ) -> str:
     command = str(payload.get("command") or "").strip()
     reason = str(payload.get("reason") or payload.get("detail") or "该命令需要用户确认后才能执行。").strip()
+    review_reason = str(payload.get("review_reason") or "").strip()
     risk = str(payload.get("risk_category") or "EXECUTE").strip()
     lines = [
         "需要你确认后我才能继续执行这批工具调用。",
@@ -1694,6 +2213,8 @@ def approval_required_final_text(
     ]
     if command:
         lines.extend(["", "当前待审批命令：", "", f"```bash\n{command}\n```"])
+    if review_reason:
+        lines.extend(["", f"独立审查未自动放行：{review_reason}"])
     lines.append("")
     lines.append("点击下面的“确认执行”后，后端会恢复同一个 pending batch；不会让模型重新生成或改写这批工具调用。")
     return "\n".join(lines)
@@ -1714,6 +2235,7 @@ def pending_tool_batch_state(
     extra_system_context: str,
     approval_payload: dict[str, Any],
     reasoning_effort: str = "medium",
+    auto_approve: bool = False,
 ) -> dict[str, Any]:
     return {
         "kind": "tool_batch",
@@ -1730,6 +2252,7 @@ def pending_tool_batch_state(
         "extra_system_context": extra_system_context,
         "approval_payload": approval_payload,
         "reasoning_effort": normalize_reasoning_effort(reasoning_effort),
+        "auto_approve": bool(auto_approve),
         "approval_batch_commands": approval_batch_commands(tool_calls, start_index=approval_index),
     }
 
@@ -1750,10 +2273,21 @@ def native_tool_call_from_payload(payload: dict[str, Any]) -> NativeToolCall:
     )
 
 
-def approved_batch_tool_input(tool_call: NativeToolCall) -> dict[str, Any]:
+def approval_granted_tool_input(
+    tool_call: NativeToolCall,
+    approval_payload: dict[str, Any],
+    *,
+    source: str,
+) -> dict[str, Any]:
     arguments = dict(tool_call.arguments)
     if tool_call.name == "shell_exec":
-        arguments["approved_by_user"] = True
+        arguments.pop("approved_by_user", None)
+        arguments["_approval_source"] = source
+        arguments["_approval_action_id"] = str(approval_payload.get("action_id") or "")
+        arguments["_approval_grant"] = issue_internal_approval_grant(
+            action_id=str(approval_payload.get("action_id") or ""),
+            source=source,
+        )
     return arguments
 
 
@@ -2149,3 +2683,74 @@ def truncate_text(value: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "..."
+
+
+def deterministic_tool_success_final(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    observation: str,
+) -> str | None:
+    """Close a turn when a delivery tool already returned an authoritative result.
+
+    A successful report save is itself the completion signal. Asking the model
+    for a third turn merely to paraphrase this structured result can turn a
+    completed local write into a visible failure when the provider is flaky.
+    Keep this deliberately narrow so ordinary tools continue through ReAct.
+    """
+
+    is_report_save = str(tool_name or "").strip() == "save_work_report"
+    if str(tool_name or "").strip() == "sys_skill":
+        is_report_save = (
+            str(tool_input.get("op") or "").strip().lower() == "call"
+            and str(tool_input.get("skill_id") or "").strip() == "work-reports"
+            and str(tool_input.get("tool_name") or "").strip() == "save_work_report"
+        )
+    if not is_report_save:
+        return None
+
+    try:
+        payload = json.loads(str(observation or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("ok") is not True
+        or payload.get("verified") is not True
+    ):
+        return None
+
+    report_labels = {"daily": "日报", "weekly": "周报", "biweekly": "双周报"}
+    report_type = str(payload.get("report_type") or "").strip()
+    report_label = report_labels.get(report_type, "工作汇报")
+    start_date = str(payload.get("start_date") or "").strip()
+    end_date = str(payload.get("end_date") or "").strip()
+    date_text = start_date if start_date == end_date else f"{start_date} 至 {end_date}"
+    path = str(payload.get("content_path") or "").strip()
+    coverage_labels = {"full": "完整", "partial": "部分", "external_gap": "存在外部工作缺口"}
+    coverage = coverage_labels.get(str(payload.get("source_coverage") or "").strip(), "未标注")
+
+    lines = [f"已完成并核验保存{date_text + ' ' if date_text else ''}{report_label}。"]
+    if path:
+        lines.append(f"文件：`{path}`")
+    lines.append(f"证据覆盖：{coverage}。")
+    if payload.get("needs_user_input") is True:
+        lines.append("当前版本已保存；仍有线下或外部工作信息需要补充。")
+    return "\n\n".join(lines)
+
+
+def tool_observation_failed(observation: str) -> bool:
+    """Identify tool-level failures without hiding them in a normal result."""
+
+    text = str(observation or "").strip()
+    upper = text.upper()
+    if upper.startswith(("TOOL_ERROR:", "MCP_TOOL_ERROR:", "ERROR:", "TRACEBACK")):
+        return True
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("ok") is False or payload.get("success") is False:
+        return True
+    return str(payload.get("status") or "").strip().lower() in {"error", "failed", "failure"}

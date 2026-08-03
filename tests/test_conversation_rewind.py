@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -93,6 +94,72 @@ class ConversationRewindTests(unittest.TestCase):
             self.assertNotIn("pending_approval", retired.metadata)
             self.assertEqual(retired.status, "cancelled")
             self.assertTrue(retired.cancel_requested)
+
+    def test_new_run_retires_interrupted_running_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = TurnStore(directory)
+            interrupted = store.create(conversation_id="conversation-1")
+            waiting = store.create(conversation_id="conversation-1")
+            store.set_pending_approval(waiting.id, {"tool": "shell_exec"})
+            other = store.create(conversation_id="conversation-2")
+
+            failed = store.fail_interrupted_running_for_conversation("conversation-1")
+
+            self.assertEqual(failed, 1)
+            interrupted_after = store.load(interrupted.id)
+            self.assertEqual(interrupted_after.status, "failed")
+            self.assertIn("中断", interrupted_after.error)
+            self.assertEqual(store.load(waiting.id).status, "waiting_approval")
+            self.assertEqual(store.load(other.id).status, "running")
+
+    def test_old_terminal_turn_logs_fold_to_public_path_and_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = TurnStore(directory)
+            turn_ids: list[str] = []
+            for index in range(4):
+                turn = store.create(conversation_id="conversation-1")
+                turn_ids.append(turn.id)
+                store.append_event(
+                    turn.id,
+                    {
+                        "event": "activity",
+                        "phase": "thinking",
+                        "title": "实施路径",
+                        "detail": f"第 {index + 1} 轮先核对材料，再修改代码。",
+                        "activity_type": "work_note",
+                    },
+                )
+                store.append_event(
+                    turn.id,
+                    {
+                        "event": "activity",
+                        "phase": "action",
+                        "title": "已运行命令",
+                        "content": "数千行终端回显",
+                        "command": "rg -n test .",
+                        "activity_type": "command",
+                    },
+                )
+                store.append_event(
+                    turn.id,
+                    {"event": "final", "content": f"第 {index + 1} 轮完成。"},
+                )
+
+            changed = store.compact_terminal_history("conversation-1", keep_recent=2)
+
+            self.assertEqual(changed, 0)
+            loaded = [store.load(turn_id) for turn_id in turn_ids]
+            compacted_turns = [
+                turn for turn in loaded if turn.metadata.get("runtime_log_compacted")
+            ]
+            self.assertEqual(len(compacted_turns), 0)
+            serialized = json.dumps(
+                [event for turn in loaded for event in turn.events],
+                ensure_ascii=False,
+            )
+            self.assertIn("先核对材料，再修改代码", serialized)
+            self.assertNotIn("执行细节已折叠", serialized)
+            self.assertIn("数千行终端回显", serialized)
 
     def test_rewind_ordinal_payload_validation(self) -> None:
         self.assertIsNone(sanitize_rewind_user_message_ordinal({}))
