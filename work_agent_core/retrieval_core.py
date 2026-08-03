@@ -8,7 +8,7 @@ import threading
 import numpy as np
 
 
-DEFAULT_MLX_MODEL_PATH = Path("/Users/alian/llm_model/mlx/bge-m3-6bit")
+DEFAULT_MLX_MODEL_PATH = Path.home() / "llm_model" / "mlx" / "bge-m3-6bit"
 DEFAULT_MLX_MODEL_ID = "bge-m3-mlx-6bit"
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_INFERENCE_BATCH_SIZE = 8
@@ -53,7 +53,7 @@ class MlxRetrievalBackend:
     @classmethod
     def from_env(cls) -> "MlxRetrievalBackend":
         return cls(
-            enabled=env_flag("WORK_AGENT_HISTORY_RAG_ENABLED", True),
+            enabled=env_flag("WORK_AGENT_HISTORY_RAG_ENABLED", False),
             model_path=os.getenv(
                 "WORK_AGENT_HISTORY_MLX_MODEL_PATH",
                 str(DEFAULT_MLX_MODEL_PATH),

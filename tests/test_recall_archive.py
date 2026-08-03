@@ -89,7 +89,7 @@ class RecallArchiveTests(unittest.TestCase):
                 "role": "tool",
                 "tool_call_id": "call-1",
                 "name": "shell_exec",
-                "content": "line 1\nline 2\nline 3\n/Users/alian/workspace/work_agent/work_agent_core/history_recall.py",
+                "content": "line 1\nline 2\nline 3\n/Users/example/work_agent/work_agent_core/history_recall.py",
             },
             {"role": "assistant", "content": "索引版本已更新。"},
         ]
