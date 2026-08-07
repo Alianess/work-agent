@@ -71,7 +71,7 @@ export type AgentSettingsPayload = {
   occupation: string;
   details: string;
   memory_enabled: boolean;
-  work_background: string;
+  work_background?: string;
   company_document_format: string;
   message?: string;
 };

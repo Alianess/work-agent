@@ -734,7 +734,6 @@ export default function App() {
     occupation: "",
     details: "",
     memory_enabled: true,
-    work_background: "",
     company_document_format: ""
   });
 
@@ -1652,7 +1651,6 @@ export default function App() {
         occupation: nextAgentSettings.occupation,
         details: nextAgentSettings.details,
         memory_enabled: nextAgentSettings.memory_enabled,
-        work_background: nextAgentSettings.work_background,
         company_document_format: nextAgentSettings.company_document_format
       });
       setMeetingMinutesSettings(nextMeetingMinutesSettings);
@@ -4949,7 +4947,6 @@ export default function App() {
         occupation: payload.occupation,
         details: payload.details,
         memory_enabled: payload.memory_enabled,
-        work_background: payload.work_background,
         company_document_format: payload.company_document_format
       });
       setStatus({ tone: "success", text: "工作背景与文件格式已保存" });
@@ -8983,7 +8980,7 @@ export default function App() {
         <form className="panel settings-work-background" onSubmit={saveAgentSettings}>
           <PanelHeader icon={<MessageCircle aria-hidden="true" />} title="关于你" />
           <p className="muted">
-            这是你主动填写的个性化资料，独立于系统自动生成的记忆。只写希望长期生效的称呼、身份与偏好。
+            这里只维护长期稳定的身份和工作口径，Friday 与普通任务聊天都会读取。阶段项目和最新进展由系统从项目资料、近期聊天与工作记录中核验，不必堆在这里。
           </p>
           <Field label="助理名称" htmlFor="assistant-name">
             <input
@@ -9003,19 +9000,22 @@ export default function App() {
             <Field label="昵称" htmlFor="agent-nickname">
               <input id="agent-nickname" value={agentSettingsForm.nickname} onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, nickname: event.target.value })} placeholder="希望智能体如何称呼你？" />
             </Field>
-            <Field label="职业" htmlFor="agent-occupation">
-              <input id="agent-occupation" value={agentSettingsForm.occupation} onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, occupation: event.target.value })} placeholder="例如：机器人产业研究员" />
+            <Field label="单位 / 岗位" htmlFor="agent-occupation">
+              <input id="agent-occupation" value={agentSettingsForm.occupation} onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, occupation: event.target.value })} placeholder="例如：合肥国先控股机器人事业部" />
             </Field>
           </div>
-          <Field label="你的详情" htmlFor="agent-details">
+          <Field label="长期工作口径" htmlFor="agent-details">
             <textarea
               id="agent-details"
-              rows={8}
+              rows={6}
               value={agentSettingsForm.details}
               onChange={(event) => setAgentSettingsForm({ ...agentSettingsForm, details: event.target.value })}
-              placeholder="需要长期记住的兴趣、价值观、偏好或固定表达要求。临时项目进展不要写在这里。"
+              placeholder="写组织关系、职责边界、正式名称和固定称谓。不要罗列阶段项目、合作企业和临时进展。"
             />
           </Field>
+          <p className="muted">
+            建议控制在 3—6 条。会议纪要专用规则放到“会议纪要设置”，专名纠错同时加入“语音识别热词”。
+          </p>
           <Field label="文档排版偏好" htmlFor="company-document-format">
             <textarea
               id="company-document-format"
@@ -9039,7 +9039,7 @@ export default function App() {
               <Check aria-hidden="true" />
               保存设置
             </button>
-            {agentSettings?.work_background || agentSettings?.company_document_format ? (
+            {agentSettings?.details || agentSettings?.company_document_format ? (
               <span className="muted">已配置，会在新一轮对话中生效。</span>
             ) : null}
           </div>

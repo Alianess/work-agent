@@ -85,6 +85,7 @@ class AuthStoreTests(unittest.TestCase):
                 {
                     "assistant_name": "周五",
                     "work_background": "first background",
+                    "details": "first background",
                     "company_document_format": "标题：二号小标宋",
                 }
             )
@@ -112,7 +113,8 @@ class AuthStoreTests(unittest.TestCase):
             web_server.REQUEST_AUTH.user = first
             first_items = web_server.load_conversations_payload()["items"]
             self.assertEqual([item["id"] for item in first_items], ["first-chat"])
-            self.assertEqual(web_server.load_agent_settings()["work_background"], "first background")
+            self.assertEqual(web_server.load_agent_settings()["details"], "first background")
+            self.assertEqual(web_server.load_agent_settings()["work_background"], "")
             self.assertEqual(web_server.load_agent_settings()["assistant_name"], "周五")
             self.assertEqual(
                 web_server.load_agent_settings()["company_document_format"],
@@ -130,6 +132,7 @@ class AuthStoreTests(unittest.TestCase):
             self.assertNotIn("周五", task_context)
             self.assertNotIn("微信", task_context)
             self.assertIn("普通任务聊天", task_context)
+            self.assertIn("first background", task_context)
         finally:
             web_server.WORKSPACE_ROOT = original_root
             web_server.AUTH_STORE = original_store

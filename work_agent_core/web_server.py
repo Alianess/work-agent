@@ -2324,9 +2324,10 @@ def save_agent_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "occupation": normalize_multiline_text(str(payload.get("occupation", current.get("occupation")) or "")),
         "details": normalize_multiline_text(str(payload.get("details", current.get("details")) or "")),
         "memory_enabled": bool(payload.get("memory_enabled", current.get("memory_enabled", True))),
-        "work_background": normalize_multiline_text(
-            str(payload.get("work_background", current.get("work_background")) or "")
-        ),
+        # ``work_background`` was the old all-in-one field.  Keep reading it
+        # for migration, but do not keep duplicating it after the user saves
+        # the structured "details" field.
+        "work_background": "",
         "company_document_format": normalize_multiline_text(
             str(payload.get("company_document_format", current.get("company_document_format")) or "")
         ),
@@ -2638,14 +2639,19 @@ def agent_system_context(*, mode: str = "task") -> str:
                 "只围绕本聊天和当前项目材料完成用户交办，不要主动介绍其他助理运行时。"
             )
         ]
-    if mode == "friday" and (nickname or occupation or details):
-        blocks.append(
-            "用户主动填写的个性化资料（优先级高于自动记忆）：\n"
-            f"- 称呼：{nickname or '未设置'}\n"
-            f"- 职业：{occupation or '未设置'}\n"
-            f"- 详情：{details or '未设置'}\n\n"
-            "这是用户自己维护的长期偏好与背景，不等同于某次聊天或会议的事实。"
+    if nickname or occupation or details:
+        profile_lines = ["用户主动维护的长期资料（优先级高于自动记忆）："]
+        if nickname:
+            profile_lines.append(f"- 称呼：{nickname}")
+        if occupation:
+            profile_lines.append(f"- 身份：{occupation}")
+        if details:
+            profile_lines.append(f"- 长期工作口径：{details}")
+        profile_lines.append(
+            "这里只包含稳定身份和长期口径；阶段项目、最新进展与具体数字应从当前项目、"
+            "近期工作记录或原始聊天中核验，不得把这里未更新的旧描述当作当前事实。"
         )
+        blocks.append("\n".join(profile_lines))
     if company_document_format:
         blocks.append(
             "公司标准文件格式（纯文字设置）：\n"
