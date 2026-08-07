@@ -247,6 +247,7 @@ class OpenAICompatibleClient:
         reasoning_effort: str | None = None,
         cancel_event: threading.Event | None = None,
         _allow_recovery: bool = True,
+        _request_usage: bool = True,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": profile.model,
@@ -255,6 +256,8 @@ class OpenAICompatibleClient:
             "max_tokens": profile.max_tokens if max_tokens is None else max_tokens,
             "stream": True,
         }
+        if _request_usage:
+            payload["stream_options"] = {"include_usage": True}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
@@ -378,6 +381,20 @@ class OpenAICompatibleClient:
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
             stream_error = RuntimeError(f"LLM stream failed with HTTP {error.code}: {detail}")
+            if error.code == 400 and _request_usage and stream_usage_option_rejected(detail):
+                return self.chat_tools_stream(
+                    messages,
+                    profile=profile,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    on_delta=on_delta,
+                    reasoning_effort=reasoning_effort,
+                    cancel_event=cancel_event,
+                    _allow_recovery=_allow_recovery,
+                    _request_usage=False,
+                )
             if error.code not in {408, 429, 500, 502, 503, 504}:
                 raise stream_error from error
         except urllib.error.URLError as error:
@@ -420,7 +437,6 @@ class OpenAICompatibleClient:
 
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("模型流请求已取消。")
-
         if stream_error is not None:
             if not _allow_recovery:
                 raise stream_error
@@ -439,6 +455,7 @@ class OpenAICompatibleClient:
                 cancel_event=cancel_event,
                 primary_finish_reason=finish_reason,
                 primary_usage=usage,
+                request_usage=_request_usage,
             )
 
         valid_tool_calls = [
@@ -486,6 +503,7 @@ class OpenAICompatibleClient:
                 cancel_event=cancel_event,
                 primary_finish_reason=finish_reason,
                 primary_usage=usage,
+                request_usage=_request_usage,
             )
         return LLMResponse(content=message["content"], raw=raw)
 
@@ -506,6 +524,7 @@ class OpenAICompatibleClient:
         cancel_event: threading.Event | None,
         primary_finish_reason: str | None = None,
         primary_usage: dict[str, Any] | None = None,
+        request_usage: bool = True,
     ) -> LLMResponse:
         elapsed_seconds = max(0, int(time.monotonic() - started_at))
         # The profile timeout governs how long the primary stream may remain
@@ -563,6 +582,7 @@ class OpenAICompatibleClient:
                 on_delta=forward_recovery_delta,
                 cancel_event=cancel_event,
                 _allow_recovery=False,
+                _request_usage=request_usage,
             )
         except Exception as error:
             recovery_error = error
@@ -775,6 +795,11 @@ def stream_end_diagnostics(
             ):
                 details.append(f"reasoning_tokens={reasoning_tokens}")
     return ", ".join(details)
+
+
+def stream_usage_option_rejected(detail: str) -> bool:
+    text = str(detail or "").lower()
+    return "stream_options" in text or "include_usage" in text
 
 
 def prepare_messages_for_profile(

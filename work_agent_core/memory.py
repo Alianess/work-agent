@@ -28,6 +28,8 @@ CHAT_RECENT_VISIBLE_TURNS = 2
 # ``session.messages``.  Without this reserve a 160k-message session can
 # silently become a >230k request and repeatedly time out before compaction.
 CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS = 24_000
+PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS = 4_096
+PROVIDER_USAGE_BASELINE_KEY = "provider_token_usage_baseline"
 ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS = CHAT_SUMMARY_TRIGGER_TOKENS
 ACTIVE_REACT_CHECKPOINT_MAX_TOKENS = 8_192
 
@@ -72,6 +74,7 @@ def inspect_session_memory(
     session: ConversationSession,
     *,
     reserved_tokens: int = 0,
+    profile: ModelProfile | None = None,
 ) -> SessionMemoryInspection:
     """Sanitize and account for a session once, without mutating it."""
     messages = [
@@ -81,10 +84,13 @@ def inspect_session_memory(
     covered_count = min(max(0, int(session.summary_message_count or 0)), len(messages))
     if not str(session.summary or "").strip():
         covered_count = 0
-    estimated_tokens = (
-        estimate_messages_tokens(messages[covered_count:])
-        + estimate_context_tokens(session.summary)
-        + max(0, int(reserved_tokens))
+    raw_context_tokens = estimate_messages_tokens(messages[covered_count:]) + estimate_context_tokens(session.summary)
+    estimated_tokens = usage_baseline_context_tokens(
+        session,
+        messages=messages,
+        raw_context_tokens=raw_context_tokens,
+        reserved_tokens=reserved_tokens,
+        profile=profile,
     )
     return SessionMemoryInspection(
         messages=messages,
@@ -93,10 +99,95 @@ def inspect_session_memory(
     )
 
 
-def estimate_session_memory_tokens(session: ConversationSession, *, reserved_tokens: int = 0) -> int:
+def estimate_session_memory_tokens(
+    session: ConversationSession,
+    *,
+    reserved_tokens: int = 0,
+    profile: ModelProfile | None = None,
+) -> int:
     """Return the estimated request size without mutating the session."""
 
-    return inspect_session_memory(session, reserved_tokens=reserved_tokens).estimated_tokens
+    return inspect_session_memory(
+        session,
+        reserved_tokens=reserved_tokens,
+        profile=profile,
+    ).estimated_tokens
+
+
+def raw_session_context_tokens(session: ConversationSession) -> int:
+    """Estimate only the conversation state represented by a persisted session."""
+    messages = [
+        message for message in (sanitize_runtime_message(item) for item in session.messages) if message
+    ]
+    messages = repair_runtime_message_sequence(messages)
+    covered_count = min(max(0, int(session.summary_message_count or 0)), len(messages))
+    if not str(session.summary or "").strip():
+        covered_count = 0
+    return estimate_messages_tokens(messages[covered_count:]) + estimate_context_tokens(session.summary)
+
+
+def usage_baseline_context_tokens(
+    session: ConversationSession,
+    *,
+    messages: list[dict[str, Any]],
+    raw_context_tokens: int,
+    reserved_tokens: int,
+    profile: ModelProfile | None,
+) -> int:
+    """Use the last real provider input count plus only the later message delta."""
+    fallback = max(0, int(raw_context_tokens)) + max(0, int(reserved_tokens))
+    baseline = session.metadata.get(PROVIDER_USAGE_BASELINE_KEY)
+    if not isinstance(baseline, dict) or profile is None:
+        return fallback
+    if (
+        str(baseline.get("profile") or "") != profile.name
+        or str(baseline.get("model") or "") != profile.model
+        or str(baseline.get("base_url") or "").rstrip("/") != profile.base_url.rstrip("/")
+        or int(baseline.get("summary_message_count") or 0)
+        != min(max(0, int(session.summary_message_count or 0)), len(messages))
+        or str(baseline.get("summary_sha256") or "")
+        != sha256(str(session.summary or "").encode("utf-8")).hexdigest()
+    ):
+        return fallback
+    prompt_tokens = int(baseline.get("prompt_tokens") or 0)
+    anchor_tokens = int(baseline.get("anchor_raw_session_tokens") or 0)
+    if prompt_tokens <= 0 or anchor_tokens < 0 or raw_context_tokens < anchor_tokens:
+        return fallback
+    delta_tokens = raw_context_tokens - anchor_tokens
+    # prompt_tokens already includes system text, tool schemas and request framing.
+    # Only reserve the next answer and a small allowance for dynamic framing.
+    output_reserve = max(
+        0,
+        int(reserved_tokens) - CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+    )
+    return prompt_tokens + delta_tokens + output_reserve + PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS
+
+
+def provider_usage_baseline_payload(
+    profile: ModelProfile,
+    usage: dict[str, Any],
+    *,
+    anchor_raw_session_tokens: int,
+    summary_message_count: int,
+    summary: str = "",
+) -> dict[str, Any] | None:
+    prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    if prompt_tokens <= 0:
+        return None
+    completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    return {
+        "profile": profile.name,
+        "model": profile.model,
+        "base_url": profile.base_url.rstrip("/"),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "anchor_raw_session_tokens": max(0, int(anchor_raw_session_tokens)),
+        "summary_message_count": max(0, int(summary_message_count)),
+        "summary_sha256": sha256(str(summary or "").encode("utf-8")).hexdigest(),
+        "captured_at": int(time.time()),
+    }
 
 
 def prepare_session_memory(
@@ -109,7 +200,11 @@ def prepare_session_memory(
     inspection: SessionMemoryInspection | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> PreparedSessionMemory:
-    inspected = inspection or inspect_session_memory(session, reserved_tokens=reserved_tokens)
+    inspected = inspection or inspect_session_memory(
+        session,
+        reserved_tokens=reserved_tokens,
+        profile=profile,
+    )
     session.messages = list(inspected.messages)
     session.summary_message_count = inspected.covered_count
     covered_count = inspected.covered_count
@@ -178,6 +273,7 @@ def prepare_session_memory(
     )
     session.summary = summary
     session.summary_message_count = next_covered_count
+    session.metadata.pop(PROVIDER_USAGE_BASELINE_KEY, None)
     session.compaction_events.append(
         {
             "id": f"compact-{int(time.time())}-{next_covered_count}",
@@ -529,9 +625,8 @@ def estimate_context_tokens(text: str) -> int:
     if not text:
         return 0
     # CJK text is commonly close to one token per character, while ASCII-heavy
-    # JSON and English average closer to four characters per token.  Counting
-    # both separately avoids materially underestimating long Chinese meeting
-    # transcripts while keeping the estimator deterministic and dependency-free.
+    # JSON and English average closer to four characters per token.  This is
+    # only used for the delta added after the last provider-reported usage.
     cjk_chars = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", text))
     other_chars = max(0, len(text) - cjk_chars)
     return max(1, cjk_chars + math.ceil(other_chars / 4))

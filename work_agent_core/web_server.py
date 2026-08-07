@@ -5,7 +5,7 @@ from datetime import date, datetime
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, quote, urlparse
 import urllib.error
 import urllib.request
@@ -60,11 +60,15 @@ from .llm import OpenAICompatibleClient, chat_completions_endpoint, normalize_re
 from .memory import (
     CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
     CHAT_SUMMARY_TRIGGER_TOKENS,
+    PROVIDER_USAGE_BASELINE_KEY,
     ContextCompactionCancelled,
     ContextCompactionError,
+    estimate_context_tokens,
+    estimate_messages_tokens,
     extract_recent_visible_turns,
     inspect_session_memory,
     prepare_session_memory,
+    provider_usage_baseline_payload,
 )
 from .message_channel import ChannelMessage, ChannelReply
 from .notifications import NotificationStore
@@ -5877,18 +5881,6 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         store.save(session)
         debug_trace.emit("task_plan_updated", plan=plan, explanation=explanation)
 
-    agent = ReActAgent(
-        client=client,
-        profile=profile,
-        tools=tools,
-        max_steps=max_steps,
-        debug_trace=debug_trace,
-        auto_approve=auto_approve,
-        plan_update_callback=persist_task_plan,
-        initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
-        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
-        reasoning_effort=reasoning_effort,
-    )
     image_preparation = enrich_image_attachments_for_model(
         list(prepared_context.messages),
         profile,
@@ -5912,6 +5904,26 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
     )
     runtime_message_count_before_run = len(runtime_messages)
+    usage_callback = session_usage_callback(
+        session=session,
+        store=store,
+        profile=profile,
+        runtime_start_index=runtime_message_count_before_run,
+        debug_trace=debug_trace,
+    )
+    agent = ReActAgent(
+        client=client,
+        profile=profile,
+        tools=tools,
+        max_steps=max_steps,
+        debug_trace=debug_trace,
+        auto_approve=auto_approve,
+        plan_update_callback=persist_task_plan,
+        usage_callback=usage_callback,
+        initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
+        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
+        reasoning_effort=reasoning_effort,
+    )
     result = agent.run_messages(
         runtime_messages,
         system_context=runtime_system_context,
@@ -6086,6 +6098,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         memory_inspection = inspect_session_memory(
             session,
             reserved_tokens=reserved_tokens,
+            profile=profile,
         )
         estimated_tokens = memory_inspection.estimated_tokens
         yield turn_runtime.emit(
@@ -6179,6 +6192,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     memory_inspection = inspect_session_memory(
         session,
         reserved_tokens=reserved_tokens,
+        profile=profile,
     )
     estimated_tokens = memory_inspection.estimated_tokens
     if estimated_tokens >= CHAT_SUMMARY_TRIGGER_TOKENS:
@@ -6292,19 +6306,6 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         get_turn_store().update_metadata(turn_runtime.turn_id, {"task_plan": plan_state})
         debug_trace.emit("task_plan_updated", plan=plan, explanation=explanation)
 
-    agent = ReActAgent(
-        client=client,
-        profile=profile,
-        tools=tools,
-        max_steps=max_steps,
-        debug_trace=debug_trace,
-        cancel_check=turn_runtime.cancelled,
-        reasoning_effort=reasoning_effort,
-        auto_approve=auto_approve,
-        plan_update_callback=persist_stream_task_plan,
-        initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
-        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
-    )
     image_preparation = enrich_image_attachments_for_model(
         list(prepared_context.messages),
         profile,
@@ -6328,6 +6329,27 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         )
     )
     runtime_message_count_before_run = len(runtime_messages)
+    usage_callback = session_usage_callback(
+        session=session,
+        store=store,
+        profile=profile,
+        runtime_start_index=runtime_message_count_before_run,
+        debug_trace=debug_trace,
+    )
+    agent = ReActAgent(
+        client=client,
+        profile=profile,
+        tools=tools,
+        max_steps=max_steps,
+        debug_trace=debug_trace,
+        cancel_check=turn_runtime.cancelled,
+        reasoning_effort=reasoning_effort,
+        auto_approve=auto_approve,
+        plan_update_callback=persist_stream_task_plan,
+        usage_callback=usage_callback,
+        initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
+        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
+    )
     session_saved_after_run = False
     if image_preparation.notice:
         yield turn_runtime.emit(
@@ -6543,6 +6565,13 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         reasoning_effort=normalize_reasoning_effort(pending_approval.get("reasoning_effort")),
         auto_approve=pending_approval.get("auto_approve") is True,
         plan_update_callback=persist_resumed_task_plan,
+        usage_callback=session_usage_callback(
+            session=session,
+            store=session_store,
+            profile=profile,
+            runtime_start_index=runtime_message_count_before_run,
+            debug_trace=debug_trace,
+        ),
         initial_task_plan=active_task_plan.get("steps", []) if isinstance(active_task_plan, dict) else [],
     )
 
@@ -6857,6 +6886,53 @@ def image_fallback_final_content(content: str, notice: str) -> str:
     if not notice:
         return content
     return f"> ⚠️ {notice}\n\n{content}".strip()
+
+
+def session_usage_callback(
+    *,
+    session: Any,
+    store: SessionStore,
+    profile: ModelProfile,
+    runtime_start_index: int,
+    debug_trace: DebugTrace,
+) -> Callable[[dict[str, Any], list[dict[str, Any]]], None]:
+    """Persist the provider's real input count at the matching session anchor."""
+
+    def persist_usage(usage: dict[str, Any], request_session_messages: list[dict[str, Any]]) -> None:
+        runtime_suffix = dehydrate_model_messages(request_session_messages[runtime_start_index:])
+        prospective_messages = repair_runtime_message_sequence(
+            [*session.messages, *runtime_suffix]
+        )
+        covered_count = min(
+            max(0, int(session.summary_message_count or 0)),
+            len(prospective_messages),
+        )
+        if not str(session.summary or "").strip():
+            covered_count = 0
+        anchor_tokens = (
+            estimate_messages_tokens(prospective_messages[covered_count:])
+            + estimate_context_tokens(session.summary)
+        )
+        baseline = provider_usage_baseline_payload(
+            profile,
+            usage,
+            anchor_raw_session_tokens=anchor_tokens,
+            summary_message_count=covered_count,
+            summary=session.summary,
+        )
+        if baseline is None:
+            return
+        session.metadata[PROVIDER_USAGE_BASELINE_KEY] = baseline
+        store.save(session)
+        debug_trace.emit(
+            "provider_usage_baseline_saved",
+            prompt_tokens=baseline["prompt_tokens"],
+            completion_tokens=baseline["completion_tokens"],
+            anchor_raw_session_tokens=anchor_tokens,
+            summary_message_count=covered_count,
+        )
+
+    return persist_usage
 
 
 def dehydrate_model_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

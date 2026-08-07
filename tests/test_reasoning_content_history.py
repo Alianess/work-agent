@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import socket
 import threading
 import time
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from work_agent_core.config import ModelProfile
@@ -65,6 +67,82 @@ class _CancellableStreamingResponse(_StreamingResponse):
 
 
 class ReasoningContentHistoryTests(unittest.TestCase):
+    def test_stream_requests_provider_usage(self) -> None:
+        profile = ModelProfile(
+            name="usage-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="WORK_AGENT_REASONING_TEST_KEY",
+        )
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":1,"total_tokens":124}}\n',
+            b"data: [DONE]\n",
+        ]
+        previous_key = os.environ.get(profile.api_key_env)
+        os.environ[profile.api_key_env] = "test-key"
+        try:
+            with patch(
+                "work_agent_core.llm.urllib.request.urlopen",
+                return_value=_StreamingResponse(lines),
+            ) as urlopen:
+                response = OpenAICompatibleClient().chat_tools_stream(
+                    [{"role": "user", "content": "reply"}],
+                    profile=profile,
+                )
+        finally:
+            if previous_key is None:
+                os.environ.pop(profile.api_key_env, None)
+            else:
+                os.environ[profile.api_key_env] = previous_key
+
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+        self.assertEqual(response.raw["usage"]["prompt_tokens"], 123)
+
+    def test_stream_retries_without_usage_option_when_provider_rejects_it(self) -> None:
+        profile = ModelProfile(
+            name="usage-fallback-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="WORK_AGENT_REASONING_TEST_KEY",
+        )
+        rejected = urllib.error.HTTPError(
+            url="https://example.invalid/v1/chat/completions",
+            code=400,
+            msg="bad request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":{"message":"unknown field stream_options"}}'),
+        )
+        success = _StreamingResponse([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b"data: [DONE]\n",
+        ])
+        previous_key = os.environ.get(profile.api_key_env)
+        os.environ[profile.api_key_env] = "test-key"
+        try:
+            with patch(
+                "work_agent_core.llm.urllib.request.urlopen",
+                side_effect=[rejected, success],
+            ) as urlopen:
+                response = OpenAICompatibleClient().chat_tools_stream(
+                    [{"role": "user", "content": "reply"}],
+                    profile=profile,
+                )
+        finally:
+            if previous_key is None:
+                os.environ.pop(profile.api_key_env, None)
+            else:
+                os.environ[profile.api_key_env] = previous_key
+
+        first_payload = json.loads(urlopen.call_args_list[0].args[0].data.decode("utf-8"))
+        second_payload = json.loads(urlopen.call_args_list[1].args[0].data.decode("utf-8"))
+        self.assertIn("stream_options", first_payload)
+        self.assertNotIn("stream_options", second_payload)
+        self.assertEqual(response.content, "ok")
+
     def test_cancelling_stream_closes_active_response(self) -> None:
         profile = ModelProfile(
             name="luna-test",

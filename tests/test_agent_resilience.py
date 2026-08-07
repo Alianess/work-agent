@@ -270,6 +270,59 @@ class _ApprovalReviewerStub:
 
 
 class AgentResilienceTests(unittest.TestCase):
+    def test_provider_usage_callback_receives_prompt_tokens_before_assistant_append(self) -> None:
+        class UsageClient:
+            def chat_tools_stream(self, messages, **_kwargs):
+                return LLMResponse(
+                    content="done",
+                    raw={
+                        "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                        "usage": {"prompt_tokens": 321, "completion_tokens": 4, "total_tokens": 325},
+                    },
+                )
+
+        captured: list[tuple[dict, list[dict]]] = []
+        profile = ModelProfile(
+            name="usage-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(
+            client=UsageClient(),  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+            usage_callback=lambda usage, messages: captured.append((usage, list(messages))),
+        )
+        session_messages = [{"role": "user", "content": "test"}]
+
+        list(agent.iter_message_events(session_messages))
+
+        self.assertEqual(captured[0][0]["prompt_tokens"], 321)
+        self.assertEqual(captured[0][1], [{"role": "user", "content": "test"}])
+
+    def test_provider_usage_callback_is_suppressed_after_active_compaction(self) -> None:
+        captured: list[dict] = []
+        profile = ModelProfile(
+            name="usage-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(
+            client=object(),  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+            usage_callback=lambda usage, _messages: captured.append(usage),
+        )
+        agent.active_runtime_was_compacted = True
+
+        agent._record_response_usage({"usage": {"prompt_tokens": 321}}, [])
+
+        self.assertEqual(captured, [])
+
     def test_dynamic_context_is_inserted_after_history_before_latest_user(self) -> None:
         profile = ModelProfile(
             name="prompt-cache-order-test",

@@ -8,10 +8,13 @@ from unittest.mock import patch
 from work_agent_core import memory as memory_module
 from work_agent_core.config import ModelProfile
 from work_agent_core.memory import (
+    CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+    PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS,
     ContextCompactionCancelled,
     ContextCompactionError,
     inspect_session_memory,
     prepare_session_memory,
+    provider_usage_baseline_payload,
 )
 from work_agent_core.session_store import ConversationSession
 
@@ -235,6 +238,77 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertEqual(prepared.summary_message_count, 2)
         self.assertGreaterEqual(prepared.estimated_tokens, 1_000)
         self.assertEqual(len(client.calls), 1)
+
+    def test_next_preflight_uses_real_prompt_tokens_plus_only_new_delta(self) -> None:
+        messages = [
+            {"role": "user", "content": "上一轮问题"},
+            {"role": "assistant", "content": "上一轮回答"},
+        ]
+        session = ConversationSession(id="provider-usage", messages=deepcopy(messages))
+        anchor = memory_module.raw_session_context_tokens(session)
+        session.metadata["provider_token_usage_baseline"] = provider_usage_baseline_payload(
+            self.profile,
+            {"prompt_tokens": 198_432, "completion_tokens": 2_100, "total_tokens": 200_532},
+            anchor_raw_session_tokens=anchor,
+            summary_message_count=0,
+            summary=session.summary,
+        )
+        session.messages.append({"role": "user", "content": "本轮新增内容"})
+        current_raw = memory_module.raw_session_context_tokens(session)
+        reserved = CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS + 8_192
+
+        inspection = inspect_session_memory(
+            session,
+            reserved_tokens=reserved,
+            profile=self.profile,
+        )
+
+        self.assertEqual(
+            inspection.estimated_tokens,
+            198_432
+            + (current_raw - anchor)
+            + 8_192
+            + PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS,
+        )
+
+    def test_usage_baseline_is_ignored_after_model_or_summary_changes(self) -> None:
+        session = ConversationSession(
+            id="stale-provider-usage",
+            messages=[{"role": "user", "content": "问题"}],
+        )
+        anchor = memory_module.raw_session_context_tokens(session)
+        session.metadata["provider_token_usage_baseline"] = provider_usage_baseline_payload(
+            self.profile,
+            {"prompt_tokens": 50_000},
+            anchor_raw_session_tokens=anchor,
+            summary_message_count=0,
+            summary=session.summary,
+        )
+        other_profile = ModelProfile(
+            name="other",
+            provider="openai-compatible",
+            base_url=self.profile.base_url,
+            model="other-model",
+            api_key_env="TEST_API_KEY",
+        )
+
+        inspection = inspect_session_memory(session, reserved_tokens=123, profile=other_profile)
+
+        self.assertEqual(inspection.estimated_tokens, anchor + 123)
+
+        session.metadata["provider_token_usage_baseline"] = provider_usage_baseline_payload(
+            self.profile,
+            {"prompt_tokens": 50_000},
+            anchor_raw_session_tokens=anchor,
+            summary_message_count=0,
+            summary=session.summary,
+        )
+        session.summary = "已被替换的摘要"
+        inspection = inspect_session_memory(session, reserved_tokens=123, profile=self.profile)
+        self.assertEqual(
+            inspection.estimated_tokens,
+            memory_module.raw_session_context_tokens(session) + 123,
+        )
 
     def test_force_compaction_runs_below_the_automatic_threshold(self) -> None:
         messages = [

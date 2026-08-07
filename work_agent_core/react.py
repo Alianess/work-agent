@@ -69,6 +69,7 @@ class ReActAgent:
         auto_approve: bool = False,
         approval_reviewer: ApprovalReviewer | None = None,
         plan_update_callback: Callable[[list[dict[str, str]], str], None] | None = None,
+        usage_callback: Callable[[dict[str, Any], list[Message]], None] | None = None,
         initial_task_plan: list[dict[str, str]] | None = None,
     ) -> None:
         self.client = client
@@ -86,6 +87,8 @@ class ReActAgent:
             profile=profile,
         )
         self.plan_update_callback = plan_update_callback
+        self.usage_callback = usage_callback
+        self.active_runtime_was_compacted = False
         self.task_plan = [
             {"step": str(item.get("step") or ""), "status": str(item.get("status") or "pending")}
             for item in (initial_task_plan or [])
@@ -101,6 +104,7 @@ class ReActAgent:
         *,
         system_context: str = "",
     ) -> AgentResult:
+        self.active_runtime_was_compacted = False
         messages: list[Message] = self._model_messages(session_messages, system_context=system_context)
         tool_schemas = self._tool_schemas()
         used_tools = False
@@ -130,6 +134,7 @@ class ReActAgent:
                 tools=tool_schemas,
                 tool_choice="auto",
             )
+            self._record_response_usage(response.raw, session_messages)
             self._trace(
                 "llm_end",
                 step=step,
@@ -327,6 +332,7 @@ class ReActAgent:
         *,
         system_context: str = "",
     ) -> Iterator[dict[str, Any]]:
+        self.active_runtime_was_compacted = False
         messages: list[Message] = self._model_messages(session_messages, system_context=system_context)
         tool_schemas = self._tool_schemas()
         used_tools = False
@@ -382,6 +388,7 @@ class ReActAgent:
                     step=step,
                     draft_prefix=visible_react_draft_prefix(visible_content_parts),
                 )
+                self._record_response_usage(response.raw, session_messages)
             except AgentCancelled:
                 self._trace("agent_cancelled", step=step)
                 raise
@@ -1318,6 +1325,7 @@ class ReActAgent:
                 ),
             },
         ]
+        self.active_runtime_was_compacted = True
         self._trace(
             "active_runtime_compacted",
             step=step,
@@ -1336,6 +1344,46 @@ class ReActAgent:
             "activity_type": "runtime_summary",
             "step": step,
         }
+
+    def _compact_active_runtime_locally(self, messages: list[Message]) -> int:
+        """Bound a large active run without spending another model request."""
+        user_indexes = [index for index, message in enumerate(messages) if message.get("role") == "user"]
+        if not user_indexes:
+            return 0
+        active_start = user_indexes[-1]
+        active_messages = messages[active_start:]
+        if len(active_messages) < 3:
+            return 0
+        keep_tail = active_messages[-8:]
+        compacted: list[Message] = [dict(active_messages[0])]
+        for message in keep_tail:
+            if message is active_messages[0]:
+                continue
+            item = dict(message)
+            content = item.get("content")
+            if isinstance(content, str) and len(content) > 8000:
+                item["content"] = content[:8000] + "\n[本地降级：工具输出已截断]"
+            compacted.append(item)
+        messages[active_start:] = repair_runtime_message_sequence(compacted)
+        self.active_runtime_was_compacted = True
+        return len(compacted)
+
+    def _record_response_usage(self, raw: dict[str, Any], session_messages: list[Message]) -> None:
+        if self.usage_callback is None or self.active_runtime_was_compacted:
+            return
+        usage = raw.get("usage") if isinstance(raw, dict) else None
+        if not isinstance(usage, dict):
+            return
+        if int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0) <= 0:
+            return
+        try:
+            self.usage_callback(dict(usage), session_messages)
+        except Exception as error:
+            self._trace(
+                "provider_usage_callback_failed",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
 
     def _execute_tool_with_progress(
         self,
@@ -1965,27 +2013,6 @@ def parse_complete_json_object(raw_arguments: str) -> dict[str, Any] | None:
     if not text:
         return None
 
-    def _compact_active_runtime_locally(self, messages: list[Message]) -> int:
-        """Bound a large active run without spending another model request."""
-        user_indexes = [index for index, message in enumerate(messages) if message.get("role") == "user"]
-        if not user_indexes:
-            return 0
-        active_start = user_indexes[-1]
-        active_messages = messages[active_start:]
-        if len(active_messages) < 3:
-            return 0
-        keep_tail = active_messages[-8:]
-        compacted: list[Message] = [dict(active_messages[0])]
-        for message in keep_tail:
-            if message is active_messages[0]:
-                continue
-            item = dict(message)
-            content = item.get("content")
-            if isinstance(content, str) and len(content) > 8000:
-                item["content"] = content[:8000] + "\n[本地降级：工具输出已截断]"
-            compacted.append(item)
-        messages[active_start:] = repair_runtime_message_sequence(compacted)
-        return len(compacted)
     for candidate in unique_candidates([text, escape_raw_control_chars_in_strings(text)]):
         try:
             parsed = json.loads(candidate)
@@ -2079,6 +2106,7 @@ def response_debug_summary(raw: dict[str, Any], content: str) -> dict[str, Any]:
     message = choice.get("message") if isinstance(choice, dict) else {}
     if not isinstance(message, dict):
         message = {}
+    usage = raw.get("usage") if isinstance(raw, dict) and isinstance(raw.get("usage"), dict) else {}
     return {
         "finish_reason": choice.get("finish_reason") if isinstance(choice, dict) else None,
         "content_chars": len(str(message.get("content") or content or "")),
@@ -2088,6 +2116,17 @@ def response_debug_summary(raw: dict[str, Any], content: str) -> dict[str, Any]:
             for call in (message.get("tool_calls") or [])
             if isinstance(call, dict)
         ],
+        "usage": {
+            key: usage.get(key)
+            for key in (
+                "prompt_tokens",
+                "input_tokens",
+                "completion_tokens",
+                "output_tokens",
+                "total_tokens",
+            )
+            if usage.get(key) is not None
+        },
     }
 
 
