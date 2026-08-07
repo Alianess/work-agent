@@ -5,8 +5,14 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from work_agent_core import memory as memory_module
 from work_agent_core.config import ModelProfile
-from work_agent_core.memory import ContextCompactionError, prepare_session_memory
+from work_agent_core.memory import (
+    ContextCompactionCancelled,
+    ContextCompactionError,
+    inspect_session_memory,
+    prepare_session_memory,
+)
 from work_agent_core.session_store import ConversationSession
 
 
@@ -177,6 +183,30 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertEqual(prepared.messages, messages)
         self.assertEqual(client.calls, [])
 
+    def test_reuses_preflight_inspection_without_sanitizing_messages_twice(self) -> None:
+        messages = [
+            {"role": "user", "content": "问题"},
+            {"role": "assistant", "content": "回答"},
+            {"role": "user", "content": "当前问题"},
+        ]
+        session = ConversationSession(id="inspection-test", messages=deepcopy(messages))
+
+        with patch(
+            "work_agent_core.memory.sanitize_runtime_message",
+            wraps=memory_module.sanitize_runtime_message,
+        ) as sanitizer:
+            inspection = inspect_session_memory(session, reserved_tokens=128)
+            prepared = prepare_session_memory(
+                RecordingClient(),
+                self.profile,
+                session,
+                reserved_tokens=128,
+                inspection=inspection,
+            )
+
+        self.assertEqual(sanitizer.call_count, len(messages))
+        self.assertEqual(prepared.estimated_tokens, inspection.estimated_tokens)
+
     def test_runtime_reserve_is_counted_before_compaction(self) -> None:
         messages = [
             {"role": "user", "content": "读取三场会议材料"},
@@ -245,6 +275,41 @@ class ChatMemoryTests(unittest.TestCase):
 
         self.assertIn("不会自动切换或重试模型", str(captured.exception))
         self.assertEqual(session.messages, messages)
+        self.assertEqual(session.summary, "")
+        self.assertEqual(session.summary_message_count, 0)
+        self.assertEqual(session.compaction_events, [])
+
+    def test_compaction_can_cancel_the_streaming_model_request(self) -> None:
+        class CancelableClient:
+            def chat_tools_stream(self, *_args, cancel_event, **_kwargs):
+                self.cancel_event = cancel_event
+                if not cancel_event.wait(1):
+                    raise AssertionError("cancel event was not signalled")
+                raise RuntimeError("模型流请求已取消。")
+
+        checks = 0
+
+        def cancel_check() -> bool:
+            nonlocal checks
+            checks += 1
+            return checks > 1
+
+        messages = [
+            {"role": "user", "content": "压缩前问题"},
+            {"role": "assistant", "content": "压缩前回答"},
+        ]
+        session = ConversationSession(id="cancel-compact", messages=deepcopy(messages))
+
+        with patch("work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS", 1):
+            with self.assertRaises(ContextCompactionCancelled):
+                prepare_session_memory(
+                    CancelableClient(),
+                    self.profile,
+                    session,
+                    force=True,
+                    cancel_check=cancel_check,
+                )
+
         self.assertEqual(session.summary, "")
         self.assertEqual(session.summary_message_count, 0)
         self.assertEqual(session.compaction_events, [])

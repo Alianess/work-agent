@@ -309,9 +309,10 @@ class TurnStore:
     def request_cancel(self, turn_id: str) -> AgentTurn:
         with _TURN_LOCK:
             turn = self.load(turn_id)
+            if turn.status in TERMINAL_STATUSES:
+                return turn
             turn.cancel_requested = True
-            if turn.status not in TERMINAL_STATUSES:
-                turn.status = "running"
+            turn.status = "running"
             turn.updated_at = int(time.time())
             self._write(turn)
             return turn
@@ -319,6 +320,8 @@ class TurnStore:
     def mark_cancelled(self, turn_id: str, *, reason: str = "用户停止了当前轮。") -> AgentTurn:
         with _TURN_LOCK:
             turn = self.load(turn_id)
+            if turn.status in TERMINAL_STATUSES:
+                return turn
             turn.cancel_requested = True
             turn.status = "cancelled"
             turn.error = reason

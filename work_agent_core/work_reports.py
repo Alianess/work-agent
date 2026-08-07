@@ -16,6 +16,7 @@ from .memory import estimate_context_tokens
 
 REPORT_TYPES = {"daily", "weekly", "biweekly"}
 DEFAULT_AUDIT_INTERVAL_SECONDS = 30 * 60
+AUTOMATIC_DAILY_REPORT_AUDIT_VERSION = 1
 DEFAULT_DAILY_CUTOFF_HOUR = 18
 DEFAULT_LOOKBACK_WORKDAYS = 10
 MAX_EVIDENCE_ITEMS = 300
@@ -276,6 +277,59 @@ class WorkReportStore:
             "content_bytes": len(content.encode("utf-8")),
         }
 
+    def delete_report(
+        self,
+        *,
+        report_type: str,
+        target_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> dict[str, Any]:
+        """Delete one explicitly identified saved report and verify both files are gone."""
+        if not any(str(value or "").strip() for value in (target_date, start_date, end_date)):
+            raise ValueError("删除工作汇报必须明确提供 target_date 或 start_date/end_date。")
+
+        period_type, start, end = resolve_report_period(
+            report_type=report_type,
+            target_date=target_date,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        report_dir = self.root / period_type
+        stem = report_stem(period_type, start, end)
+        markdown_path = report_dir / f"{stem}.md"
+        metadata_path = report_dir / f"{stem}.json"
+        paths = (markdown_path, metadata_path)
+        if not any(path.exists() for path in paths):
+            raise FileNotFoundError(f"尚未保存 {start.isoformat()} 至 {end.isoformat()} 的{period_type}工作汇报。")
+
+        if metadata_path.is_file():
+            metadata = read_json(metadata_path)
+            stored_content_path = str(metadata.get("content_path") or "").strip()
+            expected_content_path = relative_to_account(markdown_path, self.account_root)
+            if stored_content_path and stored_content_path != expected_content_path:
+                raise RuntimeError("工作汇报元数据路径与标准存储路径不一致，拒绝删除。")
+
+        deleted_paths: list[str] = []
+        for path in paths:
+            if not path.exists():
+                continue
+            path.unlink()
+            deleted_paths.append(relative_to_account(path, self.account_root))
+
+        if any(path.exists() for path in paths):
+            raise RuntimeError("工作汇报删除后校验失败，仍有文件存在。")
+
+        return {
+            "ok": True,
+            "deleted": True,
+            "verified": True,
+            "report_type": period_type,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "deleted_paths": deleted_paths,
+        }
+
     def load_report(self, report_type: str, start: date, end: date) -> dict[str, Any] | None:
         metadata_path = self.root / report_type / f"{report_stem(report_type, start, end)}.json"
         if not metadata_path.is_file():
@@ -318,7 +372,11 @@ class WorkReportStore:
         state_path = self.root / "audit_state.json"
         state = read_json(state_path)
         last_checked = int(state.get("last_checked_at") or 0)
-        if int(current.timestamp()) - last_checked < max(60, int(interval_seconds)):
+        automation_version = int(state.get("automation_version") or 0)
+        if (
+            automation_version >= AUTOMATIC_DAILY_REPORT_AUDIT_VERSION
+            and int(current.timestamp()) - last_checked < max(60, int(interval_seconds))
+        ):
             return {"ok": True, "skipped": True, **state}
 
         status = self.status(now=current)
@@ -326,10 +384,12 @@ class WorkReportStore:
         signature = sha256("\n".join(missing).encode("utf-8")).hexdigest() if missing else ""
         last_notified = int(state.get("last_notified_at") or 0)
         notify = bool(missing) and (
-            signature != str(state.get("missing_signature") or "")
+            automation_version < AUTOMATIC_DAILY_REPORT_AUDIT_VERSION
+            or signature != str(state.get("missing_signature") or "")
             or int(current.timestamp()) - last_notified >= 24 * 60 * 60
         )
         next_state = {
+            "automation_version": AUTOMATIC_DAILY_REPORT_AUDIT_VERSION,
             "last_checked_at": int(current.timestamp()),
             "missing_signature": signature,
             "last_notified_at": int(current.timestamp()) if notify else last_notified,
@@ -902,6 +962,27 @@ def register_work_report_tools(registry: ToolRegistry, account_root: str | Path)
                 "required": ["report_type"],
             },
             handler=lambda args: json.dumps(store.read_report(**args), ensure_ascii=False, indent=2),
+        )
+    )
+    registry.register(
+        Tool(
+            name="delete_work_report",
+            description=(
+                "Delete one explicitly identified saved daily, weekly, or biweekly report. "
+                "Requires target_date or start_date/end_date; removes the Markdown and metadata files "
+                "and returns verified=true only after both are confirmed absent."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "report_type": {"type": "string", "enum": ["daily", "weekly", "biweekly"]},
+                    "target_date": {"type": "string", "description": "Explicit YYYY-MM-DD target; required when deleting a daily report."},
+                    "start_date": {"type": "string", "description": "Optional explicit YYYY-MM-DD period start."},
+                    "end_date": {"type": "string", "description": "Optional explicit YYYY-MM-DD period end."},
+                },
+                "required": ["report_type"],
+            },
+            handler=lambda args: json.dumps(store.delete_report(**args), ensure_ascii=False, indent=2),
         )
     )
     registry.register(

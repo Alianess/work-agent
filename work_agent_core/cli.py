@@ -17,6 +17,7 @@ from .skills.meeting_minutes import MeetingMinutesSkill, register_meeting_minute
 from .skill_runtime import register_skill_runtime_tools
 from .skill_gateway import SkillGateway
 from .history_recall import register_history_recall_tool
+from .host_services.apple_pim import ApplePimService, register_apple_pim_tools
 from .session_store import SessionStore
 from .tool_bus import LocalToolProvider, ToolBus
 from .tools import Tool, register_file_tools
@@ -118,6 +119,8 @@ def build_default_tools(
     session_store: SessionStore | None = None,
     conversation_id: str | None = None,
     project_id: str | None = None,
+    execution_account_id: str = "local",
+    execution_turn_id: str = "",
     enabled_skill_ids: set[str] | None = None,
     friday_notification_handler: Callable[[dict[str, Any]], str] | None = None,
 ) -> ToolBus:
@@ -126,7 +129,15 @@ def build_default_tools(
 
     core_tools = LocalToolProvider("core", provider_kind="local")
     register_file_tools(core_tools.registry, private_workspace)
-    register_shell_tools(core_tools.registry, private_workspace)
+    register_shell_tools(
+        core_tools.registry,
+        private_workspace,
+        runtime_workspace_root=workspace,
+        account_id=execution_account_id,
+        turn_id=execution_turn_id,
+        conversation_id=str(conversation_id or ""),
+        project_id=str(project_id or ""),
+    )
     if session_store is not None and conversation_id:
         register_history_recall_tool(
             core_tools.registry,
@@ -170,6 +181,13 @@ def build_default_tools(
     if not include_shared_tools:
         return bus
 
+    # EventKit runs on the trusted host. The progressive skill gateway exposes
+    # reads plus explicitly user-requested Reminder creation; Calendar events
+    # and browser-side writes stay unavailable to the model.
+    apple_pim_tools = LocalToolProvider("apple-schedule", provider_kind="skill")
+    register_apple_pim_tools(apple_pim_tools.registry, ApplePimService(workspace))
+    bus.add_provider(apple_pim_tools)
+
     work_report_tools = LocalToolProvider("work-reports", provider_kind="skill")
     register_work_report_tools(
         work_report_tools.registry,
@@ -180,7 +198,8 @@ def build_default_tools(
     meeting_tools = LocalToolProvider("meeting", provider_kind="skill")
     register_meeting_minutes_skill(
         meeting_tools.registry,
-        workspace_root=workspace,
+        workspace_root=private_workspace,
+        runtime_workspace_root=workspace,
         client=client,
         profile=profile,
     )
@@ -206,7 +225,7 @@ def build_default_tools(
     skill_gateway.register(
         SkillGateway(
             workspace,
-            [core_tools, work_report_tools, meeting_tools, skill_tools, mcp_tools],
+            [core_tools, apple_pim_tools, work_report_tools, meeting_tools, skill_tools, mcp_tools],
             enabled_skill_ids=enabled_skill_ids,
         ).as_tool()
     )
@@ -259,6 +278,7 @@ def update_model_profile(config_path: str | Path, name: str, profile_data: dict)
             "temperature": profile.temperature,
             "max_tokens": profile.max_tokens,
             "timeout_seconds": profile.timeout_seconds,
+            "supports_vision": profile.supports_vision,
         }
         write_model_config(path, data)
         return

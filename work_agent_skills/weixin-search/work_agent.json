@@ -1,0 +1,16 @@
+{
+  "id": "weixin-search",
+  "label": "微信公众号搜索",
+  "mention": "@微信文章",
+  "description": "搜索和读取微信公众号文章，提取标题、公众号、发布时间、链接及正文，并为专题调研整理组织名称、会员单位、服务类别和运营模式。",
+  "when_to_use": "用户要求检索微信公众号、微信文章、公众号专题资料，或提供微信文章链接时使用。",
+  "dependencies": {
+    "mcps": ["weixin-search-mcp"]
+  },
+  "outputs": [
+    "微信公众号文章搜索结果",
+    "文章正文提取",
+    "公众号专题调研字段"
+  ],
+  "default_enabled": true
+}

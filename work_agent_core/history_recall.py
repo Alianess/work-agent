@@ -419,6 +419,40 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def delete_conversation_index(
+    database_path: str | Path,
+    conversation_ids: Iterable[str],
+) -> int:
+    """Remove deleted conversations from every raw-history index table."""
+    ids = dedupe(
+        sanitize_conversation_id(value)
+        for value in conversation_ids
+        if sanitize_conversation_id(value)
+    )
+    path = Path(database_path)
+    if not ids or not path.is_file():
+        return 0
+    placeholders = ", ".join("?" for _item in ids)
+    deleted_rows = 0
+    with sqlite3.connect(path, timeout=8) as connection:
+        configure_database(connection)
+        ensure_schema(connection)
+        for table in (
+            "chat_history_fts",
+            "history_chunk_parent",
+            "history_chunk_vectors",
+            "history_index_meta",
+            "history_conversation_meta",
+        ):
+            cursor = connection.execute(
+                f"DELETE FROM {table} WHERE conversation_id IN ({placeholders})",
+                ids,
+            )
+            deleted_rows += max(0, int(cursor.rowcount))
+        connection.commit()
+    return deleted_rows
+
+
 def ensure_conversation_index(
     connection: sqlite3.Connection,
     session: ConversationSession,

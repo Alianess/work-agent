@@ -137,6 +137,46 @@ class _ToolThenFinalClient:
         )
 
 
+class _StreamingToolContentThenFinalClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat_tools_stream(self, *_args, on_delta=None, **_kwargs) -> LLMResponse:
+        self.calls += 1
+        if self.calls == 1:
+            if on_delta:
+                on_delta(LLMStreamChunk(content="我先读取资料。"))
+                on_delta(LLMStreamChunk(tool_name="test_tool"))
+                on_delta(LLMStreamChunk(tool_arguments='{"value":"ok"}'))
+            return LLMResponse(
+                content="我先读取资料。",
+                raw={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "我先读取资料。",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_visible_tool",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "test_tool",
+                                            "arguments": '{"value":"ok"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        return LLMResponse(
+            content="资料读取完成。",
+            raw={"choices": [{"message": {"role": "assistant", "content": "资料读取完成。"}}]},
+        )
+
+
 class _ReportSaveThenNetworkFailureClient:
     def __init__(self) -> None:
         self.calls = 0
@@ -230,6 +270,36 @@ class _ApprovalReviewerStub:
 
 
 class AgentResilienceTests(unittest.TestCase):
+    def test_dynamic_context_is_inserted_after_history_before_latest_user(self) -> None:
+        profile = ModelProfile(
+            name="prompt-cache-order-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(
+            client=object(),  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+            system_prompt="fixed system",
+            initial_task_plan=[{"step": "continue", "status": "in_progress"}],
+        )
+        history = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "new question"},
+        ]
+
+        messages = agent._model_messages(history, system_context="dynamic time")
+
+        self.assertEqual(messages[0], {"role": "system", "content": "fixed system"})
+        self.assertEqual(messages[1:3], history[:2])
+        self.assertEqual(messages[-1], history[-1])
+        self.assertEqual([item["role"] for item in messages[3:-1]], ["system", "system"])
+        self.assertIn("continue", str(messages[3]["content"]))
+        self.assertEqual(messages[4]["content"], "dynamic time")
+
     def test_successful_report_save_finishes_without_another_model_request(self) -> None:
         client = _ReportSaveThenNetworkFailureClient()
         provider = LocalToolProvider("core")
@@ -269,6 +339,13 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertIn("已完成并核验保存2026-07-09 日报", final["content"])
         self.assertIn("work_reports/daily/2026-07-09.md", final["content"])
         self.assertEqual(session_messages[-1]["role"], "assistant")
+        self.assertTrue(
+            any(
+                event.get("event") == "draft_delta"
+                and event.get("content") == "日报内容已核验，正在保存。"
+                for event in events
+            )
+        )
 
     def _approval_agent(self, *, auto_approve: bool, auto_approvable: bool):
         calls: list[dict] = []
@@ -633,6 +710,58 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertEqual(observation["input_summary"], '{"value": "ok"}')
         self.assertEqual(observation["result_summary"], "ok")
         self.assertTrue(any(event.get("event") == "final" and event.get("content") == "done" for event in events))
+
+    def test_visible_content_alongside_native_tool_calls_streams_into_answer_draft(self) -> None:
+        profile = ModelProfile(
+            name="visible-tool-content-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        provider = LocalToolProvider("core")
+        provider.register(
+            Tool(
+                name="test_tool",
+                description="test",
+                parameters={"type": "object", "properties": {}},
+                handler=lambda arguments: str(arguments["value"]),
+            )
+        )
+        tools = ToolBus()
+        tools.add_provider(provider)
+        agent = ReActAgent(
+            client=_StreamingToolContentThenFinalClient(),  # type: ignore[arg-type]
+            profile=profile,
+            tools=tools,
+        )
+
+        session_messages = [{"role": "user", "content": "test"}]
+        events = list(agent.iter_message_events(session_messages))
+        first_step_draft = "".join(
+            str(event.get("content") or "")
+            for event in events
+            if event.get("event") == "draft_delta" and event.get("step") == 1
+        )
+        visible_after_completion = ""
+        for event in events:
+            if event.get("event") == "draft_reset":
+                visible_after_completion = str(event.get("content") or "")
+            elif event.get("event") == "draft_delta":
+                visible_after_completion += str(event.get("content") or "")
+            elif event.get("event") == "final":
+                visible_after_completion = str(event.get("content") or "")
+
+        expected = "我先读取资料。\n\n资料读取完成。"
+        self.assertEqual(first_step_draft, "我先读取资料。\n\n")
+        self.assertEqual(visible_after_completion, expected)
+        self.assertTrue(
+            any(
+                event.get("event") == "final" and event.get("content") == expected
+                for event in events
+            )
+        )
+        self.assertEqual(session_messages[-1]["content"], "资料读取完成。")
 
     def test_visible_model_content_streams_into_answer_draft_without_duplication(self) -> None:
         profile = ModelProfile(

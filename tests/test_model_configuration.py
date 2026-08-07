@@ -13,7 +13,7 @@ from work_agent_core.cli import (
     update_model_profile,
     update_model_profile_api_key_env,
 )
-from work_agent_core.config import api_key_env_for_profile, delete_env_value, save_env_value
+from work_agent_core.config import ModelProfile, api_key_env_for_profile, delete_env_value, save_env_value
 from work_agent_core.llm import chat_completions_endpoint
 
 
@@ -33,6 +33,26 @@ class FakeResponse:
 
 
 class ModelConfigurationTests(unittest.TestCase):
+    def test_model_profile_vision_capability_is_explicit_and_legacy_safe(self) -> None:
+        deepseek = ModelProfile.from_dict({
+            "name": "deepseek-v4-flash",
+            "provider": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-v4-flash",
+            "api_key_env": "DEEPSEEK_API_KEY",
+        })
+        vision = ModelProfile.from_dict({
+            "name": "vision-proxy",
+            "provider": "openai-compatible",
+            "base_url": "https://api.example.com/v1",
+            "model": "gpt-5.6-luna",
+            "api_key_env": "VISION_KEY",
+            "supports_vision": True,
+        })
+
+        self.assertFalse(deepseek.supports_vision)
+        self.assertTrue(vision.supports_vision)
+
     def test_profile_key_names_are_stable_and_isolated(self) -> None:
         first = api_key_env_for_profile("gpt-5.6-luna")
         second = api_key_env_for_profile("gpt_5.6_luna")

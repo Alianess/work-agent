@@ -52,7 +52,8 @@ HEALTH_REPORT_DIR = Path("meet_files") / "skill_reports"
 #     "python_modules": ["openpyxl", "python-docx", "pypdf"],
 #     "binaries": ["libreoffice", "pandoc", "pdftoppm"],
 #     "node_modules": ["docx", "pptxgenjs"],
-#     "paths": [".venv/bin/python"]
+#     "paths": [".venv/bin/python"],
+#     "skills": ["anysearch", "edge-browser"]
 #   }
 DEFAULT_DEPENDENCY_KEYS = ("python_modules", "binaries", "node_modules", "paths")
 
@@ -467,6 +468,14 @@ def load_single_skill_manifest(root: Path, skill_dir: Path) -> "SkillManifest | 
     when_to_use = str(config.get("when_to_use") or description)
     outputs = [str(item) for item in config.get("outputs") or []]
     native_tools = summarize_declared_skill_tools(config.get("tools"))
+    dependencies = config.get("dependencies")
+    raw_skill_dependencies = dependencies.get("skills") if isinstance(dependencies, dict) else []
+    skill_dependencies: list[str] = []
+    if isinstance(raw_skill_dependencies, list):
+        for item in raw_skill_dependencies:
+            dependency_id = normalize_skill_id(str(item))
+            if dependency_id and dependency_id not in skill_dependencies:
+                skill_dependencies.append(dependency_id)
     return SkillManifest(
         id=skill_id,
         label=label,
@@ -479,6 +488,7 @@ def load_single_skill_manifest(root: Path, skill_dir: Path) -> "SkillManifest | 
         path=str(skill_dir.relative_to(root)),
         default_enabled=bool(config.get("default_enabled", False)),
         native_tools=native_tools,
+        skill_dependencies=skill_dependencies,
     )
 
 
@@ -778,6 +788,7 @@ class SkillManifest:
     path: str
     default_enabled: bool = False
     native_tools: list[dict[str, str]] = field(default_factory=list)
+    skill_dependencies: list[str] = field(default_factory=list)
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -797,6 +808,8 @@ class SkillManifest:
             payload["source_url"] = self.source_url
         if self.native_tools:
             payload["native_tools"] = self.native_tools
+        if self.skill_dependencies:
+            payload["skill_dependencies"] = self.skill_dependencies
         return payload
 
 

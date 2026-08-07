@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 import json
@@ -8,12 +8,21 @@ import hashlib
 import os
 import secrets
 import shlex
-import subprocess
 import threading
 import time
+import uuid
 
-from .progress import run_logged_process
-from .runtime_env import apply_project_agent_environment
+from .execution import (
+    CapabilitySet,
+    CommandSpec,
+    ExecutionClass,
+    ExecutionMode,
+    ExecutionOrchestrator,
+    ExecutionRequest,
+)
+from .execution.events import ExecutionEvent
+from .progress import current_tool_cancel_check, emit_tool_progress
+from .runtime_env import apply_project_agent_environment, project_agent_python, project_node
 from .tools import Tool, ToolRegistry, WorkspaceFiles
 
 
@@ -106,11 +115,31 @@ class ShellDecision:
 
 
 class ShellExecutionTools:
-    def __init__(self, workspace_root: str | Path) -> None:
+    def __init__(
+        self,
+        workspace_root: str | Path,
+        *,
+        execution_orchestrator: ExecutionOrchestrator | None = None,
+        runtime_workspace_root: str | Path | None = None,
+        account_id: str = "local",
+        turn_id: str = "",
+        conversation_id: str = "",
+        project_id: str = "",
+    ) -> None:
         self.workspace = WorkspaceFiles(workspace_root)
         self.workspace_root = self.workspace.workspace_root
+        self.runtime_workspace_root = Path(runtime_workspace_root or self.workspace_root).resolve()
+        self.execution_orchestrator = execution_orchestrator or ExecutionOrchestrator(
+            workspace_root=self.workspace_root,
+            runtime_workspace_root=self.runtime_workspace_root,
+        )
+        self.account_id = str(account_id or "local")
+        self.turn_id = str(turn_id or "")
+        self.conversation_id = str(conversation_id or "")
+        self.project_id = str(project_id or "")
 
     def execute(self, args: dict[str, Any]) -> str:
+        internal_tool_call_id = str(args.get("_execution_tool_call_id") or "").strip()
         command_text = str(args.get("command") or "").strip()
         if not command_text:
             raise ValueError("缺少 command。")
@@ -168,32 +197,181 @@ class ShellExecutionTools:
                 indent=2,
             )
 
-        try:
-            result = run_logged_process(
-                argv,
-                cwd=cwd,
-                timeout_seconds=timeout_seconds,
-                label="Shell",
-                check=False,
-                env=safe_environment(self.workspace_root),
-            )
-        except subprocess.TimeoutExpired as error:
-            raise TimeoutError(f"命令执行超时：{command_text}") from error
+        # Replaying a streamed/recovered native tool call returns the same
+        # execution receipt instead of creating a second host process.
+        execution_id_seed = internal_tool_call_id or uuid.uuid4().hex
+        execution_identity = (
+            f"toolcall:{self.turn_id or self.conversation_id or 'standalone'}:{execution_id_seed}"
+        )
+        managed_argv = self._managed_runtime_argv(argv)
+        default_capabilities = CapabilitySet()
+        execution = self.execution_orchestrator.submit(
+            ExecutionRequest(
+                request_id=f"shell_{execution_identity}",
+                idempotency_key=execution_identity,
+                account_id=self.account_id,
+                turn_id=self.turn_id,
+                conversation_id=self.conversation_id,
+                project_id=self.project_id,
+                tool_call_id=execution_id_seed,
+                tool_name="shell_exec",
+                execution_class=ExecutionClass.ISOLATED_PROCESS,
+                mode=ExecutionMode.ISOLATED,
+                command=CommandSpec(
+                    argv=tuple(managed_argv),
+                    cwd=".",
+                    env={"WORK_AGENT_RUNTIME": "isolated"},
+                ),
+                requested_capabilities=CapabilitySet(
+                    resources=replace(
+                        default_capabilities.resources,
+                        wall_timeout_seconds=timeout_seconds,
+                    )
+                ),
+                delivery_mode="apply_after_validation",
+                reason=f"运行工作区内命令：{Path(argv[0]).name}",
+            ),
+            source_root=cwd,
+            on_event=self._on_execution_event,
+            cancel_check=current_tool_cancel_check(),
+        )
+        self._emit_execution_result(execution)
+        stdout, stderr = self._execution_output(execution)
+        succeeded = execution.status.value == "succeeded"
 
         return json.dumps(
             {
-                "ok": result.returncode == 0,
-                "status": "executed",
+                "ok": succeeded,
+                "status": "executed" if succeeded else "failed",
                 "permission": decision.status,
                 "risk_category": decision.risk_category,
                 "command": command_text,
                 "cwd": str(cwd),
-                "returncode": result.returncode,
-                "stdout": truncate(result.stdout, 20000),
-                "stderr": truncate(result.stderr, 12000),
+                "returncode": execution.process.exit_code if execution.process else None,
+                "stdout": truncate(stdout, 20000),
+                "stderr": truncate(stderr, 12000),
+                "execution_id": execution.execution_id,
+                "execution_status": execution.status.value,
+                "delivery_status": execution.delivery_status.value,
+                "change_set_id": execution.change_set_id,
+                "receipt_id": execution.receipt_id,
+                "error": execution.error.code if execution.error else "",
+                "reason": execution.error.message if execution.error else "",
             },
             ensure_ascii=False,
             indent=2,
+        )
+
+    def _managed_runtime_argv(self, argv: list[str]) -> list[str]:
+        """Pin managed interpreters instead of inheriting an arbitrary host PATH."""
+        if not argv:
+            return argv
+        executable = Path(argv[0]).name
+        resolved: Path | None = None
+        if executable in {"python", "python3"}:
+            resolved = project_agent_python(self.runtime_workspace_root)
+        elif executable == "node":
+            resolved = project_node(self.runtime_workspace_root)
+        if resolved is None:
+            return list(argv)
+        return [str(resolved), *argv[1:]]
+
+    def _execution_output(self, execution: Any) -> tuple[str, str]:
+        process = getattr(execution, "process", None)
+        if process is None:
+            return "", ""
+        return self._read_execution_log(process.stdout_ref), self._read_execution_log(process.stderr_ref)
+
+    @staticmethod
+    def _read_execution_log(raw_path: str) -> str:
+        if not raw_path:
+            return ""
+        try:
+            return Path(raw_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _on_execution_event(self, event: ExecutionEvent) -> None:
+        payload = event.payload
+        if event.type == "process.stdout.delta" or event.type == "process.stderr.delta":
+            emit_tool_progress(
+                {
+                    "event": "activity_delta",
+                    "id": f"execution-{event.execution_id}",
+                    "phase": "action",
+                    "title": "安全执行环境",
+                    "content": str(payload.get("content") or ""),
+                    "append_mode": "append",
+                    "activity_type": "command",
+                    "command_status": "running",
+                    "execution_id": event.execution_id,
+                    "execution_status": event.phase,
+                }
+            )
+            return
+        status = "running"
+        if event.type in {"execution.completed", "delivery.applied", "process.completed"}:
+            status = "success"
+        elif event.type in {"execution.failed", "execution.cancelled", "process.failed"}:
+            status = "error"
+        emit_tool_progress(
+            {
+                "event": "activity",
+                "id": f"execution-{event.execution_id}",
+                "phase": normalized_activity_phase(event.phase, status),
+                "title": "安全执行环境",
+                "detail": event.summary,
+                "content": "",
+                "activity_type": "runtime_summary",
+                "command_status": status,
+                "execution_id": event.execution_id,
+                "execution_status": event.phase,
+                "execution_event": event.type,
+            }
+        )
+
+    @staticmethod
+    def _emit_execution_result(execution: Any) -> None:
+        status = str(getattr(getattr(execution, "status", None), "value", "failed"))
+        delivery = str(getattr(getattr(execution, "delivery_status", None), "value", "none"))
+        error = getattr(execution, "error", None)
+        if error is not None:
+            detail = str(getattr(error, "message", "安全执行失败。"))
+            command_status = "error"
+            phase = "error"
+        elif delivery == "applied":
+            detail = "验证通过，变更已原子写回当前工作目录。"
+            command_status = "success"
+            phase = "complete"
+        elif delivery == "validated":
+            detail = "命令和产物验证完成，未产生需要写回的文件变更。"
+            command_status = "success"
+            phase = "complete"
+        elif delivery == "changes_ready":
+            detail = "变更已准备好，等待显式写回确认。"
+            command_status = "running"
+            phase = "action"
+        else:
+            detail = "安全执行已结束。"
+            command_status = "success" if status == "succeeded" else "error"
+            phase = "complete" if command_status == "success" else "error"
+        emit_tool_progress(
+            {
+                "event": "activity_delta",
+                "id": f"execution-{execution.execution_id}",
+                "phase": phase,
+                "title": "安全执行环境",
+                "content": "",
+                "append_mode": "replace",
+                "detail": detail,
+                "activity_type": "command",
+                "command_status": command_status,
+                "execution_id": execution.execution_id,
+                "execution_status": status,
+                "delivery_status": delivery,
+                "change_set_id": getattr(execution, "change_set_id", None),
+                "receipt_id": getattr(execution, "receipt_id", ""),
+            }
         )
 
     def _resolve_cwd(self, raw_cwd: str) -> Path:
@@ -248,6 +426,17 @@ class ShellExecutionTools:
         return ShellDecision("ask", f"{executable} 不在白名单内，需要用户确认。", risk_category_for_executable(executable))
 
 
+def normalized_activity_phase(execution_phase: str, command_status: str) -> str:
+    """Map durable execution states to the small public Activity phase set."""
+    if command_status == "error" or execution_phase in {"failed", "cancelled"}:
+        return "error"
+    if execution_phase in {"succeeded", "complete", "applied", "validated"}:
+        return "complete"
+    if execution_phase == "waiting_permission":
+        return "thinking"
+    return "action"
+
+
 def detect_skill_script_argument(
     argv: list[str], workspace_root: Path
 ) -> tuple[str, str] | None:
@@ -280,21 +469,41 @@ def detect_skill_script_argument(
     return None
 
 
-def register_shell_tools(registry: ToolRegistry, workspace_root: str | Path) -> None:
-    shell = ShellExecutionTools(workspace_root)
+def register_shell_tools(
+    registry: ToolRegistry,
+    workspace_root: str | Path,
+    *,
+    execution_orchestrator: ExecutionOrchestrator | None = None,
+    runtime_workspace_root: str | Path | None = None,
+    account_id: str = "local",
+    turn_id: str = "",
+    conversation_id: str = "",
+    project_id: str = "",
+) -> None:
+    shell = ShellExecutionTools(
+        workspace_root,
+        execution_orchestrator=execution_orchestrator,
+        runtime_workspace_root=runtime_workspace_root,
+        account_id=account_id,
+        turn_id=turn_id,
+        conversation_id=conversation_id,
+        project_id=project_id,
+    )
     registry.register(
         Tool(
             name="shell_exec",
             description=(
-                "Run a controlled terminal command inside the workspace. The response includes a risk_category: "
+                "Run a controlled terminal command inside a private macOS Seatbelt workspace. The response includes a risk_category: "
                 "READ, MODIFY, EXECUTE, NETWORK, DELETE, or SYSTEM. Safe read-only commands "
                 "(pwd/ls/find/rg/cat/head/tail/wc/file/stat/du and read-only git subcommands) run automatically. "
                 "Commands that may write files, delete a specific workspace target, run scripts, install packages, use the network, "
                 "or take a long time return approval_required with a preview. Broad deletion, sensitive access, and boundary escapes "
                 "are denied by fixed policy. "
+                "Do not use this tool to read, concatenate, create, or edit text/Markdown files; use the dedicated workspace file tools. "
                 "This is argv execution, not a shell: never use pipes, redirection such as 2>&1, or shell globs with ls. "
                 "For filename-pattern checks use find or rg --files. A nonzero returncode is a failed command; do not report "
-                "a verification suite as fully passed unless every required check succeeded."
+                "a verification suite as fully passed unless every required check succeeded. If native isolation is unavailable, "
+                "the command fails closed and never silently runs on the host."
             ),
             parameters={
                 "type": "object",

@@ -7,6 +7,7 @@ export type ModelProfile = {
   temperature: number;
   max_tokens: number;
   timeout_seconds: number;
+  supports_vision: boolean;
   default: boolean;
   api_key_configured: boolean;
 };
@@ -118,6 +119,66 @@ export type FridayNotification = {
 export type FridayNotificationsPayload = {
   items: FridayNotification[];
   unread_count: number;
+};
+
+export type ApplePimStatus = {
+  ok: boolean;
+  available: boolean;
+  platform: string;
+  reason?: string;
+  error_code?: string;
+  events_authorization: string;
+  reminders_authorization: string;
+};
+
+export type AppleCalendarEvent = {
+  id: string;
+  title: string;
+  start_at: string;
+  end_at: string;
+  all_day: boolean;
+  calendar_id: string;
+  calendar_title: string;
+  location: string;
+  notes: string;
+  url: string;
+};
+
+export type AppleReminder = {
+  id: string;
+  title: string;
+  due_at: string;
+  completed: boolean;
+  completed_at: string;
+  calendar_id: string;
+  calendar_title: string;
+  notes: string;
+  priority: number;
+};
+
+export type ApplePimItemsPayload = {
+  ok: boolean;
+  start_at: string;
+  end_at: string;
+  events: AppleCalendarEvent[];
+  events_truncated?: boolean;
+  reminders: AppleReminder[];
+  reminders_truncated?: boolean;
+};
+
+export type OfficePdfInput = {
+  path: string;
+  name: string;
+  size: number;
+  pages: number;
+};
+
+export type OfficePdfMergePayload = {
+  ok: boolean;
+  output: FileItem;
+  source_count: number;
+  pages: number;
+  message: string;
 };
 
 export type WorkReportMetadata = {
@@ -258,6 +319,8 @@ export type FileItem = {
   mime_type: string;
   kind: "audio" | "image" | "document" | "file";
   previewable: boolean;
+  library_section: "standard" | "office_input" | "office_output";
+  download_url: string;
 };
 
 export type FilesPayload = {
@@ -425,6 +488,8 @@ export type FilePayload = {
   source_url: string;
   rendered_path: string;
   editable: boolean;
+  library_section: "standard" | "office_input" | "office_output";
+  download_url: string;
 };
 
 export type AttachmentItem = {
@@ -467,6 +532,8 @@ export type SpeechTranscriptionPayload = {
   asr_elapsed_ms?: number;
   filter_chain?: string;
   skipped?: boolean;
+  realtime_session_id?: string;
+  segment_index?: number;
   signal?: {
     duration_ms?: number;
     rms?: number;
@@ -490,8 +557,36 @@ export type RealtimeTranscriptSavePayload = {
   ok: boolean;
   title: string;
   path: string;
+  session_id: string;
+  manifest_path: string;
   segments: number;
   chars: number;
+  duration_ms: number;
+  status: string;
+};
+
+export type RealtimeTranscriptSessionPayload = {
+  ok: boolean;
+  schema_version: number;
+  session_id: string;
+  title: string;
+  status: string;
+  created_at: number;
+  updated_at: number;
+  output_path?: string;
+  manifest_path: string;
+  segments: Array<{
+    index: number;
+    status: "processing" | "complete" | "skipped" | "error" | string;
+    text: string;
+    started_at: number;
+    finished_at: number;
+    audio_path?: string;
+    transcript_path?: string;
+    engine?: string;
+    asr_elapsed_ms?: number;
+    error?: string;
+  }>;
 };
 
 export type AgentResult = {
@@ -514,6 +609,11 @@ export type AgentChatResult = {
   conversation_id?: string;
   trace_id?: string;
   debug_trace_path?: string;
+  execution_id?: string;
+  execution_status?: string;
+  delivery_status?: string;
+  change_set_id?: string | null;
+  receipt_id?: string;
   selected_skill?: string | null;
   context_summary?: string;
   context_summary_message_count?: number;
@@ -527,6 +627,7 @@ export type ChatTitlePayload = {
 };
 
 export type AgentActivityPhase = "thinking" | "action" | "observation" | "complete" | "error";
+export type AgentRuntimeStage = "checking" | "compacting" | "complete" | "error";
 
 export type AgentActivityEvent = {
   event: "activity";
@@ -560,12 +661,21 @@ export type AgentActivityEvent = {
   file_path?: string;
   additions?: number;
   deletions?: number;
+  file_changes?: Array<{ file_path: string; additions: number; deletions: number }>;
   step?: number;
   tool_name?: string;
   selected_skill?: string | null;
   elapsed_ms?: number;
   trace_id?: string;
   debug_trace_path?: string;
+  execution_id?: string;
+  execution_status?: string;
+  delivery_status?: string;
+  change_set_id?: string | null;
+  receipt_id?: string;
+  runtime_stage?: AgentRuntimeStage;
+  context_estimated_tokens?: number;
+  context_trigger_tokens?: number;
 };
 
 export type AgentStreamEvent =
@@ -614,12 +724,21 @@ export type AgentStreamEvent =
       file_path?: string;
       additions?: number;
       deletions?: number;
+      file_changes?: Array<{ file_path: string; additions: number; deletions: number }>;
       step?: number;
       tool_name?: string;
       selected_skill?: string | null;
       elapsed_ms?: number;
       trace_id?: string;
       debug_trace_path?: string;
+      execution_id?: string;
+      execution_status?: string;
+      delivery_status?: string;
+      change_set_id?: string | null;
+      receipt_id?: string;
+      runtime_stage?: AgentRuntimeStage;
+      context_estimated_tokens?: number;
+      context_trigger_tokens?: number;
     }
   | {
       event: "delta";
@@ -638,6 +757,7 @@ export type AgentStreamEvent =
     }
   | {
       event: "draft_reset";
+      content?: string;
       step?: number;
       turn_id?: string;
       elapsed_ms?: number;

@@ -14,7 +14,7 @@ SKILL_TOOL_ALIASES: dict[str, set[str]] = {
         "check_meeting_asr_progress",
         "transcribe_meeting_audio",
     },
-    "docx": {"process_office_document", "create_docx_from_markdown"},
+    "docx": {"process_office_document", "create_docx_from_markdown", "docx_soffice"},
     "pdf": {"process_office_document", "create_pdf_from_markdown"},
     "pptx": {"process_office_document", "create_pptx_from_outline"},
     "xlsx": {
@@ -32,13 +32,19 @@ SKILL_TOOL_ALIASES: dict[str, set[str]] = {
         "collect_work_report_evidence",
         "save_work_report",
         "read_saved_work_report",
+        "delete_work_report",
         "check_work_report_status",
         "update_workday_calendar",
     },
+    "apple-schedule": {"list_apple_schedule", "create_apple_reminder"},
     "edge-browser": {
         "browser_click", "browser_close", "browser_fill_form", "browser_find",
         "browser_hover", "browser_navigate", "browser_navigate_back", "browser_press_key",
         "browser_select_option", "browser_snapshot", "browser_tabs", "browser_type", "browser_wait_for",
+    },
+    "weixin-search": {
+        "weixin_search", "weixin_search_all", "resolve_weixin_article_url",
+        "get_weixin_article_content",
     },
 }
 COMMON_SKILL_TOOLS = {"run_skill_script", "precheck_skill_environment"}
@@ -70,6 +76,8 @@ class SkillGateway:
             description=(
                 "技能分层入口。领域任务先 open 对应技能读取说明，再用 show 查看某个技能工具的参数，"
                 "最后用 call 调用该技能工具。list 只返回技能名称和简介。具体技能工具不会常驻顶层 tools。"
+                "参数规则：open 必须带 skill_id；show 必须带 skill_id 和 tool_name；call 必须带 skill_id、tool_name 和 arguments。"
+                "通过 call 调用 run_skill_script 时，arguments 只传 script_path、arguments、timeout_seconds，skill_id 会由网关自动注入。"
             ),
             parameters={
                 "type": "object",
@@ -107,7 +115,20 @@ class SkillGateway:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise ValueError("sys_skill.call 的 arguments 必须是对象。")
-            return tool.handler(arguments)
+            if tool.name == "run_skill_script":
+                arguments = dict(arguments)
+                arguments.setdefault("skill_id", skill_id)
+            missing = [
+                str(name)
+                for name in (tool.parameters.get("required") or [])
+                if name not in arguments or arguments.get(name) in (None, "")
+            ]
+            if missing:
+                raise ValueError(
+                    f"技能工具 {skill_id}.{tool.name} 缺少必填参数：{', '.join(missing)}。"
+                    f"请先调用 sys_skill(op='show', skill_id='{skill_id}', tool_name='{tool.name}') 查看参数。"
+                )
+            return tool.handler(normalize_skill_tool_arguments(tool, arguments))
         raise ValueError(f"不支持的 sys_skill 操作：{op or '（空）'}")
 
     def _list_skills(self) -> str:
@@ -174,8 +195,28 @@ class SkillGateway:
         return [tools[name] for name in sorted(tools)]
 
     def _skill_tool_names(self) -> dict[str, set[str]]:
+        manifests = {manifest.id: manifest for manifest in self._enabled_manifests()}
         mapping: dict[str, set[str]] = {}
-        for manifest in self._enabled_manifests():
+
+        def names_for(skill_id: str, visiting: set[str] | None = None) -> set[str]:
+            """Resolve a skill's own tools plus explicitly declared dependencies.
+
+            Most skills remain isolated. Composite skills can declare
+            ``dependencies.skills`` when their workflow intentionally
+            orchestrates another skill's tools. The recursion guard keeps a
+            malformed dependency cycle harmless.
+            """
+
+            if skill_id in mapping:
+                return set(mapping[skill_id])
+            manifest = manifests.get(skill_id)
+            if manifest is None:
+                return set()
+            visiting = set(visiting or ())
+            if skill_id in visiting:
+                return set()
+            visiting.add(skill_id)
+
             names = {
                 str(item.get("name") or "").strip()
                 for item in manifest.native_tools
@@ -185,7 +226,13 @@ class SkillGateway:
                 names.add(manifest.tool_name)
             names.update(SKILL_TOOL_ALIASES.get(manifest.id, set()))
             names.update(COMMON_SKILL_TOOLS)
-            mapping[manifest.id] = names
+            for dependency_id in manifest.skill_dependencies:
+                names.update(names_for(dependency_id, visiting))
+            mapping[skill_id] = names
+            return set(names)
+
+        for skill_id in manifests:
+            names_for(skill_id)
         return mapping
 
     def _normalize_skill_id(self, raw_skill_id: Any) -> str:
@@ -232,3 +279,24 @@ class SkillGateway:
                 "arguments": {},
             },
         }
+
+
+def normalize_skill_tool_arguments(tool: Tool, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Accept stable cross-skill path aliases at the gateway boundary.
+
+    Audio skills historically call their source argument ``input_path`` while
+    office/document tools use ``path``.  The model can see the latter schema
+    after ``show``, but a recovered or long-running turn may still emit the
+    former name.  Normalizing here avoids a brittle ``KeyError`` without
+    changing the concrete tool contract or accepting paths outside the
+    workspace.
+    """
+
+    normalized = dict(arguments)
+    if tool.name == "process_office_document" and not str(normalized.get("path") or "").strip():
+        for alias in ("input_path", "audio_path", "transcript_path"):
+            value = str(normalized.get(alias) or "").strip()
+            if value:
+                normalized["path"] = value
+                break
+    return normalized

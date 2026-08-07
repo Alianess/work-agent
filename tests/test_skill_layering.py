@@ -9,6 +9,9 @@ from work_agent_core.cli import build_default_tools
 from work_agent_core.config import ModelProfile
 from work_agent_core.llm import OpenAICompatibleClient
 from work_agent_core.session_store import SessionStore
+from work_agent_core.skill_gateway import SkillGateway, normalize_skill_tool_arguments
+from work_agent_core.tool_bus import LocalToolProvider
+from work_agent_core.tools import Tool
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -42,9 +45,13 @@ class SkillLayeringTests(unittest.TestCase):
         self.assertEqual(model_names, CORE_MODEL_TOOLS)
         self.assertIn("transcribe_meeting_audio", all_names)
         self.assertIn("check_meeting_asr_progress", all_names)
+        self.assertIn("get_apple_schedule_status", all_names)
+        self.assertIn("list_apple_schedule", all_names)
+        self.assertIn("create_apple_reminder", all_names)
         self.assertIn("anysearch_search", all_names)
         self.assertNotIn("transcribe_meeting_audio", model_names)
         self.assertNotIn("anysearch_search", model_names)
+        self.assertNotIn("get_apple_schedule_status", model_names)
         with self.assertRaises(KeyError):
             self.bus.get_model_tool("transcribe_meeting_audio")
 
@@ -100,6 +107,7 @@ class SkillLayeringTests(unittest.TestCase):
         index = json.loads(gateway.handler({"op": "list"}))
         skills_by_id = {item["id"]: item for item in index["skills"]}
         self.assertIn("meeting-minutes", skills_by_id)
+        self.assertIn("apple-schedule", skills_by_id)
         self.assertIn("official-document", skills_by_id)
         self.assertTrue(skills_by_id["official-document"]["default_enabled"])
 
@@ -112,6 +120,13 @@ class SkillLayeringTests(unittest.TestCase):
         self.assertIn("sys_skill", opened["execution_guidance"])
         self.assertNotIn("create_docx_from_markdown", {item["name"] for item in opened["available_tools"]})
         self.assertNotIn("generate_meeting_minutes", {item["name"] for item in opened["available_tools"]})
+
+        apple_schedule = json.loads(
+            gateway.handler({"op": "open", "skill_id": "apple-schedule", "max_chars": 5000})
+        )
+        self.assertIn("get_apple_schedule_status", {item["name"] for item in apple_schedule["available_tools"]})
+        self.assertIn("list_apple_schedule", {item["name"] for item in apple_schedule["available_tools"]})
+        self.assertIn("create_apple_reminder", {item["name"] for item in apple_schedule["available_tools"]})
 
         official = json.loads(
             gateway.handler({"op": "open", "skill_id": "official-document", "max_chars": 8000})
@@ -126,6 +141,7 @@ class SkillLayeringTests(unittest.TestCase):
         self.assertIn("collect_work_report_evidence", report_tools)
         self.assertIn("save_work_report", report_tools)
         self.assertIn("read_saved_work_report", report_tools)
+        self.assertIn("delete_work_report", report_tools)
         self.assertIn("check_work_report_status", report_tools)
         self.assertIn("update_workday_calendar", report_tools)
 
@@ -163,7 +179,6 @@ class SkillLayeringTests(unittest.TestCase):
                     "arguments": {"query": "test"},
                 }
             )
-
         with self.assertRaises(KeyError):
             gateway.handler(
                 {
@@ -176,6 +191,100 @@ class SkillLayeringTests(unittest.TestCase):
                     },
                 }
             )
+
+    def test_sys_skill_reports_conditional_arguments_and_injects_scope(self) -> None:
+        gateway = self.bus.get_model_tool("sys_skill")
+        with self.assertRaisesRegex(ValueError, "skill_id"):
+            gateway.handler({"op": "show", "tool_name": "anysearch_search"})
+        with self.assertRaisesRegex(ValueError, "tool_name"):
+            gateway.handler({"op": "show", "skill_id": "anysearch"})
+
+        captured: list[dict] = []
+        provider = LocalToolProvider("script-test")
+        provider.register(
+            Tool(
+                name="run_skill_script",
+                description="test script runner",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "skill_id": {"type": "string"},
+                        "script_path": {"type": "string"},
+                    },
+                    "required": ["skill_id", "script_path"],
+                },
+                handler=lambda args: captured.append(dict(args)) or "ok",
+            )
+        )
+        scoped_gateway = SkillGateway(
+            WORKSPACE,
+            [provider],
+            enabled_skill_ids={"anysearch"},
+        ).as_tool()
+        self.assertEqual(
+            scoped_gateway.handler(
+                {
+                    "op": "call",
+                    "skill_id": "anysearch",
+                    "tool_name": "run_skill_script",
+                    "arguments": {"script_path": "scripts/probe.py"},
+                }
+            ),
+            "ok",
+        )
+        self.assertEqual(captured[0]["skill_id"], "anysearch")
+
+    def test_composite_skill_can_call_declared_skill_dependencies(self) -> None:
+        provider = LocalToolProvider("dependency-test", provider_kind="mcp")
+        for name in ("anysearch_search", "browser_navigate"):
+            provider.register(
+                Tool(
+                    name=name,
+                    description=name,
+                    parameters={"type": "object", "properties": {}},
+                    handler=lambda _args, name=name: name,
+                )
+            )
+
+        gateway = SkillGateway(
+            WORKSPACE,
+            [provider],
+            enabled_skill_ids={"company-verification", "anysearch", "edge-browser"},
+        ).as_tool()
+        opened = json.loads(
+            gateway.handler({"op": "open", "skill_id": "company-verification", "max_chars": 5000})
+        )
+        available = {item["name"] for item in opened["available_tools"]}
+        self.assertIn("anysearch_search", available)
+        self.assertIn("browser_navigate", available)
+        self.assertNotIn("company_verification_query", available)
+
+        result = gateway.handler(
+            {
+                "op": "call",
+                "skill_id": "company-verification",
+                "tool_name": "anysearch_search",
+                "arguments": {},
+            }
+        )
+        self.assertEqual(result, "anysearch_search")
+
+    def test_document_skill_accepts_audio_style_input_path_alias(self) -> None:
+        tool = Tool(
+            name="process_office_document",
+            description="test",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+            handler=lambda _args: "",
+        )
+        normalized = normalize_skill_tool_arguments(
+            tool,
+            {
+                "input_path": "meet_files/course.pdf",
+                "output_dir": "meet_files/course_materials",
+            },
+        )
+        self.assertEqual(normalized["path"], "meet_files/course.pdf")
+        self.assertEqual(normalized["output_dir"], "meet_files/course_materials")
 
 
 if __name__ == "__main__":

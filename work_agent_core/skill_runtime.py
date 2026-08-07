@@ -13,6 +13,7 @@ import sys
 import time
 
 from .progress import compact_preview_text, emit_tool_progress, next_command_id, run_logged_process
+from .office_preview import convert_office_to_pdf
 from .runtime_env import find_runtime_executable
 from .skill_manifest import (
     DEFAULT_MAX_SKILL_CHARS,
@@ -236,12 +237,20 @@ def register_skill_runtime_tools(
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
+                    "input_path": {
+                        "type": "string",
+                        "description": "兼容音频/会议技能的输入路径别名；优先使用 path。",
+                    },
                     "operation": {
                         "type": "string",
                         "enum": ["extract_text", "convert_to_markdown", "summarize_structure"],
                         "default": "extract_text",
                     },
                     "output_path": {"type": "string"},
+                    "output_dir": {
+                        "type": "string",
+                        "description": "未指定 output_path 时使用的输出目录。",
+                    },
                     "max_chars": {"type": "integer", "default": 50000},
                 },
                 "required": ["path"],
@@ -268,6 +277,32 @@ def register_skill_runtime_tools(
                 "required": ["output_path"],
             },
             handler=runtime.create_docx_from_markdown,
+        )
+    )
+    registry.register(
+        Tool(
+            name="docx_soffice",
+            description=(
+                "Structured DOCX-to-PDF conversion backed by an isolated LibreOffice profile. "
+                "Pass paths only; the backend supplies headless flags, output directory, timeout handling, "
+                "and verifies that a non-empty PDF was produced. Use only for an explicit PDF conversion "
+                "or layout diagnosis, not for routine Web DOCX preview."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "input_path": {
+                        "type": "string",
+                        "description": "Existing .docx source path under the workspace.",
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Optional target .pdf path; defaults beside the DOCX.",
+                    },
+                },
+                "required": ["input_path"],
+            },
+            handler=runtime.convert_docx_to_pdf,
         )
     )
     registry.register(
@@ -724,7 +759,9 @@ class SkillRuntime:
         if output_path:
             output_file = self.workspace.resolve(output_path)
         else:
-            output_dir = self.workspace.resolve("meet_files/office_extracts")
+            output_dir = self.workspace.resolve(
+                str(args.get("output_dir") or "meet_files/office_extracts")
+            )
             output_dir.mkdir(parents=True, exist_ok=True)
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             output_file = output_dir / f"{timestamp}-{sanitize_filename(source_path.stem)}.md"
@@ -1133,6 +1170,48 @@ class SkillRuntime:
         skill_id = str(args.get("skill_id") or "").strip() or None
         return json.dumps(
             probe_skill_environment(self.workspace_root, skill_id=skill_id),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def convert_docx_to_pdf(self, args: dict[str, Any]) -> str:
+        source_path = self.workspace.resolve(str(args.get("input_path") or ""))
+        if source_path.suffix.lower() != ".docx":
+            raise ValueError("input_path 必须是 .docx 文件。")
+        if not source_path.is_file():
+            raise FileNotFoundError(f"DOCX 文件不存在：{args.get('input_path')}")
+        raw_output = str(args.get("output_path") or "").strip()
+        output_path = (
+            self.workspace.resolve(raw_output)
+            if raw_output
+            else source_path.with_suffix(".pdf")
+        )
+        if output_path.suffix.lower() != ".pdf":
+            raise ValueError("output_path 必须以 .pdf 结尾。")
+        generated = convert_office_to_pdf(
+            source_path,
+            output_dir=output_path.parent,
+            workspace_root=self.workspace_root,
+        )
+        if generated.resolve() != output_path.resolve():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            generated.replace(output_path)
+        if not output_path.is_file() or output_path.stat().st_size <= 0:
+            raise RuntimeError("LibreOffice 返回成功，但没有生成有效 PDF。")
+        try:
+            output_label = str(output_path.relative_to(self.workspace_root))
+            source_label = str(source_path.relative_to(self.workspace_root))
+        except ValueError:
+            output_label = str(output_path)
+            source_label = str(source_path)
+        return json.dumps(
+            {
+                "ok": True,
+                "source_path": source_label,
+                "output_path": output_label,
+                "verified": True,
+                "size_bytes": output_path.stat().st_size,
+            },
             ensure_ascii=False,
             indent=2,
         )

@@ -227,14 +227,26 @@ class MCPStdioSession:
         process = self.process
         self.process = None
         self.initialized = False
-        if not process or process.poll() is not None:
+        if not process:
             return
-        try:
-            process.terminate()
-            process.wait(timeout=2)
-        except Exception:
+        if process.poll() is None:
             try:
-                process.kill()
+                process.terminate()
+                process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=1)
+                except Exception:
+                    pass
+        # Popen can have created pipes before initialize fails. Close them even
+        # when the child already exited; otherwise every failed MCP probe leaks
+        # TextIOWrapper objects and the process emits ResourceWarnings at exit.
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
             except Exception:
                 pass
 

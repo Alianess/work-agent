@@ -108,10 +108,11 @@ cp config/asr_settings.example.json config/asr_settings.json
 cp config/mcp_servers.example.json config/mcp_servers.json
 ```
 
-然后至少完成两项设置：
+然后至少完成三项设置：
 
 1. 在 `.env` 中设置一个不少于 8 位的首次管理员密码；
-2. 设置模型 API Key，并让 `config/model_profiles.json` 的 `api_key_env` 指向对应环境变量。
+2. 设置 `WORK_AGENT_INVITE_CODE`，只有持有该邀请码的人才能注册普通账户；未配置时关闭新用户注册；
+3. 设置模型 API Key，并让 `config/model_profiles.json` 的 `api_key_env` 指向对应环境变量。
 
 新安装不会创建弱默认账户。模型 profile 由用户手动选择，运行时不会擅自替你更换到另一个模型。
 

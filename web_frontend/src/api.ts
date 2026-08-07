@@ -2,6 +2,8 @@ import type {
   AgentResult,
   AgentChatResult,
   AgentSettingsPayload,
+  ApplePimItemsPayload,
+  ApplePimStatus,
   AgentStreamEvent,
   AsrSettingsPayload,
   AttachmentPayload,
@@ -17,11 +19,14 @@ import type {
   MeetingResult,
   MeetingMinutesSettingsPayload,
   ModelsPayload,
+  OfficePdfInput,
+  OfficePdfMergePayload,
   Project,
   ProjectSummary,
   ProjectsPayload,
   ReasoningEffort,
   RealtimeTranscriptSavePayload,
+  RealtimeTranscriptSessionPayload,
   SkillsPayload,
   SkillInstructionsPayload,
   SpeechVadPayload,
@@ -77,6 +82,20 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   return data;
 }
 
+async function uploadFile<T>(path: string, file: File): Promise<T> {
+  const query = new URLSearchParams({
+    name: file.name,
+    mime_type: file.type || "application/octet-stream",
+    last_modified: String(file.lastModified || "")
+  });
+  return requestJson<T>(`${path}?${query.toString()}`, {
+    method: "POST",
+    // Keep the file out of JSON/base64 so public proxies see the real size.
+    body: file,
+    headers: { "Content-Type": file.type || "application/octet-stream" }
+  });
+}
+
 export const api = {
   authMe: () => requestJson<AuthPayload>("/api/auth/me"),
   login: (username: string, password: string) =>
@@ -84,10 +103,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ username, password })
     }),
-  register: (username: string, password: string) =>
+  register: (username: string, password: string, inviteCode: string) =>
     requestJson<AuthPayload>("/api/auth/register", {
       method: "POST",
-      body: JSON.stringify({ username, password })
+      body: JSON.stringify({ username, password, invite_code: inviteCode })
     }),
   logout: () =>
     requestJson<{ ok: boolean }>("/api/auth/logout", {
@@ -129,6 +148,20 @@ export const api = {
       body: JSON.stringify({})
     }),
   notifications: () => requestJson<FridayNotificationsPayload>("/api/notifications"),
+  applePimStatus: () => requestJson<ApplePimStatus>("/api/apple-pim/status"),
+  applePimAccess: (events: boolean, reminders: boolean) =>
+    requestJson<{ ok: boolean; events_granted?: boolean | null; reminders_granted?: boolean | null; status: ApplePimStatus }>(
+      "/api/apple-pim/access",
+      { method: "POST", body: JSON.stringify({ events, reminders }) }
+    ),
+  applePimItems: (params?: { start_at?: string; end_at?: string; include_events?: boolean; include_reminders?: boolean }) => {
+    const query = new URLSearchParams();
+    if (params?.start_at) query.set("start_at", params.start_at);
+    if (params?.end_at) query.set("end_at", params.end_at);
+    if (params?.include_events === false) query.set("include_events", "false");
+    if (params?.include_reminders === false) query.set("include_reminders", "false");
+    return requestJson<ApplePimItemsPayload>(`/api/apple-pim/items${query.size ? `?${query}` : ""}`);
+  },
   workReportCalendar: (year: number, month: number) =>
     requestJson<WorkCalendarPayload>(`/api/work-reports/calendar?year=${year}&month=${month}`),
   workReportDay: (date: string) =>
@@ -387,6 +420,11 @@ export const api = {
       `/api/projects/${encodeURIComponent(projectId)}/files/add`,
       { method: "POST", body: JSON.stringify(payload) }
     ),
+  uploadProjectFile: (projectId: string, file: File) =>
+    uploadFile<{ project: Project; file: unknown; attachment: AttachmentPayload["attachment"] }>(
+      `/api/projects/${encodeURIComponent(projectId)}/files/upload`,
+      file
+    ),
   deleteProjectFile: (projectId: string, path: string) =>
     requestJson<{ ok: boolean; project: Project }>(
       `/api/projects/${encodeURIComponent(projectId)}/files/delete`,
@@ -454,6 +492,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
+  uploadAttachment: (file: File) => uploadFile<AttachmentPayload>("/api/attachments/upload", file),
+  addOfficePdf: (payload: { name: string; mime_type: string; content_base64: string }) =>
+    requestJson<{ ok: boolean; input: OfficePdfInput; message: string }>("/api/office-workspace/pdf/add", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  mergeOfficePdfs: (payload: { source_paths: string[]; output_name: string }) =>
+    requestJson<OfficePdfMergePayload>("/api/office-workspace/pdf/merge", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
   temporarySync: () => requestJson<TemporarySyncPayload>("/api/temporary-sync"),
   saveTemporarySyncText: (content: string) =>
     requestJson<{
@@ -483,6 +532,11 @@ export const api = {
     content_base64: string;
     use_denoise?: boolean;
     skip_if_silent?: boolean;
+    realtime_session_id?: string;
+    segment_index?: number;
+    started_at?: number;
+    finished_at?: number;
+    title?: string;
   }) =>
     requestJson<SpeechTranscriptionPayload>("/api/speech/transcribe", {
       method: "POST",
@@ -500,11 +554,30 @@ export const api = {
     }),
   saveRealtimeTranscript: (payload: {
     title: string;
-    segments: Array<{ index: number; text: string; started_at: number; finished_at: number }>;
+    session_id: string;
+    segments: Array<{
+      index: number;
+      text: string;
+      started_at: number;
+      finished_at: number;
+      audio_path?: string;
+      transcript_path?: string;
+      engine?: string;
+      asr_elapsed_ms?: number;
+    }>;
   }) =>
     requestJson<RealtimeTranscriptSavePayload>("/api/realtime-transcript/save", {
       method: "POST",
       body: JSON.stringify(payload)
+    }),
+  realtimeTranscriptSession: (sessionId: string) =>
+    requestJson<RealtimeTranscriptSessionPayload>(
+      `/api/realtime-transcript/session?session_id=${encodeURIComponent(sessionId)}`
+    ),
+  retryRealtimeTranscriptSegment: (sessionId: string, segmentIndex: number) =>
+    requestJson<SpeechTranscriptionPayload>("/api/realtime-transcript/retry", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId, segment_index: segmentIndex })
     }),
   files: (path: string, limit = 500) =>
     requestJson<FilesPayload>(

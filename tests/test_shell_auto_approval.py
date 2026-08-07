@@ -7,13 +7,14 @@ import unittest
 from pathlib import Path
 
 from work_agent_core.shell_tools import ShellExecutionTools, approval_action_id, issue_internal_approval_grant
+from tests.execution_test_support import trusted_shell_tools_for_test
 
 
 class ShellAutoApprovalTests(unittest.TestCase):
     def test_workspace_artifact_command_is_delegatable(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
-                ShellExecutionTools(workspace).execute({"command": "mkdir generated"})
+                trusted_shell_tools_for_test(workspace).execute({"command": "mkdir generated"})
             )
 
         self.assertEqual(payload["status"], "approval_required")
@@ -23,7 +24,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
     def test_general_python_script_is_not_delegatable(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
-                ShellExecutionTools(workspace).execute({"command": "python script.py"})
+                trusted_shell_tools_for_test(workspace).execute({"command": "python script.py"})
             )
 
         self.assertEqual(payload["status"], "approval_required")
@@ -33,7 +34,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
     def test_package_install_is_not_delegatable(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
-                ShellExecutionTools(workspace).execute({"command": "npm install"})
+                trusted_shell_tools_for_test(workspace).execute({"command": "npm install"})
             )
 
         self.assertEqual(payload["status"], "approval_required")
@@ -43,7 +44,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
     def test_public_approved_by_user_flag_cannot_bypass_policy(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
-                ShellExecutionTools(workspace).execute(
+                trusted_shell_tools_for_test(workspace).execute(
                     {"command": "mkdir generated", "approved_by_user": True}
                 )
             )
@@ -52,7 +53,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
 
     def test_internal_grant_is_bound_to_exact_action(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            tools = ShellExecutionTools(workspace)
+            tools = trusted_shell_tools_for_test(workspace)
             wrong = json.loads(
                 tools.execute(
                     {
@@ -92,7 +93,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
                 timeout_seconds=120,
             )
             payload = json.loads(
-                ShellExecutionTools(workspace).execute(
+                trusted_shell_tools_for_test(workspace).execute(
                     {
                         "command": "mkdir generated",
                         "_approval_source": "user",
@@ -106,7 +107,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
     def test_unknown_command_cannot_reference_path_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
-                ShellExecutionTools(workspace).execute({"command": "unknown-tool /etc/passwd"})
+                trusted_shell_tools_for_test(workspace).execute({"command": "unknown-tool /etc/passwd"})
             )
 
         self.assertEqual(payload["status"], "denied")
@@ -116,7 +117,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as workspace:
             target = Path(workspace) / "generated.txt"
             target.write_text("temporary", encoding="utf-8")
-            tools = ShellExecutionTools(workspace)
+            tools = trusted_shell_tools_for_test(workspace)
             result = json.loads(tools.execute({"command": "rm generated.txt"}))
 
             self.assertEqual(result["status"], "approval_required")
@@ -131,7 +132,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
             first.write_text("first", encoding="utf-8")
             second.write_text("second", encoding="utf-8")
             payload = json.loads(
-                ShellExecutionTools(workspace).execute({"command": "rm first.txt second.txt"})
+                trusted_shell_tools_for_test(workspace).execute({"command": "rm first.txt second.txt"})
             )
 
         self.assertEqual(payload["status"], "approval_required")
@@ -140,7 +141,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
 
     def test_find_side_effect_predicates_are_hard_denied(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            tools = ShellExecutionTools(workspace)
+            tools = trusted_shell_tools_for_test(workspace)
             payload = json.loads(tools.execute({"command": "find . -delete"}))
 
         self.assertEqual(payload["status"], "denied")
@@ -149,15 +150,33 @@ class ShellAutoApprovalTests(unittest.TestCase):
     def test_read_only_find_remains_auto_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
-                ShellExecutionTools(workspace).execute({"command": "find . -name '*.txt'"})
+                trusted_shell_tools_for_test(workspace).execute({"command": "find . -name '*.txt'"})
             )
 
         self.assertEqual(payload["status"], "executed")
         self.assertEqual(payload["permission"], "allow")
 
+    def test_native_tool_call_id_is_idempotent_within_a_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(
+                workspace,
+                account_id="account-1",
+                turn_id="turn-1",
+            )
+            first = json.loads(
+                tools.execute({"command": "find . -name '*.txt'", "_execution_tool_call_id": "call-1"})
+            )
+            second = json.loads(
+                tools.execute({"command": "find . -name '*.txt'", "_execution_tool_call_id": "call-1"})
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(first["execution_id"], second["execution_id"])
+
     def test_recursive_or_broad_delete_is_hard_denied(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            tools = ShellExecutionTools(workspace)
+            tools = trusted_shell_tools_for_test(workspace)
             recursive = json.loads(tools.execute({"command": "rm -rf generated"}))
             wildcard = json.loads(tools.execute({"command": "rm *.tmp"}))
             root = json.loads(tools.execute({"command": "rm ."}))
@@ -169,7 +188,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
     def test_delete_outside_workspace_is_hard_denied(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
-                ShellExecutionTools(workspace).execute({"command": "rm /tmp/outside.txt"})
+                trusted_shell_tools_for_test(workspace).execute({"command": "rm /tmp/outside.txt"})
             )
 
         self.assertEqual(payload["status"], "denied")

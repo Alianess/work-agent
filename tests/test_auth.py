@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from datetime import datetime
+from unittest.mock import patch
 
 from work_agent_core.auth import AuthStore
 from work_agent_core import web_server
@@ -54,6 +56,16 @@ class AuthStoreTests(unittest.TestCase):
         self.store.change_password(user.id, "old-pass-123", "new-pass-456")
         self.assertIsNone(self.store.authenticate("member.two", "old-pass-123"))
         self.assertEqual(self.store.authenticate("member.two", "new-pass-456"), user)
+
+    def test_registration_requires_configured_invite_code(self) -> None:
+        with patch.dict(web_server.os.environ, {"WORK_AGENT_INVITE_CODE": "team-invite-2026"}):
+            web_server.validate_registration_invite({"invite_code": "team-invite-2026"})
+            with self.assertRaisesRegex(ValueError, "邀请码无效"):
+                web_server.validate_registration_invite({"invite_code": "wrong-code"})
+
+        with patch.dict(web_server.os.environ, {"WORK_AGENT_INVITE_CODE": ""}):
+            with self.assertRaisesRegex(ValueError, "注册已关闭"):
+                web_server.validate_registration_invite({"invite_code": "anything"})
 
     def test_account_conversations_and_settings_are_separate(self) -> None:
         original_root = web_server.WORKSPACE_ROOT
@@ -108,6 +120,10 @@ class AuthStoreTests(unittest.TestCase):
             )
             context = web_server.agent_system_context(mode="friday")
             self.assertIn("项目经理助理“周五”", context)
+            self.assertNotIn("系统当前本地日期时间（本轮提示词生成时读取，含时区偏移）", context)
+            turn_time_context = web_server.agent_turn_time_context()
+            self.assertIn("系统当前本地日期时间（本轮提示词生成时读取，含时区偏移）", turn_time_context)
+            self.assertIn(datetime.now().astimezone().date().isoformat(), turn_time_context)
             self.assertIn("公司标准文件格式（纯文字设置）", context)
             self.assertIn("official-document", context)
             task_context = web_server.agent_system_context(mode="task")

@@ -8,6 +8,23 @@
       "cwd": ".",
       "env": {},
       "enabled": false
+    },
+    "weixin-search-mcp": {
+      "skill_id": "weixin-search",
+      "type": "stdio",
+      "description": "微信公众号文章搜索与正文提取；通过搜狗微信搜索提供有限范围检索。",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "weixin-search-mcp",
+        "--with",
+        "pydantic-settings",
+        "--with",
+        "mcp<2",
+        "python",
+        "work_agent_skills/weixin-search/scripts/weixin_search_mcp_server.py"
+      ],
+      "enabled": false
     }
   }
 }

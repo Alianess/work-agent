@@ -5,6 +5,7 @@ from urllib.parse import quote
 import os
 import shutil
 import subprocess
+import tempfile
 
 
 OFFICE_TO_PDF_EXTENSIONS = {
@@ -31,29 +32,31 @@ def convert_office_to_pdf(source_path: Path, *, output_dir: Path, workspace_root
 
     soffice = find_soffice()
     output_dir.mkdir(parents=True, exist_ok=True)
-    profile_dir = workspace_root / "tmp" / "libreoffice-profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    command = [
-        str(soffice),
-        "--headless",
-        f"-env:UserInstallation={profile_uri(profile_dir)}",
-        "--convert-to",
-        "pdf",
-        "--outdir",
-        str(output_dir),
-        str(source_path),
-    ]
-    result = subprocess.run(
-        command,
-        cwd=workspace_root,
-        env=office_preview_env(workspace_root),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=300,
-        check=False,
-    )
+    # LibreOffice locks its user profile. A shared profile makes concurrent
+    # document previews wait on one another and can look like a 300s hang.
+    profile_parent = workspace_root / "tmp" / "libreoffice-profiles"
+    profile_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="preview-", dir=profile_parent) as profile_dir:
+        command = [
+            str(soffice),
+            "--headless",
+            f"-env:UserInstallation={profile_uri(Path(profile_dir))}",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(output_dir),
+            str(source_path),
+        ]
+        result = subprocess.run(
+            command,
+            cwd=workspace_root,
+            env=office_preview_env(workspace_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+            check=False,
+        )
     expected = output_dir / f"{source_path.stem}.pdf"
     if result.returncode != 0 or not expected.is_file():
         detail = (result.stderr or result.stdout or "").strip()

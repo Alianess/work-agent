@@ -1,0 +1,15 @@
+{
+  "id": "apple-schedule",
+  "label": "苹果日程与提醒",
+  "mention": "@日程",
+  "description": "读取当前 Mac 已同步的 Apple 日历和提醒事项；“待办事项”固定指 Apple 提醒事项，并可在用户明确指令下由 AI 新增提醒。",
+  "when_to_use": "用户询问今天、近期或指定日期的 Apple 日历安排、待办提醒，询问“我有什么待办”，或明确要求 AI 新增 Apple 待办时使用。",
+  "tool_name": "get_apple_schedule_status",
+  "outputs": [
+    "日历安排",
+    "未完成提醒事项",
+    "明确指令下新增的 Apple 提醒事项",
+    "macOS EventKit 授权状态"
+  ],
+  "default_enabled": true
+}

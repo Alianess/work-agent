@@ -36,4 +36,4 @@ Do not infer names, organisations, figures, locations, commitments, ownership, t
 
 ## Document handoff
 
-When a Word file is requested, send the final Markdown plus semantic roles to the document workflow. Use a user-provided template only when it is authorised for that output. Validate the generated file and visually inspect rendered pages before delivery.
+When a Word file is requested, send the final Markdown plus semantic roles to the document workflow. Use a user-provided template only when it is authorised for that output. Validate the generated DOCX structurally before delivery. Do not require model-side PDF rendering for routine completion: opening the DOCX in the Web file viewer generates the preview, and the user performs the visual acceptance. Convert or render only for an explicit PDF/image request or a reported layout problem.

@@ -56,8 +56,14 @@ dates still missing a daily report.
    `read_saved_work_report` through this skill instead. Use
    `source_coverage=external_gap` and `needs_user_input=true` when offline work
    is missing; otherwise use `partial` or `full` according to the evidence.
-9. Finalize only after `save_work_report` returns `verified=true`. Cite the saved report path
-   and mention any dates still requiring user input.
+9. When the user explicitly identifies an erroneous saved report for removal, call
+   `delete_work_report` with the exact report type and date/range. It removes the
+   Markdown and metadata files and returns `verified=true` only after both are
+   confirmed absent. Never delete a report based only on a missing-date status or
+   an inferred date.
+10. Finalize only after `save_work_report` or `delete_work_report` returns `verified=true`.
+   Cite the saved report path or deleted paths and mention any dates still requiring
+   user input.
 
 ## Correction and verification routing
 

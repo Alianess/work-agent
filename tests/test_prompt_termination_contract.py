@@ -34,6 +34,22 @@ class PromptTerminationContractTests(unittest.TestCase):
         self.assertIn("本轮尚未成功执行写入/生成类工具并完成相应核验", prompt)
         self.assertIn("查看工具参数、环境预检", prompt)
         self.assertIn("已经存在且已核验的产物路径", prompt)
+        self.assertIn("个人待办语义规则", prompt)
+        self.assertIn("待办事项只指 Apple「提醒事项」", prompt)
+        self.assertIn("不得从项目、日报、会议纪要、历史对话或工作上下文推测任务", prompt)
+
+    def test_apple_schedule_skill_distinguishes_reminders_from_work_tasks(self) -> None:
+        skill_text = (
+            Path(__file__).resolve().parents[1]
+            / "work_agent_skills"
+            / "apple-schedule"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("待办事项只指 Apple「提醒事项」", skill_text)
+        self.assertIn("include_events=false", skill_text)
+        self.assertIn("create_apple_reminder", skill_text)
+        self.assertIn("不能新增日历事件", skill_text)
 
     def test_meeting_minutes_skill_has_artifact_completion_gate(self) -> None:
         skill_text = (
@@ -47,7 +63,9 @@ class PromptTerminationContractTests(unittest.TestCase):
         self.assertIn("## Completion gate", skill_text)
         self.assertIn("They are never a completed result", skill_text)
         self.assertIn("canonical_outputs", skill_text)
-        self.assertIn("rendered-page visual QA", skill_text)
+        self.assertIn("the Web file viewer generates the preview automatically", skill_text)
+        self.assertIn("Do not wait for or simulate human page-layout acceptance", skill_text)
+        self.assertNotIn("rendered-page visual QA", skill_text)
         self.assertIn("existing path as `canonical_outputs.asr`", skill_text)
         self.assertIn("Never manually replay a large ASR", skill_text)
         self.assertIn("The ASR path may point to the existing completed transcript", skill_text)

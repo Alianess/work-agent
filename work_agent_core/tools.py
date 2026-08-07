@@ -137,6 +137,7 @@ class WorkspaceFiles:
             raise ValueError("patch 不能为空。")
         touched_paths = validate_unified_patch_paths(patch_text, self.workspace_root)
         additions, deletions = count_patch_changes(patch_text)
+        file_changes = count_patch_file_changes(patch_text)
         activity_id = next_command_id()
         display_paths = ", ".join(touched_paths) or "unknown"
         emit_tool_progress(
@@ -154,6 +155,7 @@ class WorkspaceFiles:
                 "file_path": display_paths,
                 "additions": additions,
                 "deletions": deletions,
+                "file_changes": file_changes,
             }
         )
         result = subprocess.run(
@@ -178,6 +180,7 @@ class WorkspaceFiles:
                     "file_path": display_paths,
                     "additions": additions,
                     "deletions": deletions,
+                    "file_changes": file_changes,
                 }
             )
             raise RuntimeError(f"patch 应用失败：{result.stderr or result.stdout}")
@@ -194,6 +197,7 @@ class WorkspaceFiles:
                 "file_path": display_paths,
                 "additions": additions,
                 "deletions": deletions,
+                "file_changes": file_changes,
             }
         )
         return json.dumps(
@@ -374,6 +378,32 @@ def count_patch_changes(patch_text: str) -> tuple[int, int]:
         elif line.startswith("-") and not line.startswith("---"):
             deletions += 1
     return additions, deletions
+
+
+def count_patch_file_changes(patch_text: str) -> list[dict[str, Any]]:
+    """Return per-file line totals for a validated unified patch."""
+
+    changes: dict[str, dict[str, Any]] = {}
+    current_path = ""
+    for line in patch_text.splitlines():
+        if line.startswith("+++ "):
+            raw_path = line[4:].strip().split("\t", 1)[0]
+            if raw_path == "/dev/null":
+                current_path = ""
+                continue
+            current_path = raw_path[2:] if raw_path.startswith(("a/", "b/")) else raw_path
+            changes.setdefault(
+                current_path,
+                {"file_path": current_path, "additions": 0, "deletions": 0},
+            )
+            continue
+        if not current_path:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            changes[current_path]["additions"] += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            changes[current_path]["deletions"] += 1
+    return list(changes.values())
 
 
 def clip_text(value: str, limit: int, *, suffix: str = "\n...[truncated]") -> str:

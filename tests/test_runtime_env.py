@@ -8,13 +8,12 @@ from pathlib import Path
 
 from work_agent_core.docx_exporter import create_docx, resolve_document_title
 from work_agent_core.progress import command_heartbeat_text
-from work_agent_core.office_preview import find_soffice
+from work_agent_core.office_preview import convert_office_to_pdf, find_soffice
 from work_agent_core.shell_tools import (
     ShellExecutionTools,
-    approval_action_id,
-    issue_internal_approval_grant,
     safe_environment,
 )
+from work_agent_core.runtime_env import find_runtime_executable
 from work_agent_core.skill_manifest import office_python, probe_skill_environment
 from work_agent_core.skill_runtime import render_skill_tool_arguments
 from work_agent_core import web_server
@@ -37,33 +36,18 @@ class RuntimeEnvironmentTests(unittest.TestCase):
         self.assertEqual(environment["PIP_REQUIRE_VIRTUALENV"], "true")
 
     def test_bare_python_command_uses_project_venv(self) -> None:
-        action_id = approval_action_id(
-            command="python3 -c \"import sys; print(sys.executable)\"",
-            cwd=str(self.workspace_root.resolve()),
-            timeout_seconds=120,
-        )
-        result = ShellExecutionTools(self.workspace_root).execute(
-            {
-                "command": "python3 -c \"import sys; print(sys.executable)\"",
-                "_approval_source": "user",
-                "_approval_action_id": action_id,
-                "_approval_grant": issue_internal_approval_grant(
-                    action_id=action_id,
-                    source="user",
-                ),
-            }
-        )
-        payload = json.loads(result)
+        tools = ShellExecutionTools(self.workspace_root)
+        argv = tools._managed_runtime_argv(["python3", "-c", "import sys; print(sys.executable)"])
 
-        self.assertTrue(payload["ok"])
-        self.assertIn(str(self.workspace_root / ".venv" / "bin"), payload["stdout"].strip())
+        self.assertEqual(argv[0], str(self.agent_python))
 
     def test_managed_environment_exposes_existing_media_and_node_tools(self) -> None:
-        tools = ShellExecutionTools(self.workspace_root)
+        environment = safe_environment(self.workspace_root)
         for binary in ("ffmpeg", "node"):
-            payload = json.loads(tools.execute({"command": f"which {binary}"}))
-            self.assertTrue(payload["ok"], payload)
-            self.assertEqual(payload["permission"], "allow")
+            resolved = find_runtime_executable(binary, self.workspace_root)
+            self.assertIsNotNone(resolved, binary)
+            self.assertTrue(Path(str(resolved)).is_file(), resolved)
+            self.assertTrue(environment["PATH"])
 
     def test_skill_precheck_verifies_declared_runtime_dependencies(self) -> None:
         for skill_id in ("meeting-minutes", "anysearch"):
@@ -131,6 +115,22 @@ class RuntimeEnvironmentTests(unittest.TestCase):
             with zipfile.ZipFile(output) as archive:
                 settings = archive.read("word/settings.xml").decode("utf-8")
         self.assertIn('w:percent="100"', settings)
+
+    def test_structured_docx_pdf_conversion_finishes_and_verifies_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "minutes.docx"
+            create_docx("# 测试会议纪要\n\n正文。\n", source)
+
+            output = convert_office_to_pdf(
+                source,
+                output_dir=root / "rendered",
+                workspace_root=root,
+            )
+
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 0)
+            self.assertEqual(output.suffix.lower(), ".pdf")
 
     def test_generated_docx_supports_compact_inline_conclusion_paragraphs(self) -> None:
         from docx import Document

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from hashlib import sha256
 import json
 import math
 import re
+import threading
 import time
 
 from .config import ModelProfile
@@ -46,6 +47,17 @@ class ContextCompactionError(RuntimeError):
     """The configured model could not produce a trustworthy continuation summary."""
 
 
+class ContextCompactionCancelled(RuntimeError):
+    """The user cancelled while a continuation summary was being generated."""
+
+
+@dataclass(frozen=True)
+class SessionMemoryInspection:
+    messages: list[dict[str, Any]]
+    covered_count: int
+    estimated_tokens: int
+
+
 @dataclass(frozen=True)
 class PreparedSessionMemory:
     messages: list[dict[str, Any]]
@@ -56,6 +68,37 @@ class PreparedSessionMemory:
     system_context: str
 
 
+def inspect_session_memory(
+    session: ConversationSession,
+    *,
+    reserved_tokens: int = 0,
+) -> SessionMemoryInspection:
+    """Sanitize and account for a session once, without mutating it."""
+    messages = [
+        message for message in (sanitize_runtime_message(item) for item in session.messages) if message
+    ]
+    messages = repair_runtime_message_sequence(messages)
+    covered_count = min(max(0, int(session.summary_message_count or 0)), len(messages))
+    if not str(session.summary or "").strip():
+        covered_count = 0
+    estimated_tokens = (
+        estimate_messages_tokens(messages[covered_count:])
+        + estimate_context_tokens(session.summary)
+        + max(0, int(reserved_tokens))
+    )
+    return SessionMemoryInspection(
+        messages=messages,
+        covered_count=covered_count,
+        estimated_tokens=estimated_tokens,
+    )
+
+
+def estimate_session_memory_tokens(session: ConversationSession, *, reserved_tokens: int = 0) -> int:
+    """Return the estimated request size without mutating the session."""
+
+    return inspect_session_memory(session, reserved_tokens=reserved_tokens).estimated_tokens
+
+
 def prepare_session_memory(
     client: OpenAICompatibleClient,
     profile: ModelProfile,
@@ -63,17 +106,13 @@ def prepare_session_memory(
     *,
     reserved_tokens: int = 0,
     force: bool = False,
+    inspection: SessionMemoryInspection | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> PreparedSessionMemory:
-    session.messages = [
-        message for message in (sanitize_runtime_message(item) for item in session.messages) if message
-    ]
-    session.messages = repair_runtime_message_sequence(session.messages)
-    if session.summary_message_count > len(session.messages):
-        session.summary_message_count = len(session.messages)
-    if not session.summary:
-        session.summary_message_count = 0
-
-    covered_count = min(session.summary_message_count, len(session.messages))
+    inspected = inspection or inspect_session_memory(session, reserved_tokens=reserved_tokens)
+    session.messages = list(inspected.messages)
+    session.summary_message_count = inspected.covered_count
+    covered_count = inspected.covered_count
     archive_is_stale = any(
         int(item.get("archive_version") or 0) != RECALL_ARCHIVE_VERSION
         for item in session.recall_episodes
@@ -87,11 +126,7 @@ def prepare_session_memory(
             session.messages[:covered_count]
         )
     unsummarized_messages = session.messages[covered_count:]
-    estimated_tokens = (
-        estimate_messages_tokens(unsummarized_messages)
-        + estimate_context_tokens(session.summary)
-        + max(0, int(reserved_tokens))
-    )
+    estimated_tokens = inspected.estimated_tokens
 
     if not force and estimated_tokens < CHAT_SUMMARY_TRIGGER_TOKENS:
         recent = runtime_messages_with_retained_turns(
@@ -124,7 +159,13 @@ def prepare_session_memory(
             system_context=render_summary_system_context(session.summary),
         )
 
-    summary = summarize_session_messages(client, profile, session.summary, completed_messages)
+    summary = summarize_session_messages(
+        client,
+        profile,
+        session.summary,
+        completed_messages,
+        cancel_check=cancel_check,
+    )
 
     next_covered_count = covered_count + len(completed_messages)
     session.recall_episodes = build_recall_episodes(
@@ -182,50 +223,86 @@ def summarize_session_messages(
     profile: ModelProfile,
     existing_summary: str,
     older_messages: list[dict[str, Any]],
+    *,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> str:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是项目经理助理的高保真“当前任务断点续作”压缩器。你的唯一任务是把"
+                "已有工作摘要与本次已完成的 messages 滚动合并，使上下文被截断后仍能"
+                "从当前进度继续工作，而不必从头开始。这不是长期记忆、用户画像、人物库、"
+                "项目档案或跨会话知识整理；不得为了未来可能有用而扩写。只能记录输入中"
+                "与当前任务延续有关的事实，不得推断或补充。\n\n"
+                "保真规则：\n"
+                "1. 所有会影响后续行动的目标、决定、承诺、纠正、未完成项都必须保留；"
+                "不要为了简短合并掉不同事项。\n"
+                "2. 人名、公司名、项目名、日期、时间、金额、数量、版本、状态、路径、URL、"
+                "错误文本和责任边界应尽量原样保留。\n"
+                "3. 已有摘要中的信息，只有在新增 messages 明确否定、纠正或取代它时才能"
+                "删除；发生冲突时同时写明旧说法、新说法和当前采用版本。\n"
+                "4. 工具调用不必逐字复制参数，但必须保留工具名、关键输入范围、成功结果、"
+                "失败原因、部分完成状态、生成文件、待审批动作和仍可复用的中间结果。\n"
+                "5. 区分已确认事实、模型建议和待核实信息；不要把建议写成既成事实。\n"
+                "6. 每个栏目可以有任意数量条目，以信息完整为先；确实没有内容才写“无”。\n"
+                "7. 最近两轮的完整 ReAct 工具链也在输入中；把其中会影响续作的信息并入"
+                "摘要，不要因为运行时还会展示最近两轮最终回答而省略工具证据。\n"
+                "8. 使用紧凑 Markdown 条目，不写寒暄、修辞、思维链或重复内容。\n\n"
+                "必须严格使用以下八个二级标题，保持顺序：\n"
+                + "\n".join(f"## {section}" for section in CHAT_SUMMARY_SECTIONS)
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "已有摘要：\n"
+                f"{existing_summary or '（无）'}\n\n"
+                "本次需要并入工作摘要的完整已完成 messages：\n"
+                f"{serialize_runtime_messages_for_summary(older_messages)}"
+            ),
+        },
+    ]
     try:
-        response = client.chat(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "你是项目经理助理的高保真“当前任务断点续作”压缩器。你的唯一任务是把"
-                    "已有工作摘要与本次已完成的 messages 滚动合并，使上下文被截断后仍能"
-                    "从当前进度继续工作，而不必从头开始。这不是长期记忆、用户画像、人物库、"
-                    "项目档案或跨会话知识整理；不得为了未来可能有用而扩写。只能记录输入中"
-                    "与当前任务延续有关的事实，不得推断或补充。\n\n"
-                    "保真规则：\n"
-                    "1. 所有会影响后续行动的目标、决定、承诺、纠正、未完成项都必须保留；"
-                    "不要为了简短合并掉不同事项。\n"
-                    "2. 人名、公司名、项目名、日期、时间、金额、数量、版本、状态、路径、URL、"
-                    "错误文本和责任边界应尽量原样保留。\n"
-                    "3. 已有摘要中的信息，只有在新增 messages 明确否定、纠正或取代它时才能"
-                    "删除；发生冲突时同时写明旧说法、新说法和当前采用版本。\n"
-                    "4. 工具调用不必逐字复制参数，但必须保留工具名、关键输入范围、成功结果、"
-                    "失败原因、部分完成状态、生成文件、待审批动作和仍可复用的中间结果。\n"
-                    "5. 区分已确认事实、模型建议和待核实信息；不要把建议写成既成事实。\n"
-                    "6. 每个栏目可以有任意数量条目，以信息完整为先；确实没有内容才写“无”。\n"
-                    "7. 最近两轮的完整 ReAct 工具链也在输入中；把其中会影响续作的信息并入"
-                    "摘要，不要因为运行时还会展示最近两轮最终回答而省略工具证据。\n"
-                    "8. 使用紧凑 Markdown 条目，不写寒暄、修辞、思维链或重复内容。\n\n"
-                    "必须严格使用以下八个二级标题，保持顺序：\n"
-                    + "\n".join(f"## {section}" for section in CHAT_SUMMARY_SECTIONS)
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "已有摘要：\n"
-                    f"{existing_summary or '（无）'}\n\n"
-                    "本次需要并入工作摘要的完整已完成 messages：\n"
-                    f"{serialize_runtime_messages_for_summary(older_messages)}"
-                ),
-            },
-        ],
-            profile=profile,
-            max_tokens=CHAT_SUMMARY_MAX_TOKENS,
-        )
+        if cancel_check is None or not hasattr(client, "chat_tools_stream"):
+            response = client.chat(messages, profile=profile, max_tokens=CHAT_SUMMARY_MAX_TOKENS)
+        else:
+            if cancel_check():
+                raise ContextCompactionCancelled("用户停止了上下文压缩。")
+            cancel_event = threading.Event()
+            watcher_finished = threading.Event()
+
+            def watch_cancellation() -> None:
+                while not watcher_finished.wait(0.1):
+                    try:
+                        if cancel_check():
+                            cancel_event.set()
+                            return
+                    except Exception:
+                        continue
+
+            watcher = threading.Thread(
+                target=watch_cancellation,
+                name="work-agent-compaction-cancel",
+                daemon=True,
+            )
+            watcher.start()
+            try:
+                response = client.chat_tools_stream(
+                    messages,
+                    profile=profile,
+                    max_tokens=CHAT_SUMMARY_MAX_TOKENS,
+                    cancel_event=cancel_event,
+                )
+            finally:
+                watcher_finished.set()
+            if cancel_event.is_set() or cancel_check():
+                raise ContextCompactionCancelled("用户停止了上下文压缩。")
+    except ContextCompactionCancelled:
+        raise
     except Exception as error:
+        if cancel_check is not None and cancel_check():
+            raise ContextCompactionCancelled("用户停止了上下文压缩。") from error
         raise ContextCompactionError(
             f"当前模型压缩会话失败：{type(error).__name__}: {error}。原始会话未改写，也不会自动切换或重试模型。"
         ) from error

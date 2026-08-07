@@ -257,6 +257,19 @@ class CrossChatMemoryStore:
             if cursor.rowcount != 1:
                 raise ValueError("没有找到这条可删除的记忆。")
 
+    def delete_for_conversation(self, conversation_id: str) -> int:
+        """Hide every derived memory whose source conversation was deleted."""
+        source_id = str(conversation_id or "").strip()
+        if not source_id:
+            return 0
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE memory_items SET state='deleted', updated_at=?
+                WHERE conversation_id=? AND state <> 'deleted'""",
+                (int(time.time()), source_id),
+            )
+            return int(cursor.rowcount)
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=8)
         connection.row_factory = sqlite3.Row

@@ -14,6 +14,7 @@ from typing import Any
 
 
 ProgressSink = Callable[[dict[str, Any]], None]
+CancelCheck = Callable[[], bool]
 
 _thread_state = threading.local()
 _command_counter = itertools.count(1)
@@ -24,6 +25,17 @@ def set_tool_progress_sink(sink: ProgressSink | None) -> ProgressSink | None:
     previous = getattr(_thread_state, "sink", None)
     _thread_state.sink = sink
     return previous
+
+
+def set_tool_cancel_check(check: CancelCheck | None) -> CancelCheck | None:
+    """Bind the current turn cancellation probe to one tool worker thread."""
+    previous = getattr(_thread_state, "cancel_check", None)
+    _thread_state.cancel_check = check
+    return previous
+
+
+def current_tool_cancel_check() -> CancelCheck | None:
+    return getattr(_thread_state, "cancel_check", None)
 
 
 def emit_tool_progress(event: dict[str, Any]) -> None:

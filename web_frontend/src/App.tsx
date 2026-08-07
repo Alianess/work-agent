@@ -17,6 +17,7 @@ import {
   EyeOff,
   ExternalLink,
   Folder,
+  GripVertical,
   FileText,
   FolderOpen,
   ImageIcon,
@@ -43,10 +44,11 @@ import {
   Trash2,
   Upload,
   UserRound,
+  Volume2,
   Wrench,
   X
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, Dispatch, DragEvent, FormEvent, MouseEvent, MutableRefObject, ReactNode, SetStateAction } from "react";
 import { api } from "./api";
 import type { AuthUser } from "./api";
@@ -54,6 +56,10 @@ import type {
   AgentActivityEvent,
   AgentSettingsPayload,
   AgentStreamEvent,
+  AppleCalendarEvent,
+  ApplePimItemsPayload,
+  ApplePimStatus,
+  AppleReminder,
   AsrSettingsPayload,
   AttachmentItem,
   ChatMessage,
@@ -67,6 +73,8 @@ import type {
   MeetingMinutesSettingsPayload,
   ModelsPayload,
   ModelProfile,
+  OfficePdfInput,
+  OfficePdfMergePayload,
   Project,
   ProjectMaterial,
   ProjectSummary,
@@ -82,12 +90,19 @@ import type {
   WorkDayDetailPayload
 } from "./types";
 
-type View = "agent" | "friday" | "projects" | "skills" | "artifacts" | "models" | "transcribe" | "more" | "sync" | "work-calendar";
+type View = "agent" | "friday" | "projects" | "skills" | "artifacts" | "models" | "transcribe" | "record" | "more" | "sync" | "work-calendar" | "apple-pim" | "office";
 type ArtifactTab = "meeting" | "files";
 type ProjectDetailTab = "chat" | "timeline" | "files";
-type FileFilter = "all" | "audio" | "image" | "document" | "output";
+type FileFilter = "all" | "audio" | "image" | "document" | "output" | "office";
+type LibraryFileGroup = {
+  id: "standard" | "office";
+  title: string;
+  description: string;
+  files: FileItem[];
+};
 type StatusTone = "idle" | "success" | "error" | "loading";
 type RealtimeTranscriptionStatus = "idle" | "recording" | "processing" | "error";
+type MeetingCaptureMode = "microphone" | "system-audio";
 type ModelProviderPresetId = "openai-compatible" | "openai" | "deepseek" | "openrouter";
 type ComposerSubmenu = "model" | "reasoning" | "advanced" | null;
 type ModelEditorMode = "add" | "edit" | null;
@@ -116,7 +131,6 @@ type TimelineCompletionState = {
   note: string;
   materialPaths: string[];
 };
-
 const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string; shortLabel: string }> = [
   { value: "light", label: "轻度", shortLabel: "轻" },
   { value: "medium", label: "中", shortLabel: "中" },
@@ -125,6 +139,7 @@ const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string; shortLab
 ];
 const REASONING_STORAGE_KEY = "work-agent-reasoning-effort";
 const AUTO_APPROVE_STORAGE_KEY = "work-agent-auto-approve";
+const REALTIME_TRANSCRIPT_SESSION_STORAGE_PREFIX = "work-agent-realtime-session";
 const TIMELINE_STATUS_OPTIONS = ["未开始", "推进中", "待确认", "有风险", "已完成", "已取消"];
 const EMPTY_TIMELINE_VALUES: TimelineEditorValues = {
   node_id: "",
@@ -152,6 +167,7 @@ const MODEL_PROVIDER_PRESETS: Record<
     temperature: number;
     max_tokens: number;
     timeout_seconds: number;
+    supports_vision: boolean;
   }
 > = {
   "openai-compatible": {
@@ -162,7 +178,8 @@ const MODEL_PROVIDER_PRESETS: Record<
     model: "",
     temperature: 0.6,
     max_tokens: 16384,
-    timeout_seconds: 180
+    timeout_seconds: 180,
+    supports_vision: false
   },
   openai: {
     label: "OpenAI",
@@ -172,7 +189,8 @@ const MODEL_PROVIDER_PRESETS: Record<
     model: "",
     temperature: 0.6,
     max_tokens: 16384,
-    timeout_seconds: 180
+    timeout_seconds: 180,
+    supports_vision: false
   },
   deepseek: {
     label: "DeepSeek",
@@ -182,7 +200,8 @@ const MODEL_PROVIDER_PRESETS: Record<
     model: "deepseek-v4-flash",
     temperature: 0.6,
     max_tokens: 8192,
-    timeout_seconds: 180
+    timeout_seconds: 180,
+    supports_vision: false
   },
   openrouter: {
     label: "OpenRouter",
@@ -192,7 +211,8 @@ const MODEL_PROVIDER_PRESETS: Record<
     model: "",
     temperature: 0.6,
     max_tokens: 16384,
-    timeout_seconds: 180
+    timeout_seconds: 180,
+    supports_vision: false
   }
 };
 
@@ -208,6 +228,7 @@ function createDefaultModelForm() {
     temperature: preset.temperature,
     max_tokens: preset.max_tokens,
     timeout_seconds: preset.timeout_seconds,
+    supports_vision: preset.supports_vision,
     set_default: false,
     source_name: ""
   };
@@ -222,9 +243,17 @@ type ConversationHistoryItem = {
   contextSummaryMessageCount?: number;
   activities?: ActivityRecordMap;
   activeActivityIndex?: number | null;
+  activeTurnId?: string;
+  activeTurnStatus?: "running" | "waiting_approval";
+  acknowledgedTaskKey?: string;
   pinned?: boolean;
   projectId?: string;
 };
+
+type ConversationRunState = {
+  turnId: string;
+  status: "running" | "waiting_approval";
+} | null;
 
 type ActivityRecord = {
   events: AgentActivityEvent[];
@@ -276,9 +305,17 @@ type RealtimeTranscriptSegment = {
   finishedAt: number;
   audioPath?: string;
   transcriptPath?: string;
+  engine?: string;
   asrElapsedMs?: number;
   pending?: boolean;
   error?: string;
+};
+
+type RealtimeAudioChunk = {
+  blob: Blob;
+  mimeType: string;
+  startedAt: number;
+  finishedAt: number;
 };
 
 type MeetingGroup = {
@@ -298,11 +335,14 @@ const fileFilterOptions: Array<{ id: FileFilter; label: string }> = [
   { id: "audio", label: "录音" },
   { id: "image", label: "图片" },
   { id: "document", label: "文件" },
-  { id: "output", label: "产出" }
+  { id: "output", label: "产出" },
+  { id: "office", label: "文件办公区" }
 ];
 
 const conversationStorageKey = "work-agent-conversation-history";
 const FRIDAY_CONVERSATION_ID = "friday-main";
+const CHAT_TURN_RAIL_MAX_MARKS = 18;
+const MAX_UPLOAD_FILE_BYTES = 250 * 1024 * 1024;
 const pendingConversationTitle = "待命名对话";
 const untitledConversationTitle = "待命名对话";
 const toolCallMarkupPattern = /<\/?\s*(?:tool_calls?|工具调用(?:列表)?)(?=[\s>/])/i;
@@ -338,9 +378,12 @@ function initialView(): View {
     query === "agent" ||
     query === "friday" ||
     query === "transcribe" ||
+    query === "record" ||
     query === "more" ||
     query === "sync" ||
-    query === "work-calendar"
+    query === "work-calendar" ||
+    query === "apple-pim" ||
+    query === "office"
   ) {
     return query;
   }
@@ -367,6 +410,17 @@ function loadReasoningEffort(): ReasoningEffort {
 
 function loadAutoApprove(): boolean {
   return window.localStorage.getItem(AUTO_APPROVE_STORAGE_KEY) === "true";
+}
+
+function createRealtimeTranscriptSessionId() {
+  const randomPart = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+    : Math.random().toString(36).slice(2, 14);
+  return `rt-${Date.now().toString(36)}-${randomPart}`.toLowerCase();
+}
+
+function realtimeTranscriptSessionStorageKey(userId: number) {
+  return `${REALTIME_TRANSCRIPT_SESSION_STORAGE_PREFIX}-${userId}`;
 }
 
 function reasoningOption(value: ReasoningEffort) {
@@ -423,7 +477,7 @@ export default function App() {
   const [authState, setAuthState] = useState<"loading" | "anonymous" | "authenticated">("loading");
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
-  const [authForm, setAuthForm] = useState({ username: "", password: "", confirm: "" });
+  const [authForm, setAuthForm] = useState({ username: "", password: "", confirm: "", inviteCode: "" });
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [view, setView] = useState<View>(initialView);
@@ -470,6 +524,17 @@ export default function App() {
   const [selectedWorkDate, setSelectedWorkDate] = useState(todayIso);
   const [workDayDetail, setWorkDayDetail] = useState<WorkDayDetailPayload | null>(null);
   const [workCalendarLoading, setWorkCalendarLoading] = useState(false);
+  const [applePimStatus, setApplePimStatus] = useState<ApplePimStatus | null>(null);
+  const [applePimItems, setApplePimItems] = useState<ApplePimItemsPayload | null>(null);
+  const [applePimLoading, setApplePimLoading] = useState(false);
+  const [applePimRangeDays, setApplePimRangeDays] = useState(30);
+  const officePdfInputRef = useRef<HTMLInputElement>(null);
+  const [officePdfItems, setOfficePdfItems] = useState<OfficePdfInput[]>([]);
+  const [officePdfOutputName, setOfficePdfOutputName] = useState("合并后的文件");
+  const [officePdfMergeResult, setOfficePdfMergeResult] = useState<OfficePdfMergePayload | null>(null);
+  const [officePdfBusy, setOfficePdfBusy] = useState(false);
+  const [officePdfDropActive, setOfficePdfDropActive] = useState(false);
+  const [officePdfDragPath, setOfficePdfDragPath] = useState("");
   const [meetingArchives, setMeetingArchives] = useState<MeetingArchive[]>([]);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -537,6 +602,7 @@ export default function App() {
   const [activityMessageIndex, setActivityMessageIndex] = useState<number | null>(null);
   const [activityStartedAt, setActivityStartedAt] = useState<number | null>(null);
   const [activityRunning, setActivityRunning] = useState(false);
+  const [executionCapsulePanel, setExecutionCapsulePanel] = useState<"plan" | "files" | null>(null);
   const [activityNow, setActivityNow] = useState(Date.now());
   const [queuedChatCount, setQueuedChatCount] = useState(0);
   const currentConversationIdRef = useRef(currentConversationId);
@@ -553,6 +619,7 @@ export default function App() {
   const conversationArchivePendingRef = useRef<ConversationHistoryItem[] | null>(null);
   const conversationArchiveSavingRef = useRef(false);
   const conversationArchiveSaveTimerRef = useRef<number | null>(null);
+  const conversationLocalSaveTimerRef = useRef<number | null>(null);
   const [speechSupported, setSpeechSupported] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -563,11 +630,27 @@ export default function App() {
   const voiceShouldTranscribeRef = useRef(false);
   const [voiceLevels, setVoiceLevels] = useState<number[]>(() => createIdleVoiceLevels());
   const [meetingLiveTitle, setMeetingLiveTitle] = useState("实时会议转写");
+  const [meetingCaptureMode, setMeetingCaptureMode] = useState<MeetingCaptureMode>("system-audio");
+  const [simpleRecordingStatus, setSimpleRecordingStatus] = useState<"idle" | "recording" | "saving" | "error">("idle");
+  const [simpleRecordingPath, setSimpleRecordingPath] = useState("");
+  const [simpleRecordingElapsedMs, setSimpleRecordingElapsedMs] = useState(0);
+  const simpleRecordingStartedAtRef = useRef(0);
+  const simpleRecordingTimerRef = useRef<number | null>(null);
+  const simpleRecorderRef = useRef<MediaRecorder | null>(null);
+  const simpleRecordingChunksRef = useRef<BlobPart[]>([]);
+  const simpleRecordingStreamRef = useRef<MediaStream | null>(null);
+  const simpleDisplayStreamRef = useRef<MediaStream | null>(null);
+  const simpleMixAudioContextRef = useRef<AudioContext | null>(null);
+  const simpleMixSourcesRef = useRef<MediaStreamAudioSourceNode[]>([]);
   const [meetingLiveSegments, setMeetingLiveSegments] = useState<RealtimeTranscriptSegment[]>([]);
   const [meetingLiveStatus, setMeetingLiveStatus] = useState<RealtimeTranscriptionStatus>("idle");
   const [meetingLiveLevels, setMeetingLiveLevels] = useState<number[]>(() => createIdleVoiceLevels());
   const [meetingLivePending, setMeetingLivePending] = useState(0);
   const [meetingLiveSavedPath, setMeetingLiveSavedPath] = useState("");
+  const [meetingLiveSessionId, setMeetingLiveSessionId] = useState("");
+  const meetingLiveSessionIdRef = useRef("");
+  const meetingLiveSegmentsRef = useRef<RealtimeTranscriptSegment[]>([]);
+  const meetingLiveAudioChunksRef = useRef<Map<string, RealtimeAudioChunk>>(new Map());
   const meetingLiveRecorderRef = useRef<MediaRecorder | null>(null);
   const meetingLiveStreamRef = useRef<MediaStream | null>(null);
   const meetingLiveAudioContextRef = useRef<AudioContext | null>(null);
@@ -718,6 +801,86 @@ export default function App() {
   }, [authState, currentUser?.id]);
 
   useEffect(() => {
+    if (authState !== "authenticated" || !currentUser) return;
+    const storageKey = realtimeTranscriptSessionStorageKey(currentUser.id);
+    const storedSessionId = window.localStorage.getItem(storageKey)?.trim();
+    if (!storedSessionId || meetingLiveSegmentsRef.current.length > 0) return;
+    let cancelled = false;
+    void api.realtimeTranscriptSession(storedSessionId)
+      .then((payload) => {
+        if (cancelled) return;
+        const restoredSegments: RealtimeTranscriptSegment[] = payload.segments
+          .filter((segment) => segment.status !== "skipped")
+          .map((segment) => ({
+            id: `restored-${payload.session_id}-${segment.index}`,
+            index: segment.index,
+            text: segment.text || "",
+            startedAt: segment.started_at || payload.created_at,
+            finishedAt: segment.finished_at || payload.updated_at,
+            audioPath: segment.audio_path,
+            transcriptPath: segment.transcript_path,
+            engine: segment.engine,
+            asrElapsedMs: segment.asr_elapsed_ms,
+            pending: false,
+            error:
+              segment.status === "processing"
+                ? "上次识别在处理中断，可点击重试。"
+                : segment.error || undefined
+          }));
+        meetingLiveSegmentsRef.current = restoredSegments;
+        setMeetingLiveSegments(restoredSegments);
+        meetingLiveChunkIndexRef.current = restoredSegments.reduce(
+          (maximum, segment) => Math.max(maximum, segment.index),
+          0
+        );
+        meetingLiveSessionIdRef.current = payload.session_id;
+        setMeetingLiveSessionId(payload.session_id);
+        setMeetingLiveTitle(payload.title || "实时会议转写");
+        const recoveredErrors = restoredSegments.filter((segment) => Boolean(segment.error)).length;
+        // An older session may have been saved before all failed segments were
+        // retried.  Never present that partial Markdown as ready for a new
+        // chat or meeting minutes; it remains visible only in the session
+        // manifest until the missing segments are repaired.
+        setMeetingLiveSavedPath(recoveredErrors ? "" : payload.output_path || "");
+        setMeetingLiveStatus(recoveredErrors ? "error" : "idle");
+        if (restoredSegments.length > 0) {
+          setStatus(
+            recoveredErrors
+              ? { tone: "error", text: `已恢复 ${restoredSegments.length} 段实时转写，其中 ${recoveredErrors} 段需要重试` }
+              : { tone: "success", text: `已恢复 ${restoredSegments.length} 段实时转写` }
+          );
+        }
+      })
+      .catch(() => {
+        window.localStorage.removeItem(storageKey);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authState, currentUser?.id]);
+
+  useEffect(() => {
+    if (!currentUser || !meetingLiveSessionId) return;
+    window.localStorage.setItem(
+      realtimeTranscriptSessionStorageKey(currentUser.id),
+      meetingLiveSessionId
+    );
+  }, [currentUser?.id, meetingLiveSessionId]);
+
+  useEffect(() => {
+    const hasUnsavedTranscript = meetingLiveSegments.some(
+      (segment) => segment.text.trim() && !segment.pending && !segment.error
+    ) && !meetingLiveSavedPath;
+    if (meetingLiveStatus !== "recording" && meetingLivePending === 0 && !hasUnsavedTranscript) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [meetingLivePending, meetingLiveSavedPath, meetingLiveSegments, meetingLiveStatus]);
+
+  useEffect(() => {
     if (authState !== "authenticated" || view !== "sync") return;
     void refreshTemporarySync(true);
     const refreshTimer = window.setInterval(() => {
@@ -736,6 +899,11 @@ export default function App() {
     if (authState !== "authenticated" || view !== "work-calendar") return;
     void refreshWorkCalendar();
   }, [authState, view, workCalendarCursor]);
+
+  useEffect(() => {
+    if (authState !== "authenticated" || view !== "apple-pim" || currentUser?.role !== "admin") return;
+    void refreshApplePim();
+  }, [authState, view, currentUser?.role, applePimRangeDays]);
 
   useEffect(() => {
     if (authState !== "authenticated") return;
@@ -821,11 +989,26 @@ export default function App() {
   useEffect(() => {
     conversationHistoryRef.current = conversationHistory;
     if (!currentUser) return;
-    saveConversationHistory(conversationHistory, currentUser.username);
-    if (conversationArchiveReadyRef.current) {
+    if (conversationLocalSaveTimerRef.current !== null) {
+      window.clearTimeout(conversationLocalSaveTimerRef.current);
+    }
+    conversationLocalSaveTimerRef.current = window.setTimeout(
+      () => {
+        conversationLocalSaveTimerRef.current = null;
+        saveConversationHistory(conversationHistoryRef.current, currentUser.username);
+      },
+      activityRunningRef.current ? 1200 : 0
+    );
+    if (conversationArchiveReadyRef.current && !activityRunningRef.current) {
       queueConversationArchiveSave(conversationHistory);
     }
-  }, [conversationHistory, currentUser?.id]);
+    return () => {
+      if (conversationLocalSaveTimerRef.current !== null) {
+        window.clearTimeout(conversationLocalSaveTimerRef.current);
+        conversationLocalSaveTimerRef.current = null;
+      }
+    };
+  }, [conversationHistory, currentUser?.id, activityRunning]);
 
   useEffect(() => {
     if (!agentSettings?.assistant_name) return;
@@ -857,6 +1040,15 @@ export default function App() {
         stopMeetingLiveBoundaryLoop();
         meetingLiveRecorderRef.current.stop();
       }
+      if (simpleRecorderRef.current?.state === "recording") {
+        try {
+          simpleRecorderRef.current.stop();
+        } catch {
+          // The page is already being torn down.
+        }
+      }
+      stopSimpleRecordingTimer();
+      stopSimpleRecordingCapture();
       stopVoiceLevelMeter(voiceAnimationRef, voiceAudioContextRef);
       stopVoiceStream(voiceStreamRef.current);
       stopVoiceLevelMeter(meetingLiveAnimationRef, meetingLiveAudioContextRef);
@@ -947,6 +1139,10 @@ export default function App() {
     [files, fileQuery, fileFilter]
   );
   const libraryCounts = useMemo(() => countLibraryFiles(files), [files]);
+  const libraryFileGroups = useMemo(
+    () => groupLibraryFiles(filteredFiles, fileFilter),
+    [filteredFiles, fileFilter]
+  );
   const filteredConversationHistory = useMemo(
     () =>
       filterConversations(
@@ -982,6 +1178,25 @@ export default function App() {
       ),
     [chatMessages]
   );
+  const chatTurnRailTurns = useMemo(() => {
+    if (chatUserTurns.length <= CHAT_TURN_RAIL_MAX_MARKS) return chatUserTurns;
+    const lastTurnIndex = chatUserTurns.length - 1;
+    return Array.from({ length: CHAT_TURN_RAIL_MAX_MARKS }, (_, railIndex) =>
+      chatUserTurns[
+        Math.round((railIndex * lastTurnIndex) / (CHAT_TURN_RAIL_MAX_MARKS - 1))
+      ]
+    );
+  }, [chatUserTurns]);
+  const activeChatTurnRailIndex = useMemo(() => {
+    if (activeChatTurnIndex === null || chatTurnRailTurns.length === 0) return null;
+    const activeTurnIndex = chatUserTurns.findIndex(
+      (turn) => turn.messageIndex === activeChatTurnIndex
+    );
+    if (activeTurnIndex < 0 || chatUserTurns.length < 2) return null;
+    return Math.round(
+      (activeTurnIndex * (chatTurnRailTurns.length - 1)) / (chatUserTurns.length - 1)
+    );
+  }, [activeChatTurnIndex, chatTurnRailTurns.length, chatUserTurns]);
 
   useEffect(() => {
     const thread = chatThreadRef.current;
@@ -1140,10 +1355,155 @@ export default function App() {
     setWorkCalendarCursor(next);
   }
 
+  async function refreshApplePim(silent = false) {
+    if (!silent) setApplePimLoading(true);
+    try {
+      const nextStatus = await api.applePimStatus();
+      setApplePimStatus(nextStatus);
+      const canReadEvents = nextStatus.available && nextStatus.events_authorization === "full_access";
+      const canReadReminders = nextStatus.available && nextStatus.reminders_authorization === "full_access";
+      if (!canReadEvents && !canReadReminders) {
+        setApplePimItems(null);
+        return;
+      }
+      const start = new Date();
+      const end = new Date(start.getTime() + applePimRangeDays * 24 * 60 * 60 * 1000);
+      const items = await api.applePimItems({
+        start_at: start.toISOString(),
+        end_at: end.toISOString(),
+        include_events: canReadEvents,
+        include_reminders: canReadReminders
+      });
+      setApplePimItems(items);
+    } catch (error) {
+      setApplePimItems(null);
+      if (!silent) setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      if (!silent) setApplePimLoading(false);
+    }
+  }
+
+  async function requestApplePimAccess() {
+    setApplePimLoading(true);
+    setStatus({ tone: "loading", text: "正在请求 macOS 日历和提醒事项权限…" });
+    try {
+      const result = await api.applePimAccess(true, true);
+      setApplePimStatus(result.status);
+      if (
+        result.status.events_authorization !== "full_access" &&
+        result.status.reminders_authorization !== "full_access"
+      ) {
+        setStatus({ tone: "error", text: "未获得读取权限。请在 macOS 系统设置的隐私与安全性中允许当前 Work Agent 服务访问日历和提醒事项。" });
+        return;
+      }
+      await refreshApplePim(true);
+      setStatus({ tone: "success", text: "Apple 日历与提醒事项已连接" });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setApplePimLoading(false);
+    }
+  }
+
   function draftWorkReportRequest(kind: "daily" | "weekly" | "biweekly") {
     const label = kind === "daily" ? "日报" : kind === "weekly" ? "周报" : "双周报";
     setChatInput(`请使用日报周报双周报技能，以 ${selectedWorkDate} 为基准生成${label}。先复用已有日报，只在缺口处回查工作证据。`);
     setViewWithUrl("agent");
+  }
+
+  function moveOfficePdf(path: string, offset: number) {
+    setOfficePdfItems((current) => {
+      const index = current.findIndex((item) => item.path === path);
+      const target = index + offset;
+      if (index < 0 || target < 0 || target >= current.length) return current;
+      const next = [...current];
+      const [item] = next.splice(index, 1);
+      next.splice(target, 0, item);
+      return next;
+    });
+    setOfficePdfMergeResult(null);
+  }
+
+  function reorderOfficePdfs(sourcePath: string, targetPath: string) {
+    if (!sourcePath || sourcePath === targetPath) return;
+    setOfficePdfItems((current) => {
+      const sourceIndex = current.findIndex((item) => item.path === sourcePath);
+      const targetIndex = current.findIndex((item) => item.path === targetPath);
+      if (sourceIndex < 0 || targetIndex < 0) return current;
+      const next = [...current];
+      const [source] = next.splice(sourceIndex, 1);
+      next.splice(targetIndex, 0, source);
+      return next;
+    });
+    setOfficePdfMergeResult(null);
+  }
+
+  async function addOfficePdfs(fileList: FileList | File[]) {
+    const selected = Array.from(fileList);
+    if (selected.length === 0) return;
+    const invalid = selected.find((file) => !file.name.toLowerCase().endsWith(".pdf"));
+    if (invalid) {
+      setStatus({ tone: "error", text: `“${invalid.name}”不是 PDF 文件。` });
+      return;
+    }
+    const oversized = selected.find((file) => file.size > MAX_UPLOAD_FILE_BYTES);
+    if (oversized) {
+      setStatus({ tone: "error", text: `“${oversized.name}”超过单文件 250 MB 上限。` });
+      return;
+    }
+    setOfficePdfBusy(true);
+    setOfficePdfMergeResult(null);
+    setStatus({ tone: "loading", text: `正在添加 ${selected.length} 个 PDF…` });
+    let added = 0;
+    try {
+      for (const file of selected) {
+        const payload = await api.addOfficePdf({
+          name: file.name,
+          mime_type: file.type || "application/pdf",
+          content_base64: await fileToBase64(file)
+        });
+        setOfficePdfItems((current) => [...current, payload.input]);
+        added += 1;
+      }
+      setStatus({ tone: "success", text: `已按添加顺序加入 ${added} 个 PDF，可拖动调整。` });
+    } catch (error) {
+      setStatus({
+        tone: "error",
+        text: added > 0 ? `已加入 ${added} 个 PDF；其余未添加：${explainError(error)}` : explainError(error)
+      });
+    } finally {
+      setOfficePdfBusy(false);
+      setOfficePdfDropActive(false);
+    }
+  }
+
+  async function mergeOfficePdfs() {
+    const outputName = officePdfOutputName.trim();
+    if (officePdfItems.length < 2) {
+      setStatus({ tone: "error", text: "请至少添加两个 PDF 后再合并。" });
+      return;
+    }
+    if (!outputName) {
+      setStatus({ tone: "error", text: "请填写合并后文件的名称。" });
+      return;
+    }
+    setOfficePdfBusy(true);
+    setStatus({ tone: "loading", text: "正在按当前顺序合并 PDF，并校验结果…" });
+    try {
+      const result = await api.mergeOfficePdfs({
+        source_paths: officePdfItems.map((item) => item.path),
+        output_name: outputName
+      });
+      setOfficePdfMergeResult(result);
+      const library = await api.files(filesRoot || "meet_files");
+      setFiles(library.files);
+      setFilesRoot(library.root);
+      setStatus({ tone: "success", text: result.message });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setOfficePdfBusy(false);
+    }
   }
 
   async function refreshTemporarySync(silent = false) {
@@ -1201,9 +1561,9 @@ export default function App() {
   async function uploadTemporarySyncFiles(fileList: FileList | File[]) {
     const selected = Array.from(fileList);
     if (selected.length === 0) return;
-    const oversized = selected.find((file) => file.size > 100 * 1024 * 1024);
+    const oversized = selected.find((file) => file.size > MAX_UPLOAD_FILE_BYTES);
     if (oversized) {
-      setStatus({ tone: "error", text: `${oversized.name} 超过 100 MB，未上传` });
+      setStatus({ tone: "error", text: `${oversized.name} 超过 250 MB，未上传` });
       return;
     }
     setTemporarySyncBusy(true);
@@ -1530,11 +1890,7 @@ export default function App() {
       const uploaded: AttachmentItem[] = [];
       let latestProject: Project | null = null;
       for (const file of nextFiles) {
-        const payload = await api.addProjectFile(targetProjectId, {
-          name: file.name,
-          mime_type: file.type || "application/octet-stream",
-          content_base64: await fileToBase64(file)
-        });
+        const payload = await api.uploadProjectFile(targetProjectId, file);
         uploaded.push(payload.attachment);
         latestProject = payload.project;
       }
@@ -1879,9 +2235,10 @@ export default function App() {
       return;
     }
 
-    if (typeof navigator.mediaDevices?.getUserMedia !== "function" || typeof MediaRecorder === "undefined") {
+    const capabilityError = recordingCapabilityError();
+    if (capabilityError) {
       setSpeechSupported(false);
-      setStatus({ tone: "error", text: "当前浏览器不支持本地录音，请用 Edge 或 Chrome 打开本地页面。" });
+      setStatus({ tone: "error", text: capabilityError });
       return;
     }
 
@@ -2044,12 +2401,233 @@ export default function App() {
     }
   }
 
+  function stopSimpleRecordingCapture() {
+    for (const source of simpleMixSourcesRef.current) {
+      try {
+        source.disconnect();
+      } catch {
+        // The source may already be closed during browser teardown.
+      }
+    }
+    simpleMixSourcesRef.current = [];
+    const mixContext = simpleMixAudioContextRef.current;
+    simpleMixAudioContextRef.current = null;
+    if (mixContext && mixContext.state !== "closed") {
+      void mixContext.close();
+    }
+    stopVoiceStream(simpleRecordingStreamRef.current);
+    stopVoiceStream(simpleDisplayStreamRef.current);
+    simpleRecordingStreamRef.current = null;
+    simpleDisplayStreamRef.current = null;
+  }
+
+  function stopSimpleRecordingTimer() {
+    if (simpleRecordingTimerRef.current !== null) {
+      window.clearInterval(simpleRecordingTimerRef.current);
+      simpleRecordingTimerRef.current = null;
+    }
+  }
+
+  async function createSimpleRecordingCapture(mode: MeetingCaptureMode) {
+    const microphoneStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1
+      }
+    });
+    if (mode === "microphone") {
+      return { stream: microphoneStream, displayStream: null, mixContext: null, sources: [] };
+    }
+
+    if (typeof navigator.mediaDevices.getDisplayMedia !== "function") {
+      stopVoiceStream(microphoneStream);
+      throw new Error("当前浏览器不支持系统声音捕获，请使用最新版 Chrome 或 Edge。");
+    }
+
+    let displayStream: MediaStream;
+    try {
+      // Chrome requires a video share request before it exposes system audio;
+      // the video track is discarded below and never reaches MediaRecorder.
+      displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 1 },
+        audio: true
+      });
+    } catch (error) {
+      stopVoiceStream(microphoneStream);
+      throw error;
+    }
+    if (displayStream.getAudioTracks().length === 0) {
+      stopVoiceStream(microphoneStream);
+      stopVoiceStream(displayStream);
+      throw new Error("没有捕获到系统声音。请在共享弹窗中选择屏幕或会议标签页，并勾选“共享声音”。");
+    }
+
+    const AudioContextCtor =
+      window.AudioContext ??
+      (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) {
+      stopVoiceStream(microphoneStream);
+      stopVoiceStream(displayStream);
+      throw new Error("当前浏览器不支持音频混音，请使用最新版 Chrome 或 Edge。");
+    }
+
+    const mixContext = new AudioContextCtor();
+    const destination = mixContext.createMediaStreamDestination();
+    const microphoneSource = mixContext.createMediaStreamSource(microphoneStream);
+    const displaySource = mixContext.createMediaStreamSource(displayStream);
+    microphoneSource.connect(destination);
+    displaySource.connect(destination);
+    await mixContext.resume();
+    return {
+      stream: destination.stream,
+      displayStream,
+      mixContext,
+      sources: [microphoneSource, displaySource]
+    };
+  }
+
+  async function startSimpleMeetingRecording() {
+    if (simpleRecordingStatus === "recording" || simpleRecordingStatus === "saving") return;
+    const capabilityError = recordingEnvironmentError(meetingCaptureMode);
+    if (capabilityError) {
+      setSimpleRecordingStatus("error");
+      setStatus({ tone: "error", text: capabilityError });
+      return;
+    }
+
+    try {
+      const capture = await createSimpleRecordingCapture(meetingCaptureMode);
+      simpleRecordingStreamRef.current = capture.stream;
+      simpleDisplayStreamRef.current = capture.displayStream;
+      simpleMixAudioContextRef.current = capture.mixContext;
+      simpleMixSourcesRef.current = capture.sources;
+      const audioOnlyStream = new MediaStream(capture.stream.getAudioTracks());
+      if (audioOnlyStream.getAudioTracks().length === 0) {
+        stopSimpleRecordingCapture();
+        throw new Error("没有可用的音频轨道，请重新选择音频来源。");
+      }
+      const options = preferredMediaRecorderOptions();
+      const recorder = new MediaRecorder(audioOnlyStream, options);
+      simpleRecordingChunksRef.current = [];
+      simpleRecordingStreamRef.current = audioOnlyStream;
+      simpleRecorderRef.current = recorder;
+      simpleRecordingStartedAtRef.current = Date.now();
+      setSimpleRecordingElapsedMs(0);
+      setSimpleRecordingPath("");
+      setSimpleRecordingStatus("recording");
+      setStatus({
+        tone: "loading",
+        text: meetingCaptureMode === "system-audio"
+          ? "正在录制系统声音和麦克风"
+          : "正在录制麦克风"
+      });
+      simpleRecordingTimerRef.current = window.setInterval(() => {
+        setSimpleRecordingElapsedMs(Date.now() - simpleRecordingStartedAtRef.current);
+      }, 500);
+
+      const displayVideoTrack = capture.displayStream?.getVideoTracks()[0];
+      if (displayVideoTrack) {
+        displayVideoTrack.onended = () => {
+          if (simpleRecorderRef.current === recorder && recorder.state === "recording") {
+            setStatus({ tone: "loading", text: "系统声音共享已结束，正在保存录音…" });
+            recorder.stop();
+          }
+        };
+      }
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) simpleRecordingChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        stopSimpleRecordingTimer();
+        stopSimpleRecordingCapture();
+        simpleRecorderRef.current = null;
+        setSimpleRecordingStatus("error");
+        setStatus({ tone: "error", text: "录音失败，请检查麦克风和系统声音权限。" });
+      };
+      recorder.onstop = () => {
+        const mimeType = recorder.mimeType || options?.mimeType || "audio/webm";
+        const blob = new Blob(simpleRecordingChunksRef.current, { type: mimeType });
+        simpleRecordingChunksRef.current = [];
+        stopSimpleRecordingTimer();
+        stopSimpleRecordingCapture();
+        simpleRecorderRef.current = null;
+        if (blob.size === 0) {
+          setSimpleRecordingStatus("error");
+          setStatus({ tone: "error", text: "没有录到音频，请重新开始录音。" });
+          return;
+        }
+        setSimpleRecordingStatus("saving");
+        setStatus({ tone: "loading", text: "正在保存录音文件…" });
+        void (async () => {
+          try {
+            const extension = extensionForMimeType(mimeType);
+            const file = new File(
+              [blob],
+              `会议录音-${new Date(simpleRecordingStartedAtRef.current).toISOString().replace(/[:.]/g, "-")}${extension}`,
+              { type: mimeType }
+            );
+            const payload = await api.uploadAttachment(file);
+            setSimpleRecordingPath(payload.attachment.path);
+            setSimpleRecordingStatus("idle");
+            setStatus({ tone: "success", text: "录音已保存，可在文件库或会议处理中继续使用。" });
+          } catch (error) {
+            setSimpleRecordingStatus("error");
+            setStatus({ tone: "error", text: `录音保存失败：${explainError(error)}` });
+          }
+        })();
+      };
+      recorder.start(1000);
+    } catch (error) {
+      stopSimpleRecordingTimer();
+      stopSimpleRecordingCapture();
+      simpleRecorderRef.current = null;
+      setSimpleRecordingStatus("error");
+      setStatus({
+        tone: "error",
+        text: meetingCaptureMode === "system-audio"
+          ? explainSystemAudioCaptureError(error)
+          : explainMicrophonePermissionError(error)
+      });
+    }
+  }
+
+  function stopSimpleMeetingRecording() {
+    const recorder = simpleRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") return;
+    setStatus({ tone: "loading", text: "正在结束并保存录音…" });
+    recorder.stop();
+  }
+
+  function replaceMeetingLiveSegments(
+    updater:
+      | RealtimeTranscriptSegment[]
+      | ((segments: RealtimeTranscriptSegment[]) => RealtimeTranscriptSegment[])
+  ) {
+    const next = typeof updater === "function"
+      ? updater(meetingLiveSegmentsRef.current)
+      : updater;
+    meetingLiveSegmentsRef.current = next;
+    setMeetingLiveSegments(next);
+  }
+
+  function ensureMeetingLiveSession() {
+    const existing = meetingLiveSessionIdRef.current;
+    if (existing) return existing;
+    const sessionId = createRealtimeTranscriptSessionId();
+    meetingLiveSessionIdRef.current = sessionId;
+    setMeetingLiveSessionId(sessionId);
+    return sessionId;
+  }
+
   async function startMeetingLiveTranscription() {
-    if (meetingLiveStatus === "recording") return;
-    if (typeof navigator.mediaDevices?.getUserMedia !== "function" || typeof MediaRecorder === "undefined") {
+    if (meetingLiveStatus === "recording" || meetingLivePendingRef.current > 0) return;
+    const capabilityError = recordingCapabilityError();
+    if (capabilityError) {
       setSpeechSupported(false);
       setMeetingLiveStatus("error");
-      setStatus({ tone: "error", text: "当前浏览器不支持本地录音，请用 Edge 或 Chrome 打开本地页面。" });
+      setStatus({ tone: "error", text: capabilityError });
       return;
     }
 
@@ -2070,6 +2648,7 @@ export default function App() {
     }
 
     const options = preferredMediaRecorderOptions();
+    ensureMeetingLiveSession();
     meetingLiveOptionsRef.current = options;
     meetingLiveStreamRef.current = stream;
     meetingLiveActiveRef.current = true;
@@ -2454,65 +3033,97 @@ export default function App() {
     return next;
   }
 
-  async function handleMeetingLiveChunk(blob: Blob, mimeType: string, startedAt = Date.now()) {
-    if (blob.size < 512) return;
-    const index = meetingLiveChunkIndexRef.current + 1;
-    meetingLiveChunkIndexRef.current = index;
+  async function handleMeetingLiveChunk(
+    blob: Blob | null,
+    mimeType: string,
+    startedAt = Date.now(),
+    retrySegment?: RealtimeTranscriptSegment
+  ) {
+    if (blob && blob.size < 512) return;
+    const index = retrySegment?.index ?? meetingLiveChunkIndexRef.current + 1;
+    meetingLiveChunkIndexRef.current = Math.max(meetingLiveChunkIndexRef.current, index);
     const now = Date.now();
-    const segmentId = `live-${now}-${index}`;
-    setMeetingLiveSegments((items) => [
-      ...items,
-      {
-        id: segmentId,
-        index,
-        text: "",
+    const segmentId = retrySegment?.id ?? `live-${now}-${index}`;
+    const finishedAt = retrySegment?.finishedAt || now;
+    setMeetingLiveSavedPath("");
+    if (blob) {
+      meetingLiveAudioChunksRef.current.set(segmentId, {
+        blob,
+        mimeType,
         startedAt,
-        finishedAt: 0,
-        pending: true
-      }
-    ]);
+        finishedAt
+      });
+    }
+    replaceMeetingLiveSegments((items) => retrySegment
+      ? items.map((item) => item.id === segmentId
+        ? { ...item, pending: true, error: undefined }
+        : item)
+      : [
+          ...items,
+          {
+            id: segmentId,
+            index,
+            text: "",
+            startedAt,
+            finishedAt,
+            pending: true
+          }
+        ]
+    );
     updateMeetingLivePending(1);
     const run = async () => {
       try {
-        const payload = await api.transcribeSpeech({
-          name: `实时转写-${index}-${now}${extensionForMimeType(mimeType)}`,
-          mime_type: mimeType || blob.type || "audio/webm",
-          content_base64: await blobToBase64(blob),
-          use_denoise: true,
-          skip_if_silent: true
-        });
+        const sessionId = ensureMeetingLiveSession();
+        const payload = blob
+          ? await api.transcribeSpeech({
+              name: `实时转写-${index}-${now}${extensionForMimeType(mimeType)}`,
+              mime_type: mimeType || blob.type || "audio/webm",
+              content_base64: await blobToBase64(blob),
+              use_denoise: true,
+              skip_if_silent: true,
+              realtime_session_id: sessionId,
+              segment_index: index,
+              started_at: startedAt,
+              finished_at: finishedAt,
+              title: meetingLiveTitle.trim() || "实时会议转写"
+            })
+          : await api.retryRealtimeTranscriptSegment(sessionId, index);
         const text = payload.text.trim();
         if (!text) {
-          setMeetingLiveSegments((items) => items.filter((item) => item.id !== segmentId));
+          replaceMeetingLiveSegments((items) => items.filter((item) => item.id !== segmentId));
+          meetingLiveAudioChunksRef.current.delete(segmentId);
           if (!payload.skipped) {
             setStatus({ tone: "idle", text: `第 ${index} 段未识别到文字` });
           }
           return;
         }
-        setMeetingLiveSegments((items) =>
+        replaceMeetingLiveSegments((items) =>
           items.map((item) =>
             item.id === segmentId
               ? {
                   ...item,
                   text,
                   pending: false,
-                  finishedAt: Date.now(),
+                  finishedAt,
                   audioPath: payload.audio_path,
                   transcriptPath: payload.transcript_path,
-                  asrElapsedMs: payload.asr_elapsed_ms
+                  engine: payload.engine,
+                  asrElapsedMs: payload.asr_elapsed_ms,
+                  error: undefined
                 }
               : item
           )
         );
+        meetingLiveAudioChunksRef.current.delete(segmentId);
         setStatus({ tone: "success", text: `已追加第 ${index} 段转写` });
       } catch (error) {
-        setMeetingLiveSegments((items) =>
+        replaceMeetingLiveSegments((items) =>
           items.map((item) =>
             item.id === segmentId
               ? {
                   ...item,
                   pending: false,
-                  finishedAt: Date.now(),
+                  finishedAt,
                   error: explainError(error)
                 }
               : item
@@ -2534,51 +3145,119 @@ export default function App() {
     await queued;
   }
 
-  async function saveMeetingLiveTranscript() {
-    const completedSegments = meetingLiveSegments.filter(
+  async function retryMeetingLiveSegment(segment: RealtimeTranscriptSegment) {
+    if (segment.pending || meetingLivePendingRef.current > 0) return;
+    const cached = meetingLiveAudioChunksRef.current.get(segment.id);
+    await handleMeetingLiveChunk(
+      cached?.blob ?? null,
+      cached?.mimeType ?? "audio/webm",
+      cached?.startedAt ?? segment.startedAt,
+      segment
+    );
+  }
+
+  async function saveMeetingLiveTranscript(): Promise<string | null> {
+    if (meetingLivePendingRef.current > 0) {
+      setStatus({ tone: "loading", text: "正在等待剩余音频片段识别完成…" });
+      await meetingLiveTranscriptionQueueRef.current.catch(() => undefined);
+    }
+    const completedSegments = meetingLiveSegmentsRef.current.filter(
       (segment) => segment.text.trim() && !segment.pending && !segment.error
     );
+    const failedSegments = meetingLiveSegmentsRef.current.filter((segment) => Boolean(segment.error));
+    if (failedSegments.length > 0) {
+      setStatus({
+        tone: "error",
+        text: `还有 ${failedSegments.length} 段实时转写异常。请先逐段重试，避免保存不完整会议记录。`
+      });
+      return null;
+    }
     if (completedSegments.length === 0) {
       setStatus({ tone: "error", text: "还没有可保存的实时转写内容。" });
-      return;
+      return null;
     }
+    if (meetingLiveSavedPath) return meetingLiveSavedPath;
     setBusy(true);
     setStatus({ tone: "loading", text: "正在保存实时转写稿…" });
     try {
       const payload = await api.saveRealtimeTranscript({
         title: meetingLiveTitle.trim() || "实时会议转写",
+        session_id: ensureMeetingLiveSession(),
         segments: completedSegments.map((segment) => ({
           index: segment.index,
           text: segment.text,
           started_at: segment.startedAt,
-          finished_at: segment.finishedAt
+          finished_at: segment.finishedAt,
+          audio_path: segment.audioPath,
+          transcript_path: segment.transcriptPath,
+          engine: segment.engine,
+          asr_elapsed_ms: segment.asrElapsedMs
         }))
       });
       setMeetingLiveSavedPath(payload.path);
       await refreshFiles(filesRoot || "meet_files");
       setStatus({ tone: "success", text: `实时转写稿已保存：${payload.path}` });
+      return payload.path;
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
+      return null;
     } finally {
       setBusy(false);
     }
   }
 
   function clearMeetingLiveTranscript() {
-    if (meetingLiveStatus === "recording") return;
+    if (meetingLiveStatus === "recording" || meetingLivePendingRef.current > 0) return;
     meetingLiveChunkIndexRef.current = 0;
     meetingLivePendingRef.current = 0;
     setMeetingLivePending(0);
-    setMeetingLiveSegments([]);
+    replaceMeetingLiveSegments([]);
+    meetingLiveAudioChunksRef.current.clear();
+    meetingLiveSessionIdRef.current = "";
+    setMeetingLiveSessionId("");
+    if (currentUser) {
+      window.localStorage.removeItem(realtimeTranscriptSessionStorageKey(currentUser.id));
+    }
     setMeetingLiveSavedPath("");
     setMeetingLiveStatus("idle");
     setStatus({ tone: "idle", text: "实时转写内容已清空" });
   }
 
-  function sendMeetingTranscriptToAgent() {
-    if (!meetingLiveSavedPath) return;
-    setChatInput(`请基于这份实时会议转写稿整理会议内容：${meetingLiveSavedPath}`);
-    setViewWithUrl("agent");
+  async function sendMeetingTranscriptToNewChat(target: "minutes" | "chat") {
+    const meetingMinutesSkill =
+      target === "minutes"
+        ? skills.find((skill) => skill.id === "meeting-minutes") ?? null
+        : null;
+    if (target === "minutes" && !meetingMinutesSkill) {
+      setStatus({ tone: "error", text: "会议纪要 skill 当前不可用，不能改走一条新的会议处理流程。" });
+      return;
+    }
+    const transcriptPath = await saveMeetingLiveTranscript();
+    if (!transcriptPath) return;
+    const title = meetingLiveTitle.trim() || "实时会议转写";
+    const conversationId = startNewChat();
+    const content = target === "minutes"
+      ? `${meetingMinutesSkill?.mention ? `${meetingMinutesSkill.mention} ` : ""}` +
+        `请按现有会议纪要 skill 流程处理这份已完成的实时转写稿。\n\n` +
+        `input_path: ${transcriptPath}\nmeeting_name: ${title}\n\n` +
+        "这是已完成的实时 ASR Markdown：必须直接复用，不能重新转写、不能另建会议工作流。请生成内部留档版、工作提交版、DOCX 和 manifest，并按既有验证门槛交付。"
+      : `请读取并继续处理这份实时会议转写稿：${transcriptPath}\n\n` +
+        `它来自“${title}”的已完成实时 ASR，会话分片和来源路径已保留；先基于这份文本回答，不要重复转写。`;
+    await runChatMessage(
+      {
+        content,
+        attachments: [],
+        skill: meetingMinutesSkill,
+        autoApprove
+      },
+      {
+        conversationId,
+        baseMessages: chatMessagesRef.current,
+        activityRecords: {},
+        conversationSummary: "",
+        conversationSummaryMessageCount: 0
+      }
+    );
   }
 
   function attachSkill(skill: SkillInfo) {
@@ -2620,6 +3299,7 @@ export default function App() {
   }
 
   function startNewChat(projectId: string | null = null) {
+    const backgroundRunCount = activeChatRunsRef.current.size;
     requestChatScrollToBottom();
     const conversationId = createConversationId();
     currentConversationIdRef.current = conversationId;
@@ -2651,6 +3331,7 @@ export default function App() {
     setActivityRecords({});
     setActivityPanelMessageIndex(null);
     setActivityEvents([]);
+    setExecutionCapsulePanel(null);
     setActivityOpen(false);
     setActivityMessageIndex(null);
     setActivityStartedAt(null);
@@ -2659,9 +3340,16 @@ export default function App() {
     setActivityElapsedMs(0);
     setQueuedChatCount(0);
     setBusy(false);
-    setStatus({ tone: "idle", text: "就绪" });
+    setStatus({
+      tone: backgroundRunCount > 0 ? "loading" : "idle",
+      text:
+        backgroundRunCount > 0
+          ? `新会话已开始；${backgroundRunCount} 个后台任务继续运行`
+          : "就绪"
+    });
     setSearchOpen(false);
     setViewWithUrl("agent");
+    return conversationId;
   }
 
   function openFridayConversation() {
@@ -2694,6 +3382,26 @@ export default function App() {
     const restoredActivityRecord =
       restoredActivityIndex === null ? null : restoredActivityRecords[restoredActivityIndex] ?? null;
     const activeRun = activeChatRunsRef.current.get(item.id);
+    const taskStatus = conversationTaskStatus(item, Boolean(activeRun));
+    if (taskStatus === "completed" || taskStatus === "error") {
+      const taskKey = conversationTaskKey(item);
+      if (taskKey && item.acknowledgedTaskKey !== taskKey) {
+        setConversationHistory((items) => {
+          const next = items.map((candidate) =>
+            candidate.id === item.id
+              ? {
+                  ...candidate,
+                  acknowledgedTaskKey: taskKey,
+                  activeTurnId: undefined,
+                  activeTurnStatus: undefined
+                }
+              : candidate
+          );
+          conversationHistoryRef.current = next;
+          return next;
+        });
+      }
+    }
     currentConversationIdRef.current = item.id;
     setCurrentConversationId(item.id);
     setActiveProjectId(item.projectId ?? null);
@@ -2715,6 +3423,7 @@ export default function App() {
     setActivityRecords(restoredActivityRecords);
     setActivityPanelMessageIndex(restoredActivityIndex);
     setActivityEvents(restoredActivityRecord?.events ?? []);
+    setExecutionCapsulePanel(null);
     if (!options.preserveActivityPanel) setActivityOpen(false);
     setActivityMessageIndex(restoredActivityIndex);
     setActivityStartedAt(activeRun?.startedAt ?? null);
@@ -2729,6 +3438,8 @@ export default function App() {
     setStatus(
       activeRun
         ? { tone: "loading", text: "该对话仍在后台处理中…" }
+        : item.activeTurnStatus === "waiting_approval"
+          ? { tone: "loading", text: "该对话等待工具执行确认" }
         : { tone: "idle", text: "已打开对话" }
     );
   }
@@ -2852,7 +3563,9 @@ export default function App() {
 
   function queueConversationArchiveSave(items: ConversationHistoryItem[], delayMs = 350) {
     if (!conversationArchiveReadyRef.current || !currentUser) return;
-    conversationArchivePendingRef.current = items.map(sanitizeConversationHistoryItem);
+    // Keep this enqueue path cheap. Sanitizing and diffing a very long chat is
+    // deferred to the scheduled flush so a streamed activity event can paint.
+    conversationArchivePendingRef.current = items;
     if (conversationArchiveSavingRef.current) return;
     if (conversationArchiveSaveTimerRef.current !== null) {
       window.clearTimeout(conversationArchiveSaveTimerRef.current);
@@ -2865,9 +3578,10 @@ export default function App() {
 
   async function flushConversationArchiveSave() {
     if (conversationArchiveSavingRef.current || !conversationArchiveReadyRef.current) return;
-    const snapshot = conversationArchivePendingRef.current;
+    const requestedSnapshot = conversationArchivePendingRef.current;
     conversationArchivePendingRef.current = null;
-    if (!snapshot) return;
+    if (!requestedSnapshot) return;
+    const snapshot = requestedSnapshot.map(sanitizeConversationHistoryItem);
 
     const change = conversationArchiveChangeSet(
       conversationArchiveShadowRef.current,
@@ -2915,7 +3629,7 @@ export default function App() {
     } catch (error) {
       // Do not silently retry a failed persistence request.  The next explicit
       // conversation change will create a fresh, versioned save request.
-      conversationArchivePendingRef.current = snapshot;
+      conversationArchivePendingRef.current = null;
       setStatus({ tone: "error", text: `聊天存档保存失败：${explainError(error)}` });
     } finally {
       conversationArchiveSavingRef.current = false;
@@ -2923,7 +3637,7 @@ export default function App() {
       if (
         pending &&
         conversationArchiveReadyRef.current &&
-        (retryAfterConflict || pending !== snapshot)
+        (retryAfterConflict || pending !== requestedSnapshot)
       ) {
         queueConversationArchiveSave(pending, 0);
       }
@@ -2984,19 +3698,7 @@ export default function App() {
     try {
       const uploaded: AttachmentItem[] = [];
       for (const file of nextFiles) {
-        const fileWithLocalHints = file as File & {
-          path?: string;
-          webkitRelativePath?: string;
-        };
-        const payload = await api.addAttachment({
-          name: file.name,
-          mime_type: file.type || "application/octet-stream",
-          size: file.size,
-          last_modified: file.lastModified,
-          relative_path: fileWithLocalHints.webkitRelativePath || "",
-          source_path: fileWithLocalHints.path || "",
-          content_base64: await fileToBase64(file)
-        });
+        const payload = await api.uploadAttachment(file);
         uploaded.push(payload.attachment);
       }
       setAttachments((items) => mergeAttachmentsByPath(items, uploaded));
@@ -3235,6 +3937,14 @@ export default function App() {
             }
           }
         : activityRecordsDraft;
+      const currentRun = activeChatRunsRef.current.get(conversationId);
+      const runState: ConversationRunState | undefined = options?.completed
+        ? waitingApprovalDraft && currentRun?.turnId
+          ? { turnId: currentRun.turnId, status: "waiting_approval" }
+          : null
+        : currentRun?.turnId
+          ? { turnId: currentRun.turnId, status: "running" }
+          : undefined;
       const fallbackTitle = shouldNameConversation
         ? pendingConversationTitle
         : titleFromMessages(snapshotMessages);
@@ -3248,10 +3958,10 @@ export default function App() {
           fallbackTitle,
           contextSummaryDraft,
           contextSummaryMessageCountDraft,
-          projectId
+          projectId,
+          runState
         );
         conversationHistoryRef.current = next;
-        saveConversationHistory(next, currentUser?.username);
         return next;
       });
     };
@@ -3305,6 +4015,7 @@ export default function App() {
       setActivityEvents([]);
       setActivityElapsedMs(0);
       setActivityOpen(false);
+      setExecutionCapsulePanel(null);
       setActivityMessageIndex(assistantIndex);
       setActivityStartedAt(activityStartedAtMs);
       setActivityNow(activityStartedAtMs);
@@ -3332,9 +4043,10 @@ export default function App() {
         (streamEvent) => {
           if ("turn_id" in streamEvent && typeof streamEvent.turn_id === "string") {
             const activeRun = activeChatRunsRef.current.get(conversationId);
-            if (activeRun?.abortController === abortController) {
-              activeRun.turnId = streamEvent.turn_id;
-            }
+          if (activeRun?.abortController === abortController) {
+            activeRun.turnId = streamEvent.turn_id;
+            persistDraftConversation({ force: true });
+          }
           }
           if ("elapsed_ms" in streamEvent && typeof streamEvent.elapsed_ms === "number") {
             updateDraftActivityElapsed(streamEvent.elapsed_ms);
@@ -3359,12 +4071,13 @@ export default function App() {
             }
             persistDraftConversation();
           } else if (streamEvent.event === "draft_reset") {
-            streamedContent = "";
-            assistantDraftContent = "";
+            const resetContent = streamEvent.content ?? "";
+            streamedContent = resetContent;
+            assistantDraftContent = resetContent;
             if (isVisibleConversation()) {
               setChatMessages((items) =>
                 items.map((message, index) =>
-                  index === assistantIndex ? { ...message, content: "" } : message
+                  index === assistantIndex ? { ...message, content: resetContent } : message
                 )
               );
             }
@@ -3398,7 +4111,7 @@ export default function App() {
                     : "已回复"
               });
             }
-            persistDraftConversation({ force: true, completed: true });
+            persistDraftConversation({ force: true, completed: !waitingApprovalDraft });
           } else if (streamEvent.event === "error") {
             const errorMessage = streamErrorMessage(streamEvent);
             assistantDraftContent = `这次没有成功：${errorMessage}`;
@@ -3495,10 +4208,11 @@ export default function App() {
             assistantIndex,
             untitledConversationTitle,
             contextSummaryDraft,
-            contextSummaryMessageCountDraft
+            contextSummaryMessageCountDraft,
+            projectId,
+            null
           );
           conversationHistoryRef.current = next;
-          saveConversationHistory(next, currentUser?.username);
           return next;
         });
       }
@@ -3671,6 +4385,9 @@ export default function App() {
             }
           }
         : activityRecordsDraft;
+      const runState: ConversationRunState = options?.completed
+        ? null
+        : { turnId, status: "running" };
       setConversationHistory((items) => {
         const next = updateConversationMessages(
           items,
@@ -3680,10 +4397,11 @@ export default function App() {
           assistantIndex,
           untitledConversationTitle,
           contextSummaryDraft,
-          contextSummaryMessageCountDraft
+          contextSummaryMessageCountDraft,
+          undefined,
+          runState
         );
         conversationHistoryRef.current = next;
-        saveConversationHistory(next, currentUser?.username);
         return next;
       });
     };
@@ -3777,8 +4495,9 @@ export default function App() {
             writeAssistantContent(`${assistantDraftContent}${streamEvent.content}`);
             persistDraftConversation();
           } else if (streamEvent.event === "draft_reset") {
-            streamedContent = "";
-            writeAssistantContent("");
+            const resetContent = streamEvent.content ?? "";
+            streamedContent = resetContent;
+            writeAssistantContent(resetContent);
             persistDraftConversation({ force: true });
           } else if (streamEvent.event === "final") {
             finalReply = streamEvent.content;
@@ -3839,11 +4558,12 @@ export default function App() {
           assistantIndex,
           untitledConversationTitle,
           contextSummaryDraft,
-          contextSummaryMessageCountDraft
+          contextSummaryMessageCountDraft,
+          undefined,
+          null
         );
         conversationHistoryRef.current = next;
-        saveConversationHistory(next, currentUser?.username);
-        return next;
+          return next;
       });
     } catch (error) {
       const stoppedByUser = abortController.signal.aborted;
@@ -4054,6 +4774,7 @@ export default function App() {
       temperature: profile.temperature,
       max_tokens: profile.max_tokens,
       timeout_seconds: profile.timeout_seconds,
+      supports_vision: profile.supports_vision,
       set_default: profile.default,
       source_name: ""
     });
@@ -4075,6 +4796,7 @@ export default function App() {
       temperature: profile.temperature,
       max_tokens: profile.max_tokens,
       timeout_seconds: profile.timeout_seconds,
+      supports_vision: profile.supports_vision,
       set_default: false,
       source_name: profile.name
     });
@@ -4411,11 +5133,11 @@ export default function App() {
     try {
       const payload = authMode === "login"
         ? await api.login(authForm.username, authForm.password)
-        : await api.register(authForm.username, authForm.password);
+        : await api.register(authForm.username, authForm.password, authForm.inviteCode);
       if (!payload.user) throw new Error("账户信息未返回，请重试");
       setCurrentUser(payload.user);
       setAuthState("authenticated");
-      setAuthForm({ username: "", password: "", confirm: "" });
+      setAuthForm({ username: "", password: "", confirm: "", inviteCode: "" });
     } catch (error) {
       setAuthError(explainError(error));
     } finally {
@@ -4484,9 +5206,12 @@ export default function App() {
 
       <aside className="sidebar" id="workspace-sidebar" aria-label="工作台导航">
         <div className="brand-block">
-          <div className="brand-copy">
-            <h1>工作智能体</h1>
-            <p translate="no">{workspace ? compactPath(workspace) : "本地工作区"}</p>
+          <div className="brand-identity">
+            <span className="brand-symbol" aria-hidden="true"><Sparkles /></span>
+            <div className="brand-copy">
+              <h1>工作智能体</h1>
+              <p translate="no">{workspace ? compactPath(workspace) : "本地工作区"}</p>
+            </div>
           </div>
           <div className="sidebar-header-actions">
             <button
@@ -4518,7 +5243,7 @@ export default function App() {
         <nav className="nav-list" aria-label="主要区域">
           <button
             type="button"
-            className={`nav-button ${
+            className={`nav-button nav-new-chat ${
               view === "agent" && chatMessages.length <= 1 && currentConversationId.startsWith("local")
                 ? "is-active"
                 : ""
@@ -4530,63 +5255,71 @@ export default function App() {
             <MessageSquarePlus aria-hidden="true" />
             <span>新聊天</span>
           </button>
-          <button
-            type="button"
-            className={`nav-button nav-section-start ${
-              view === "artifacts" && artifactTab === "files" ? "is-active" : ""
-            }`}
-            aria-current={view === "artifacts" && artifactTab === "files" ? "page" : undefined}
-            aria-label="文件库"
-            title="文件库"
-            onClick={() => setArtifactTabWithUrl("files")}
-          >
-            <Library aria-hidden="true" />
-            <span>文件库</span>
-          </button>
-          <button
-            type="button"
-            className={`nav-button ${view === "projects" ? "is-active" : ""}`}
-            aria-current={view === "projects" ? "page" : undefined}
-            aria-label="项目"
-            title="项目"
-            onClick={showProjectList}
-          >
-            <Folder aria-hidden="true" />
-            <span>项目</span>
-          </button>
-          <button
-            type="button"
-            className={`nav-button ${view === "skills" ? "is-active" : ""}`}
-            aria-current={view === "skills" ? "page" : undefined}
-            aria-label="技能"
-            title="技能"
-            onClick={() => setViewWithUrl("skills")}
-          >
-            <Wrench aria-hidden="true" />
-            <span>技能</span>
-          </button>
-          <button
-            type="button"
-            className={`nav-button ${view === "models" ? "is-active" : ""}`}
-            aria-current={view === "models" ? "page" : undefined}
-            aria-label="设置"
-            title="设置"
-            onClick={() => setViewWithUrl("models")}
-          >
-            <Cpu aria-hidden="true" />
-            <span>设置</span>
-          </button>
-          <button
-            type="button"
-            className={`nav-button ${view === "more" ? "is-active" : ""}`}
-            aria-current={view === "more" ? "page" : undefined}
-            aria-label="更多"
-            title="更多"
-            onClick={() => setViewWithUrl("more")}
-          >
-            <MoreHorizontal aria-hidden="true" />
-            <span>更多</span>
-          </button>
+
+          <div className="nav-group">
+            <div>
+              <button
+                type="button"
+                className={`nav-button ${view === "projects" ? "is-active" : ""}`}
+                aria-current={view === "projects" ? "page" : undefined}
+                aria-label="项目"
+                title="项目"
+                onClick={showProjectList}
+              >
+                <Folder aria-hidden="true" />
+                <span>项目</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-button ${view === "artifacts" && artifactTab === "files" ? "is-active" : ""}`}
+                aria-current={view === "artifacts" && artifactTab === "files" ? "page" : undefined}
+                aria-label="文件库"
+                title="文件库"
+                onClick={() => setArtifactTabWithUrl("files")}
+              >
+                <Library aria-hidden="true" />
+                <span>文件库</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="nav-group">
+            <div>
+              <button
+                type="button"
+                className={`nav-button ${view === "skills" ? "is-active" : ""}`}
+                aria-current={view === "skills" ? "page" : undefined}
+                aria-label="技能"
+                title="技能"
+                onClick={() => setViewWithUrl("skills")}
+              >
+                <Wrench aria-hidden="true" />
+                <span>技能</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-button ${view === "models" ? "is-active" : ""}`}
+                aria-current={view === "models" ? "page" : undefined}
+                aria-label="设置"
+                title="设置"
+                onClick={() => setViewWithUrl("models")}
+              >
+                <Cpu aria-hidden="true" />
+                <span>设置</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-button ${view === "more" ? "is-active" : ""}`}
+                aria-current={view === "more" ? "page" : undefined}
+                aria-label="更多工具"
+                title="更多工具"
+                onClick={() => setViewWithUrl("more")}
+              >
+                <MoreHorizontal aria-hidden="true" />
+                <span>更多工具</span>
+              </button>
+            </div>
+          </div>
         </nav>
 
         <section className="recent-block" aria-label="历史对话">
@@ -4596,6 +5329,10 @@ export default function App() {
               regularConversationHistory.map((item) => {
                 const isActive = currentConversationId === item.id;
                 const isRenaming = renamingConversationId === item.id;
+                const taskStatus = conversationTaskStatus(
+                  item,
+                  activeChatRunsRef.current.has(item.id)
+                );
                 const projectName = item.projectId
                   ? projects.find((project) => project.id === item.projectId)?.name
                   : undefined;
@@ -4643,29 +5380,43 @@ export default function App() {
                       </button>
                     )}
                     {!isRenaming ? (
-                      <div className="recent-actions" aria-label={`${item.title} 的操作`}>
-                        <button
-                          type="button"
-                          className={`recent-action-button recent-pin-button ${item.pinned ? "is-pinned" : ""}`}
-                          aria-label={item.pinned ? "取消置顶" : "置顶对话"}
-                          title={item.pinned ? "取消置顶" : "置顶对话"}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            toggleConversationPin(item.id);
-                          }}
-                        >
-                          {item.pinned ? <PinOff aria-hidden="true" /> : <Pin aria-hidden="true" />}
-                        </button>
-                        <button
-                          type="button"
-                          className="recent-action-button"
-                          aria-label="更多操作"
-                          aria-haspopup="menu"
-                          aria-expanded={historyMenu?.id === item.id}
-                          onClick={(event) => openHistoryMenu(event, item.id)}
-                        >
-                          <MoreHorizontal aria-hidden="true" />
-                        </button>
+                      <div className="recent-item-trailing">
+                        {!isActive && taskStatus !== "idle" ? (
+                          <span
+                            className={`recent-task-status is-${taskStatus}`}
+                            title={conversationTaskStatusLabel(taskStatus)}
+                            aria-label={conversationTaskStatusLabel(taskStatus)}
+                          >
+                            {taskStatus === "running" ? <Loader2 className="spin" aria-hidden="true" /> : null}
+                            {taskStatus === "waiting" ? <Clock3 aria-hidden="true" /> : null}
+                            {taskStatus === "completed" ? <CheckCircle2 aria-hidden="true" /> : null}
+                            {taskStatus === "error" ? <AlertCircle aria-hidden="true" /> : null}
+                          </span>
+                        ) : null}
+                        <div className="recent-actions" aria-label={`${item.title} 的操作`}>
+                          <button
+                            type="button"
+                            className={`recent-action-button recent-pin-button ${item.pinned ? "is-pinned" : ""}`}
+                            aria-label={item.pinned ? "取消置顶" : "置顶对话"}
+                            title={item.pinned ? "取消置顶" : "置顶对话"}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              toggleConversationPin(item.id);
+                            }}
+                          >
+                            {item.pinned ? <PinOff aria-hidden="true" /> : <Pin aria-hidden="true" />}
+                          </button>
+                          <button
+                            type="button"
+                            className="recent-action-button"
+                            aria-label="更多操作"
+                            aria-haspopup="menu"
+                            aria-expanded={historyMenu?.id === item.id}
+                            onClick={(event) => openHistoryMenu(event, item.id)}
+                          >
+                            <MoreHorizontal aria-hidden="true" />
+                          </button>
+                        </div>
                       </div>
                     ) : null}
                   </div>
@@ -4726,7 +5477,7 @@ export default function App() {
                   : view === "agent"
                   ? activeProjectId
                     ? `项目：${selectedProject?.name ?? "正在载入"} · 自动使用项目资料`
-                    : "本地文件、技能和模型都在同一条对话里汇合"
+                    : "文件、技能和模型共享当前对话"
                   : view === "projects"
                     ? selectedProject
                       ? "资料、指令和多轮对话共同组成项目上下文"
@@ -4735,10 +5486,16 @@ export default function App() {
                     ? "当前对话智能体可自动调用的能力"
                   : view === "transcribe"
                     ? "浏览器麦克风实时记录，本地降噪后转写并保存"
+                  : view === "record"
+                    ? "保存系统声音和麦克风原始音频，录音后再处理"
                   : view === "sync"
                     ? "同一账号的设备之间临时传递文字和文件"
                   : view === "work-calendar"
                     ? "按日期查看本地工作记录、日报和周期报告"
+                  : view === "apple-pim"
+                    ? "读取本机已同步的 Apple 日历和提醒事项；写入必须由你明确提交"
+                  : view === "office"
+                    ? "本地文件办公工具；输出会保存到当前账户的文件库"
                   : view === "more"
                     ? "临时同步、会议归档、实时转写等功能入口"
                   : view === "artifacts" && artifactTab === "files"
@@ -4854,8 +5611,11 @@ export default function App() {
           {view === "projects" && renderProjects()}
           {view === "skills" && renderSkills()}
           {view === "transcribe" && renderRealtimeTranscription()}
+          {view === "record" && renderSimpleRecording()}
           {view === "sync" && renderTemporarySync()}
           {view === "work-calendar" && renderWorkCalendar()}
+          {view === "apple-pim" && renderApplePim()}
+          {view === "office" && renderOfficeWorkspace()}
           {view === "artifacts" && renderArtifacts()}
           {view === "models" && renderModels()}
           {view === "more" && renderMore()}
@@ -5523,14 +6283,20 @@ export default function App() {
   }
 
   function renderChatTurnNavigator() {
-    if (chatUserTurns.length < 2) return null;
+    if (
+      view === "friday" ||
+      currentConversationId === FRIDAY_CONVERSATION_ID ||
+      chatUserTurns.length < 2
+    ) {
+      return null;
+    }
     return (
       <aside className="chat-turn-navigator" aria-label="对话历史导航">
         <div className="chat-turn-rail" aria-hidden="true">
-          {chatUserTurns.map((turn) => (
+          {chatTurnRailTurns.map((turn, railIndex) => (
             <span
               key={turn.messageIndex}
-              className={activeChatTurnIndex === turn.messageIndex ? "is-active" : ""}
+              className={activeChatTurnRailIndex === railIndex ? "is-active" : ""}
             />
           ))}
         </div>
@@ -5559,6 +6325,15 @@ export default function App() {
   }
 
   function renderAgent() {
+    const latestContextProgress = latestRuntimeSummaryEvent(activityEvents);
+    const showContextProgress = Boolean(
+      activityRunning && latestContextProgress?.runtime_stage === "compacting"
+    );
+    const activeActivityRecord =
+      activityMessageIndex === null ? null : activityRecordForMessage(activityMessageIndex);
+    const pendingApproval = activeActivityRecord ? pendingApprovalEvent(activeActivityRecord) : null;
+    const latestPlan = latestPlanActivity(activityEvents);
+    const showExecutionPlan = Boolean(latestPlan && (activityRunning || pendingApproval));
     return (
       <div className={`chat-page ${view === "friday" ? "is-friday" : "is-task-chat"} ${
         activityOpen || chatFilesOpen ? "has-side-panel" : ""
@@ -5575,6 +6350,9 @@ export default function App() {
                     ? pendingApprovalEvent(activityRecord)
                     : null;
                 const displayMessage = sanitizeChatMessage(message);
+                const completedCompaction = activityRecord
+                  ? latestCompletedRuntimeSummaryEvent(activityRecord.events)
+                  : null;
                 const content =
                   displayMessage.content ||
                   (message.role === "assistant" && busy && !isActivityMessage ? "正在生成…" : "");
@@ -5620,7 +6398,7 @@ export default function App() {
                       <>
                         <div className="chat-bubble">
                           {displayMessage.role === "assistant" ? (
-                            <MarkdownContent content={content} onOpenFile={openLinkedFile} />
+                            <CachedMarkdownContent content={content} onOpenFile={openLinkedFile} />
                           ) : (
                             <p>{content}</p>
                           )}
@@ -5640,6 +6418,7 @@ export default function App() {
                         ) : null}
                       </>
                     ) : null}
+                    {completedCompaction ? renderCompletedContextCompaction() : null}
                     {message.role === "user" && editingMessageIndex !== index ? (
                       <div className="chat-message-actions" aria-label="消息操作">
                         <button
@@ -5665,12 +6444,16 @@ export default function App() {
                   </article>
                 );
               })}
+              {showContextProgress && latestContextProgress
+                ? renderContextProgress(latestContextProgress)
+                : null}
             </div>
           </section>
 
           {renderChatTurnNavigator()}
 
           <section className="composer-dock" aria-label="消息输入区">
+            {showExecutionPlan && latestPlan ? renderExecutionCapsule(latestPlan, activityEvents) : null}
             <form
               className={`chat-compose ${dragActive ? "is-dragging" : ""} ${
                 isListening ? "is-recording" : ""
@@ -6071,7 +6854,7 @@ export default function App() {
               <p>
                 {queuedChatCount > 0
                   ? `队列中还有 ${queuedChatCount} 条消息等待处理。`
-                  : "智能体存在幻觉，可能会犯错，请核查重要信息。"}
+                  : "智能体可能出错，请核查重要信息。"}
               </p>
               {chatMessages.length > 1 ? (
                 <button
@@ -6317,7 +7100,114 @@ export default function App() {
     );
   }
 
+  function renderContextProgress(item: AgentActivityEvent) {
+    return (
+      <div
+        className="context-compaction-running"
+        role="status"
+        aria-live="polite"
+        aria-busy="true"
+      >
+        <Loader2 className="spin" aria-hidden="true" />
+        <span className="context-compaction-label" data-label={item.title || "正在压缩上下文"}>
+          {item.title || "正在压缩上下文"}
+        </span>
+      </div>
+    );
+  }
+
+  function renderCompletedContextCompaction() {
+    return (
+      <div className="context-compaction-complete" role="status">
+        <FileText aria-hidden="true" />
+        <span>上下文已自动压缩</span>
+      </div>
+    );
+  }
+
+  function renderExecutionCapsule(item: AgentActivityEvent, events: AgentActivityEvent[]) {
+    const plan = item.plan ?? [];
+    if (plan.length === 0) return null;
+    const completed = item.plan_completed ?? plan.filter((entry) => entry.status === "completed").length;
+    const currentIndex = plan.findIndex((entry) => entry.status === "in_progress");
+    const total = item.plan_total ?? plan.length;
+    const displayStep = currentIndex >= 0 ? currentIndex + 1 : Math.min(completed + 1, total);
+    const fileChanges = summarizeFileChanges(events);
+    const additions = fileChanges.reduce((sum, entry) => sum + entry.additions, 0);
+    const deletions = fileChanges.reduce((sum, entry) => sum + entry.deletions, 0);
+    const planOpen = executionCapsulePanel === "plan";
+    const filesOpen = executionCapsulePanel === "files";
+    return (
+      <section
+        className="execution-capsule"
+        aria-label="当前执行进度"
+        onMouseLeave={() => setExecutionCapsulePanel(null)}
+      >
+        <div className="execution-capsule-segment execution-capsule-plan">
+          <button
+            type="button"
+            aria-expanded={planOpen}
+            aria-controls="execution-plan-popover"
+            onMouseEnter={() => setExecutionCapsulePanel("plan")}
+            onFocus={() => setExecutionCapsulePanel("plan")}
+            onClick={() => setExecutionCapsulePanel((panel) => panel === "plan" ? null : "plan")}
+          >
+            <Loader2 className="execution-capsule-spinner spin" aria-hidden="true" />
+            <strong>第 {displayStep} / {total} 步</strong>
+          </button>
+          {planOpen ? (
+            <div className="execution-capsule-popover is-plan" id="execution-plan-popover">
+              <ol>
+                {plan.map((entry, index) => (
+                  <li key={`${entry.step}-${index}`} className={`is-${entry.status}`}>
+                    <span className="execution-capsule-step-icon" aria-hidden="true">
+                      {entry.status === "completed" ? <CheckCircle2 /> : entry.status === "in_progress" ? <Loader2 className="spin" /> : <Clock3 />}
+                    </span>
+                    <span>{entry.step}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          ) : null}
+        </div>
+        {fileChanges.length > 0 ? <span className="execution-capsule-divider" aria-hidden="true">·</span> : null}
+        {fileChanges.length > 0 ? (
+          <div className="execution-capsule-segment execution-capsule-files">
+            <button
+              type="button"
+              aria-expanded={filesOpen}
+              aria-controls="execution-files-popover"
+              onMouseEnter={() => setExecutionCapsulePanel("files")}
+              onFocus={() => setExecutionCapsulePanel("files")}
+              onClick={() => setExecutionCapsulePanel((panel) => panel === "files" ? null : "files")}
+            >
+              <span>{fileChanges.length} 个文件已更改</span>
+              <span className="diff-additions">+{additions}</span>
+              <span className="diff-deletions">-{deletions}</span>
+            </button>
+            {filesOpen ? (
+              <div className="execution-capsule-popover is-files" id="execution-files-popover">
+                <ul>
+                  {fileChanges.map((entry) => (
+                    <li key={entry.filePath}>
+                      <span title={entry.filePath}>{fileNameFromPath(entry.filePath)}</span>
+                      <span className="execution-capsule-file-diff">
+                        <span className="diff-additions">+{entry.additions}</span>
+                        <span className="diff-deletions">-{entry.deletions}</span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
+    );
+  }
+
   function renderActivityEvent(item: AgentActivityEvent, key: string) {
+    if (item.activity_type === "plan") return null;
     if (item.phase === "error" || item.command_status === "error") {
       return renderActivityError(item, key);
     }
@@ -6331,8 +7221,6 @@ export default function App() {
             <div className="activity-work-note">
               <p>{item.detail || item.content || item.title}</p>
             </div>
-          ) : item.activity_type === "plan" ? (
-            renderTaskPlanActivity(item)
           ) : item.activity_type === "command" ? (
             renderCommandActivity(item)
           ) : item.activity_type === "file_edit" ? (
@@ -6526,16 +7414,21 @@ export default function App() {
       commandText.startsWith("write_text_file") ||
       commandText.startsWith("create_docx_from_markdown");
     const isApproval = status === "approval_required" || item.approval_required;
+    const isSecureExecution = Boolean(item.execution_id);
     const cardTitle = isHeartbeat
       ? "正在处理"
       : isModelRequest
         ? "模型请求"
         : isApproval
           ? "等待终端确认"
+          : isSecureExecution
+            ? "安全执行"
           : isWritePreview
             ? item.title
             : "已运行命令";
-    const activityLabel = isHeartbeat ? "Live" : isModelRequest ? "LLM" : isWritePreview ? "Write" : "Shell";
+    const activityLabel = isSecureExecution
+      ? "Seatbelt"
+      : isHeartbeat ? "Live" : isModelRequest ? "LLM" : isWritePreview ? "Write" : "Shell";
     const output = (item.approval_preview || item.content || "").trimEnd();
     const heartbeatSummary = isHeartbeat ? output.replace(/\s+/g, " ").trim() : "";
     const commandLine = activityRowCommandLine(item);
@@ -6552,6 +7445,8 @@ export default function App() {
               "✦"
             ) : isApproval ? (
               "!"
+            ) : isSecureExecution ? (
+              <ShieldCheck />
             ) : isWritePreview ? (
               "✎"
             ) : (
@@ -6602,6 +7497,13 @@ export default function App() {
               <Copy aria-hidden="true" />
             </button>
           </div>
+          {isSecureExecution ? (
+            <div className="activity-execution-meta">
+              <span><ShieldCheck aria-hidden="true" />原生隔离</span>
+              <span>{executionDeliveryLabel(item)}</span>
+              {item.receipt_id ? <code translate="no">回执 {shortExecutionId(item.receipt_id)}</code> : null}
+            </div>
+          ) : null}
           <pre>
             <code>
               {commandLine}
@@ -6686,12 +7588,45 @@ export default function App() {
       <div className="more-page">
         <header className="more-hero">
           <div>
-            <h2>更多功能</h2>
-            <p>把低频但重要的办公功能收在这里，常用工作仍然从对话和文件库开始。</p>
+            <h2>更多工具</h2>
+            <p>会议处理、跨设备同步和周期复盘统一放在这里。</p>
           </div>
         </header>
 
         <div className="more-grid" aria-label="功能入口">
+          <button type="button" className="more-card" onClick={() => setViewWithUrl("transcribe")}>
+            <span className="panel-icon">
+              <Mic aria-hidden="true" />
+            </span>
+            <span>
+              <strong>实时转写</strong>
+              <small>浏览器麦克风持续记录、自动断句，并保存为完整 ASR 转写稿。</small>
+            </span>
+            <ChevronRight aria-hidden="true" />
+          </button>
+
+          <button type="button" className="more-card" onClick={() => setViewWithUrl("record")}>
+            <span className="panel-icon">
+              <Volume2 aria-hidden="true" />
+            </span>
+            <span>
+              <strong>单纯录音</strong>
+              <small>只保存系统声音和麦克风原始音频，不实时转写，录音结束后再到文件库处理。</small>
+            </span>
+            <ChevronRight aria-hidden="true" />
+          </button>
+
+          <button type="button" className="more-card" onClick={() => setArtifactTabWithUrl("meeting")}>
+            <span className="panel-icon">
+              <FileText aria-hidden="true" />
+            </span>
+            <span>
+              <strong>会议纪要</strong>
+              <small>查看会议归档、内部留档版、工作提交版和 Word 交付文件。</small>
+            </span>
+            <ChevronRight aria-hidden="true" />
+          </button>
+
           <button type="button" className="more-card" onClick={() => setViewWithUrl("work-calendar")}>
             <span className="panel-icon">
               <CalendarDays aria-hidden="true" />
@@ -6699,6 +7634,28 @@ export default function App() {
             <span>
               <strong>工作日历</strong>
               <small>按天查看工作记录和日报，在周期末回看周报、双周报。</small>
+            </span>
+            <ChevronRight aria-hidden="true" />
+          </button>
+
+          <button type="button" className="more-card" onClick={() => setViewWithUrl("apple-pim")}>
+            <span className="panel-icon">
+              <Bell aria-hidden="true" />
+            </span>
+            <span>
+              <strong>日程与提醒</strong>
+              <small>读取 Mac 与 iPhone 同步的 Apple 日历和提醒事项，并由你确认后新增。</small>
+            </span>
+            <ChevronRight aria-hidden="true" />
+          </button>
+
+          <button type="button" className="more-card" onClick={() => setViewWithUrl("office")}>
+            <span className="panel-icon">
+              <FileText aria-hidden="true" />
+            </span>
+            <span>
+              <strong>文件办公区</strong>
+              <small>在本地处理文件。首个工具支持按顺序拖入、调整并合并 PDF。</small>
             </span>
             <ChevronRight aria-hidden="true" />
           </button>
@@ -6714,31 +7671,6 @@ export default function App() {
             <ChevronRight aria-hidden="true" />
           </button>
 
-          <button
-            type="button"
-            className="more-card"
-            onClick={() => setArtifactTabWithUrl("meeting")}
-          >
-            <span className="panel-icon">
-              <FileText aria-hidden="true" />
-            </span>
-            <span>
-              <strong>会议纪要</strong>
-              <small>按会议查看 ASR 转写稿、内部留档版、工作提交版和 DOCX。</small>
-            </span>
-            <ChevronRight aria-hidden="true" />
-          </button>
-
-          <button type="button" className="more-card" onClick={() => setViewWithUrl("transcribe")}>
-            <span className="panel-icon">
-              <Mic aria-hidden="true" />
-            </span>
-            <span>
-              <strong>实时转写</strong>
-              <small>现场录音、自动断句、本地 ASR 转写并保存成稿。</small>
-            </span>
-            <ChevronRight aria-hidden="true" />
-          </button>
         </div>
       </div>
     );
@@ -6887,6 +7819,307 @@ export default function App() {
     );
   }
 
+  function renderApplePim() {
+    const hasEventAccess = applePimStatus?.available && applePimStatus.events_authorization === "full_access";
+    const hasReminderAccess = applePimStatus?.available && applePimStatus.reminders_authorization === "full_access";
+    const canRead = hasEventAccess || hasReminderAccess;
+    const events = applePimItems?.events ?? [];
+    const reminders = applePimItems?.reminders ?? [];
+    const formatDate = (value: string, fallback: string) => {
+      if (!value) return fallback;
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? fallback : date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    };
+    if (currentUser?.role !== "admin") {
+      return (
+        <div className="apple-pim-page">
+          <section className="apple-pim-empty">
+            <ShieldCheck aria-hidden="true" />
+            <div>
+              <h2>仅限本机管理员</h2>
+              <p>Apple 日历和提醒事项属于当前 Mac 的系统账户数据，不能与 Work Agent 的普通账号混用。</p>
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    return (
+      <div className="apple-pim-page">
+        <header className="apple-pim-heading">
+          <div>
+            <span className="apple-pim-kicker">APPLE EVENTKIT · LOCAL MAC</span>
+            <h2>日程与提醒</h2>
+            <p>这里仅展示当前 Mac 已同步的 Apple 日历与提醒事项。请在 iPhone 管理自己的日历和提醒；需要 AI 新增待办时，在对话中明确说明即可。</p>
+          </div>
+          <div className="apple-pim-actions">
+            <label>
+              日历范围
+              <select value={applePimRangeDays} onChange={(event) => setApplePimRangeDays(Number(event.target.value))} disabled={applePimLoading}>
+                <option value={7}>未来 7 天</option>
+                <option value={30}>未来 30 天</option>
+                <option value={90}>未来 90 天</option>
+              </select>
+            </label>
+            <button type="button" className="secondary-button" onClick={() => void refreshApplePim()} disabled={applePimLoading}>
+              <RefreshCw aria-hidden="true" className={applePimLoading ? "spin" : ""} />
+              刷新
+            </button>
+          </div>
+        </header>
+
+        {!applePimStatus?.available ? (
+          <section className="apple-pim-permission" aria-live="polite">
+            <div className="apple-pim-permission-icon"><ShieldCheck aria-hidden="true" /></div>
+            <div>
+              <h3>连接 Apple 日历与提醒事项</h3>
+              <p>{applePimStatus?.reason ?? "首次使用需由 macOS 明确授予读取权限。Work Agent 不会读取你的 Apple ID 密码，也不会替你开启 iCloud 同步。"}</p>
+              <p className="apple-pim-permission-note">授权弹窗由 macOS 显示。若此前拒绝过，请在「系统设置 → 隐私与安全性 → 日历 / 提醒事项」中重新允许。</p>
+            </div>
+            <button type="button" className="primary-button" onClick={() => void requestApplePimAccess()} disabled={applePimLoading}>
+              {applePimLoading ? <Loader2 className="spin" aria-hidden="true" /> : <CalendarDays aria-hidden="true" />}
+              授权并连接
+            </button>
+          </section>
+        ) : !canRead ? (
+          <section className="apple-pim-permission is-blocked" aria-live="polite">
+            <div className="apple-pim-permission-icon"><AlertCircle aria-hidden="true" /></div>
+            <div>
+              <h3>需要完整读取权限</h3>
+              <p>当前权限不足以展示日程。请重新授权，或在 macOS 系统设置中把此服务的日历和提醒事项权限设为允许。</p>
+            </div>
+            <button type="button" className="secondary-button" onClick={() => void requestApplePimAccess()} disabled={applePimLoading}>重新请求权限</button>
+          </section>
+        ) : (
+          <>
+            <section className="apple-pim-summary" aria-label="授权状态">
+              <div>
+                <CalendarDays aria-hidden="true" />
+                <span>日历 <strong>{hasEventAccess ? "已连接" : "未授权"}</strong></span>
+              </div>
+              <div>
+                <Bell aria-hidden="true" />
+                <span>提醒事项 <strong>{hasReminderAccess ? "已连接" : "未授权"}</strong></span>
+              </div>
+              <p>日历按所选范围加载；提醒事项显示全部未完成项。此页面仅供查看，不提供手工新增或编辑。</p>
+            </section>
+
+            <div className="apple-pim-layout">
+              <section className="apple-pim-list-panel" aria-labelledby="apple-events-title">
+                <header className="apple-pim-panel-heading">
+                  <div>
+                    <span>CALENDAR</span>
+                    <h3 id="apple-events-title">日历安排</h3>
+                  </div>
+                  <small>{applePimItems?.events_truncated ? "显示前 200 项" : `${events.length} 项`}</small>
+                </header>
+                {hasEventAccess ? (
+                  events.length ? <div className="apple-pim-item-list">
+                    {events.map((item: AppleCalendarEvent) => (
+                      <article key={item.id} className="apple-pim-item">
+                        <time>{item.all_day ? formatDate(item.start_at, "全天")?.split(" ")[0] ?? "全天" : formatDate(item.start_at, "时间待定")}</time>
+                        <div>
+                          <strong>{item.title || "未命名日程"}</strong>
+                          <p>{item.calendar_title}{item.location ? ` · ${item.location}` : ""}</p>
+                          {item.notes ? <small>{item.notes}</small> : null}
+                        </div>
+                      </article>
+                    ))}
+                  </div> : <p className="apple-pim-list-empty">这个日历范围内没有安排。</p>
+                ) : <p className="apple-pim-list-empty">尚未授权读取日历。</p>}
+              </section>
+
+              <section className="apple-pim-list-panel" aria-labelledby="apple-reminders-title">
+                <header className="apple-pim-panel-heading">
+                  <div>
+                    <span>REMINDERS</span>
+                    <h3 id="apple-reminders-title">待办提醒</h3>
+                  </div>
+                  <small>{applePimItems?.reminders_truncated ? "显示前 200 项" : `${reminders.length} 项`}</small>
+                </header>
+                {hasReminderAccess ? (
+                  reminders.length ? <div className="apple-pim-item-list">
+                    {reminders.map((item: AppleReminder) => (
+                      <article key={item.id} className="apple-pim-item is-reminder">
+                        <time>{formatDate(item.due_at, "未设截止时间")}</time>
+                        <div>
+                          <strong>{item.title || "未命名提醒"}</strong>
+                          <p>{item.calendar_title}{item.priority ? ` · 优先级 ${item.priority}` : ""}</p>
+                          {item.notes ? <small>{item.notes}</small> : null}
+                        </div>
+                      </article>
+                    ))}
+                  </div> : <p className="apple-pim-list-empty">没有未完成的提醒事项。</p>
+                ) : <p className="apple-pim-list-empty">尚未授权读取提醒事项。</p>}
+              </section>
+            </div>
+
+          </>
+        )}
+      </div>
+    );
+  }
+
+  function renderOfficeWorkspace() {
+    const totalPages = officePdfItems.reduce((total, item) => total + item.pages, 0);
+    const totalBytes = officePdfItems.reduce((total, item) => total + item.size, 0);
+    const canMerge = officePdfItems.length >= 2 && officePdfOutputName.trim().length > 0 && !officePdfBusy;
+    return (
+      <div className="office-workspace-page">
+        <header className="office-workspace-heading">
+          <div>
+            <h2>文件办公区</h2>
+            <p>首个工具：本地合并 PDF。文件只保存在当前账户的工作区，不会上传到第三方服务。</p>
+          </div>
+          <span className="office-workspace-status">PDF 合并</span>
+        </header>
+
+        <section className="office-pdf-workbench" aria-labelledby="office-pdf-title">
+          <header className="office-pdf-titlebar">
+            <div className="panel-icon"><FileText aria-hidden="true" /></div>
+            <div>
+              <h3 id="office-pdf-title">按顺序合并 PDF</h3>
+              <p>添加顺序就是合并顺序；拖动列表可调整。合并后会重新打开文件校验总页数。</p>
+            </div>
+          </header>
+
+          <input
+            ref={officePdfInputRef}
+            className="office-file-input"
+            type="file"
+            accept="application/pdf,.pdf"
+            multiple
+            onChange={(event) => {
+              if (event.currentTarget.files) void addOfficePdfs(event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
+          />
+
+          <button
+            type="button"
+            className={`office-pdf-dropzone ${officePdfDropActive ? "is-active" : ""}`}
+            onClick={() => officePdfInputRef.current?.click()}
+            onDragEnter={(event) => {
+              event.preventDefault();
+              setOfficePdfDropActive(true);
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "copy";
+            }}
+            onDragLeave={(event) => {
+              if (event.currentTarget === event.target) setOfficePdfDropActive(false);
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              setOfficePdfDropActive(false);
+              void addOfficePdfs(event.dataTransfer.files);
+            }}
+            disabled={officePdfBusy}
+          >
+            <Upload aria-hidden="true" />
+            <strong>{officePdfItems.length ? "继续添加 PDF" : "拖入 PDF，或选择文件"}</strong>
+            <small>单个文件最大 250 MB；会按加入顺序追加到下方列表。</small>
+          </button>
+
+          {officePdfItems.length ? (
+            <>
+              <div className="office-pdf-summary" aria-live="polite">
+                <span><strong>{officePdfItems.length}</strong> 个文件</span>
+                <span><strong>{totalPages}</strong> 页</span>
+                <span>{formatBytes(totalBytes)}</span>
+                <small>当前顺序即输出顺序</small>
+              </div>
+
+              <ol className="office-pdf-list" aria-label="PDF 合并顺序">
+                {officePdfItems.map((item, index) => (
+                  <li
+                    key={item.path}
+                    className={`office-pdf-row ${officePdfDragPath === item.path ? "is-dragging" : ""}`}
+                    draggable={!officePdfBusy}
+                    onDragStart={(event) => {
+                      setOfficePdfDragPath(item.path);
+                      event.dataTransfer.effectAllowed = "move";
+                      event.dataTransfer.setData("text/plain", item.path);
+                    }}
+                    onDragEnd={() => setOfficePdfDragPath("")}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const sourcePath = event.dataTransfer.getData("text/plain");
+                      if (sourcePath) reorderOfficePdfs(sourcePath, item.path);
+                      setOfficePdfDragPath("");
+                    }}
+                  >
+                    <span className="office-pdf-order" aria-label={`第 ${index + 1} 份`}>{String(index + 1).padStart(2, "0")}</span>
+                    <span className="office-pdf-grip" aria-hidden="true"><GripVertical /></span>
+                    <span className="office-pdf-file-icon" aria-hidden="true"><FileText /></span>
+                    <span className="office-pdf-file-copy">
+                      <strong title={item.name}>{item.name}</strong>
+                      <small>{item.pages} 页 · {formatBytes(item.size)}</small>
+                    </span>
+                    <div className="office-pdf-row-actions" aria-label={`${item.name} 的顺序和删除操作`}>
+                      <button type="button" onClick={() => moveOfficePdf(item.path, -1)} disabled={officePdfBusy || index === 0}>上移</button>
+                      <button type="button" onClick={() => moveOfficePdf(item.path, 1)} disabled={officePdfBusy || index === officePdfItems.length - 1}>下移</button>
+                      <button
+                        type="button"
+                        className="office-pdf-remove"
+                        aria-label={`移除 ${item.name}`}
+                        title={`移除 ${item.name}`}
+                        disabled={officePdfBusy}
+                        onClick={() => {
+                          setOfficePdfItems((current) => current.filter((entry) => entry.path !== item.path));
+                          setOfficePdfMergeResult(null);
+                        }}
+                      >
+                        <Trash2 aria-hidden="true" />
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            </>
+          ) : (
+            <div className="office-pdf-empty">
+              <span>添加至少两个 PDF 后，可拖动排列合并顺序。</span>
+            </div>
+          )}
+
+          <footer className="office-pdf-output">
+            <label>
+              合并后文件名
+              <span className="office-pdf-name-field">
+                <input value={officePdfOutputName} onChange={(event) => setOfficePdfOutputName(event.target.value)} placeholder="例如：项目材料汇编" disabled={officePdfBusy} />
+                <b>.pdf</b>
+              </span>
+            </label>
+            <button type="button" className="primary-button" onClick={() => void mergeOfficePdfs()} disabled={!canMerge}>
+              {officePdfBusy ? <Loader2 className="spin" aria-hidden="true" /> : <FileText aria-hidden="true" />}
+              合并 PDF
+            </button>
+          </footer>
+
+          {officePdfMergeResult ? (
+            <div className="office-pdf-result" role="status">
+              <CheckCircle2 aria-hidden="true" />
+              <div>
+                <strong>{officePdfMergeResult.output.name}</strong>
+                <p>已合并 {officePdfMergeResult.source_count} 个 PDF，共 {officePdfMergeResult.pages} 页，并完成结构校验。</p>
+              </div>
+              <button type="button" className="secondary-button" onClick={() => void openLinkedFile(officePdfMergeResult.output.path)}>查看文件</button>
+              <a className="secondary-button" href={officePdfMergeResult.output.download_url} download={officePdfMergeResult.output.name}>
+                <Download aria-hidden="true" />下载
+              </a>
+            </div>
+          ) : null}
+        </section>
+      </div>
+    );
+  }
+
   function renderTemporarySync() {
     const storedText = temporarySync?.text.content ?? "";
     const textChanged = temporarySyncTextDirty || temporarySyncText !== storedText;
@@ -6956,7 +8189,7 @@ export default function App() {
           <div className="sync-section-heading">
             <div>
               <h3 id="sync-files-title">临时文件</h3>
-              <p>可同时传多个文件，单个不超过 100 MB；上传满 1 小时后自动删除。</p>
+              <p>可同时传多个文件，单个不超过 250 MB；上传满 1 小时后自动删除。</p>
             </div>
             <span>{temporarySync?.files.length ?? 0} 个有效文件</span>
           </div>
@@ -7293,6 +8526,99 @@ export default function App() {
     );
   }
 
+  function renderSimpleRecording() {
+    const environmentError = recordingEnvironmentError(meetingCaptureMode);
+    return (
+      <div className="simple-recording-page">
+        <section className="simple-recording-panel" aria-label="单纯录音控制">
+          <div className="realtime-control-head">
+            <span className="panel-icon">
+              <Volume2 aria-hidden="true" />
+            </span>
+            <div>
+              <h3>单纯录音</h3>
+              <p>先保存原始音频，不实时转写；录音结束后可在文件库中继续处理。</p>
+            </div>
+          </div>
+
+          {environmentError ? (
+            <div className="simple-recording-environment-error" role="status">
+              <AlertCircle aria-hidden="true" />
+              <span>{environmentError}</span>
+            </div>
+          ) : null}
+
+          <section className="simple-recording-block" aria-label="录音设置">
+            <div className="simple-recording-heading">
+              <div>
+                <strong>录音来源</strong>
+                <span>默认录制系统声音和麦克风，也可以只录麦克风。</span>
+              </div>
+              <Badge tone={simpleRecordingStatus === "recording" ? "success" : simpleRecordingStatus === "saving" ? "warning" : "neutral"}>
+                {simpleRecordingStatus === "recording" ? "正在录音" : simpleRecordingStatus === "saving" ? "正在保存" : simpleRecordingPath ? "已保存" : "未开始"}
+              </Badge>
+            </div>
+            <div className="simple-recording-modes" role="radiogroup" aria-label="录音来源">
+              <label>
+                <input
+                  type="radio"
+                  name="meeting-capture-mode"
+                  value="system-audio"
+                  checked={meetingCaptureMode === "system-audio"}
+                  disabled={simpleRecordingStatus === "recording" || simpleRecordingStatus === "saving"}
+                  onChange={() => setMeetingCaptureMode("system-audio")}
+                />
+                <Volume2 aria-hidden="true" />
+                <span>系统声音 + 麦克风</span>
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="meeting-capture-mode"
+                  value="microphone"
+                  checked={meetingCaptureMode === "microphone"}
+                  disabled={simpleRecordingStatus === "recording" || simpleRecordingStatus === "saving"}
+                  onChange={() => setMeetingCaptureMode("microphone")}
+                />
+                <Mic aria-hidden="true" />
+                <span>仅麦克风</span>
+              </label>
+            </div>
+            <p className="simple-recording-note">
+              录音文件只保存音频，不保存屏幕画面。系统声音模式仍需在共享弹窗中选择屏幕或会议标签页并勾选“共享声音”，这是浏览器获取系统音频的权限方式；不想共享屏幕时请选择“仅麦克风”。
+            </p>
+            <div className="simple-recording-actions">
+              {simpleRecordingStatus === "recording" ? (
+                <button type="button" className="primary-button" onClick={stopSimpleMeetingRecording}>
+                  <Check aria-hidden="true" />
+                  停止并保存
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => void startSimpleMeetingRecording()}
+                  disabled={simpleRecordingStatus === "saving"}
+                >
+                  <Volume2 aria-hidden="true" />
+                  开始录音
+                </button>
+              )}
+              {simpleRecordingStatus === "recording" ? (
+                <span className="simple-recording-elapsed">{formatActivityDuration(simpleRecordingElapsedMs)}</span>
+              ) : null}
+              {simpleRecordingPath ? (
+                <button type="button" className="path-button" onClick={() => openLinkedFile(simpleRecordingPath)}>
+                  {simpleRecordingPath}
+                </button>
+              ) : null}
+            </div>
+          </section>
+        </section>
+      </div>
+    );
+  }
+
   function renderRealtimeTranscription() {
     const completedSegments = meetingLiveSegments.filter(
       (segment) => segment.text.trim() && !segment.pending && !segment.error
@@ -7340,11 +8666,12 @@ export default function App() {
               </div>
             ) : null}
             <div className="realtime-state-row">
-              <Badge tone={isRecording ? "success" : isProcessing ? "warning" : "neutral"}>
-                {isRecording ? "正在记录" : isProcessing ? "正在识别" : "未开始"}
+              <Badge tone={isRecording ? "success" : isProcessing || errorSegments.length > 0 ? "warning" : "neutral"}>
+                {isRecording ? "正在记录" : isProcessing ? "正在识别" : errorSegments.length > 0 ? "需要处理" : completedSegments.length > 0 ? "转写就绪" : "未开始"}
               </Badge>
               <span>{completedSegments.length} 段已转写</span>
               {meetingLivePending > 0 ? <span>{meetingLivePending} 段处理中</span> : null}
+              {errorSegments.length > 0 ? <span>{errorSegments.length} 段需重试</span> : null}
             </div>
           </div>
 
@@ -7368,8 +8695,8 @@ export default function App() {
             <button
               type="button"
               className="secondary-button"
-              onClick={saveMeetingLiveTranscript}
-              disabled={busy || isRecording || completedSegments.length === 0}
+              onClick={() => void saveMeetingLiveTranscript()}
+              disabled={busy || isRecording || isProcessing || errorSegments.length > 0 || completedSegments.length === 0}
             >
               {busy ? <Loader2 aria-hidden="true" className="spin" /> : <FileText aria-hidden="true" />}
               保存转写稿
@@ -7378,7 +8705,7 @@ export default function App() {
               type="button"
               className="text-button"
               onClick={clearMeetingLiveTranscript}
-              disabled={busy || isRecording || meetingLiveSegments.length === 0}
+              disabled={busy || isRecording || isProcessing || meetingLiveSegments.length === 0}
             >
               <Trash2 aria-hidden="true" />
               清空
@@ -7393,6 +8720,37 @@ export default function App() {
             <span>当前片段会先做高通、低通、频谱降噪和音量归一化。</span>
           </div>
 
+          {completedSegments.length > 0 ? (
+            <section className="realtime-handoff" aria-label="转写后续操作">
+              <div>
+                <strong>转写完成后</strong>
+                <span>
+                  {errorSegments.length > 0
+                    ? "先重试异常分片，避免把不完整内容交给会议纪要。"
+                    : "系统会先保存标准 ASR Markdown，并立即在新聊天中继续既有流程。"}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="primary-button"
+                disabled={busy || isRecording || isProcessing || errorSegments.length > 0}
+                onClick={() => void sendMeetingTranscriptToNewChat("minutes")}
+              >
+                <FileText aria-hidden="true" />
+                在新聊天中生成会议纪要
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={busy || isRecording || isProcessing || errorSegments.length > 0}
+                onClick={() => void sendMeetingTranscriptToNewChat("chat")}
+              >
+                <MessageSquarePlus aria-hidden="true" />
+                立即在新聊天中使用
+              </button>
+            </section>
+          ) : null}
+
           {meetingLiveSavedPath ? (
             <div className="realtime-saved">
               <strong>已保存</strong>
@@ -7403,10 +8761,6 @@ export default function App() {
                 <button type="button" className="text-button" onClick={() => copyPath(meetingLiveSavedPath)}>
                   <Copy aria-hidden="true" />
                   复制路径
-                </button>
-                <button type="button" className="text-button" onClick={sendMeetingTranscriptToAgent}>
-                  <SendHorizontal aria-hidden="true" />
-                  交给智能体
                 </button>
               </div>
             </div>
@@ -7450,7 +8804,18 @@ export default function App() {
                       正在识别这一段…
                     </p>
                   ) : segment.error ? (
-                    <p className="realtime-error-text">{segment.error}</p>
+                    <div className="realtime-segment-error">
+                      <p className="realtime-error-text">{segment.error}</p>
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        disabled={meetingLivePending > 0 || isRecording}
+                        onClick={() => void retryMeetingLiveSegment(segment)}
+                      >
+                        <RefreshCw aria-hidden="true" />
+                        重试这一段
+                      </button>
+                    </div>
                   ) : (
                     <p>{segment.text}</p>
                   )}
@@ -7993,6 +9358,9 @@ export default function App() {
                       <Badge tone={profile.api_key_configured ? "neutral" : "warning"}>
                         {profile.api_key_configured ? "密钥已配置" : "缺少密钥"}
                       </Badge>
+                      <Badge tone={profile.supports_vision ? "success" : "neutral"}>
+                        {profile.supports_vision ? "支持图片" : "仅文字"}
+                      </Badge>
                     </span>
                     <span className="model-profile-route">
                       <code translate="no">{profile.model}</code>
@@ -8082,7 +9450,8 @@ export default function App() {
                         model: preset.model,
                         temperature: preset.temperature,
                         max_tokens: preset.max_tokens,
-                        timeout_seconds: preset.timeout_seconds
+                        timeout_seconds: preset.timeout_seconds,
+                        supports_vision: preset.supports_vision
                       }));
                       setDiscoveredModelIds([]);
                       setModelConnectionResult(null);
@@ -8213,6 +9582,15 @@ export default function App() {
                     />
                   </Field>
                 </div>
+                <label className="checkbox-row">
+                  <input
+                    name="supports-vision"
+                    type="checkbox"
+                    checked={modelForm.supports_vision}
+                    onChange={(event) => setModelForm({ ...modelForm, supports_vision: event.target.checked })}
+                  />
+                  <span>支持图片输入（模型不支持时请勿开启）</span>
+                </label>
               </details>
 
               <label className="checkbox-row model-default-toggle">
@@ -8295,7 +9673,7 @@ export default function App() {
         <header className="library-header">
           <div>
             <h2>文件库</h2>
-            <p>拖进来的录音、图片、PDF、Word，以及智能体生成的纪要和 Markdown 产出都会保存在这里。</p>
+            <p>工作资料与文件办公区分开管理；文件可直接下载到当前使用的电脑。</p>
           </div>
           <div className="library-actions">
             <label className="library-search" htmlFor="library-search">
@@ -8342,39 +9720,71 @@ export default function App() {
         </div>
 
         <div className="library-layout">
-          <section className="library-list-panel" aria-label="文件列表">
-            <div className="library-table-head" aria-hidden="true">
-              <span>名称</span>
-              <span>修改时间</span>
-              <span>大小</span>
+          {libraryFileGroups.length === 0 ? (
+            <EmptyState text={files.length === 0 ? "还没有文件，拖入录音或材料后会显示在这里。" : "没有匹配的文件。"} />
+          ) : (
+            <div className="library-file-groups">
+              {libraryFileGroups.map((group) => (
+                <section
+                  key={group.id}
+                  className={"library-list-panel library-file-group is-" + group.id}
+                  aria-labelledby={"library-group-" + group.id}
+                >
+                  <header className="library-group-heading">
+                    <div>
+                      <h3 id={"library-group-" + group.id}>{group.title}</h3>
+                      <p>{group.description}</p>
+                    </div>
+                    <span>{group.files.length} 项</span>
+                  </header>
+                  <div className="library-table-head" aria-hidden="true">
+                    <span>名称</span>
+                    <span>修改时间</span>
+                    <span>大小</span>
+                    <span>操作</span>
+                  </div>
+                  <div className="library-file-list">
+                    {group.files.map((file) => (
+                      <div key={file.path} className="library-file-row">
+                        <button
+                          type="button"
+                          className="library-file-main"
+                          onClick={() => void openFile(file.path)}
+                        >
+                          <span className="library-name-cell">
+                            <span className={"library-file-icon file-kind-" + getLibraryKind(file)}>
+                              {iconForLibraryFile(file)}
+                            </span>
+                            <span>
+                              <span className="library-file-title-line">
+                                <strong>{file.name}</strong>
+                                {isOfficeWorkspaceFile(file) ? (
+                                  <small className="library-section-badge">{librarySectionLabel(file.library_section)}</small>
+                                ) : null}
+                              </span>
+                              <code translate="no">{file.path}</code>
+                            </span>
+                          </span>
+                          <span className="library-date-cell">{formatFileDate(file.modified)}</span>
+                          <span className="library-size-cell">{formatBytes(file.size)}</span>
+                        </button>
+                        <a
+                          className="library-download-button"
+                          href={file.download_url}
+                          download={file.name}
+                          aria-label={"下载 " + file.name + " 到当前电脑"}
+                          title="下载到当前电脑"
+                        >
+                          <Download aria-hidden="true" />
+                          <span>下载</span>
+                        </a>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              ))}
             </div>
-            <div className="library-file-list">
-              {filteredFiles.length === 0 ? (
-                <EmptyState text={files.length === 0 ? "还没有文件，拖入录音或材料后会显示在这里。" : "没有匹配的文件。"} />
-              ) : (
-                filteredFiles.map((file) => (
-                  <button
-                    key={file.path}
-                    type="button"
-                    className="library-file-row"
-                    onClick={() => openFile(file.path)}
-                  >
-                    <span className="library-name-cell">
-                      <span className={`library-file-icon file-kind-${getLibraryKind(file)}`}>
-                        {iconForLibraryFile(file)}
-                      </span>
-                      <span>
-                        <strong>{file.name}</strong>
-                        <code translate="no">{file.path}</code>
-                      </span>
-                    </span>
-                    <span className="library-date-cell">{formatFileDate(file.modified)}</span>
-                    <span className="library-size-cell">{formatBytes(file.size)}</span>
-                  </button>
-                ))
-              )}
-            </div>
-          </section>
+          )}
         </div>
       </div>
     );
@@ -8401,6 +9811,15 @@ export default function App() {
             <strong>{fileTitleForReader(file.name)}</strong>
           </div>
           <div className="file-reader-actions">
+            <a
+              className="secondary-button file-reader-download-button"
+              href={file.download_url}
+              download={file.name}
+              aria-label={"下载 " + file.name + " 到当前电脑"}
+            >
+              <Download aria-hidden="true" />
+              下载
+            </a>
             <button
               type="button"
               className="icon-button"
@@ -8409,24 +9828,6 @@ export default function App() {
               onClick={() => copyPath(file.path)}
             >
               <Copy aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              className="icon-button"
-              aria-label="用系统打开"
-              title="用系统打开"
-              onClick={() => openLocalFile(file.path)}
-            >
-              <ExternalLink aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              className="icon-button"
-              aria-label="在访达中显示"
-              title="在访达中显示"
-              onClick={() => revealLocalFile(file.path)}
-            >
-              <FolderOpen aria-hidden="true" />
             </button>
           </div>
         </header>
@@ -8523,16 +9924,12 @@ export default function App() {
           {iconForLibraryFile(file)}
         </span>
         <strong>这个文件暂不支持网页预览</strong>
-        <p>可以用系统打开，或在访达中定位后查看。</p>
+        <p>下载到当前电脑后，即可使用本地应用打开。</p>
         <div className="file-reader-unpreviewable-actions">
-          <button type="button" className="secondary-button" onClick={() => openLocalFile(file.path)}>
-            <ExternalLink aria-hidden="true" />
-            用系统打开
-          </button>
-          <button type="button" className="secondary-button" onClick={() => revealLocalFile(file.path)}>
-            <FolderOpen aria-hidden="true" />
-            在访达中显示
-          </button>
+          <a className="secondary-button" href={file.download_url} download={file.name}>
+            <Download aria-hidden="true" />
+            下载到当前电脑
+          </a>
         </div>
       </div>
     );
@@ -8560,24 +9957,50 @@ function AuthScreen({
   onSubmit
 }: {
   mode: "login" | "register";
-  form: { username: string; password: string; confirm: string };
+  form: { username: string; password: string; confirm: string; inviteCode: string };
   busy: boolean;
   error: string;
   onModeChange: (mode: "login" | "register") => void;
-  onFormChange: Dispatch<SetStateAction<{ username: string; password: string; confirm: string }>>;
+  onFormChange: Dispatch<SetStateAction<{ username: string; password: string; confirm: string; inviteCode: string }>>;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   return (
     <main className="auth-shell">
       <section className="auth-intro" aria-labelledby="auth-title">
-        <span className="auth-kicker">WORK AGENT / LOCAL</span>
-        <h1 id="auth-title">你的工作记录，<br />只留在你的账户里。</h1>
-        <p>对话、个人工作背景和上传文件按账户分开保存；模型与技能由管理员统一维护。</p>
+        <div className="auth-brand">
+          <span aria-hidden="true"><Sparkles /></span>
+          <div>
+            <strong>工作智能体</strong>
+            <small>本地工作台</small>
+          </div>
+        </div>
+        <div className="auth-intro-copy">
+          <h1 id="auth-title">让会议、对话和文件，成为可以继续推进的工作。</h1>
+          <p>从现场转写到会议纪要，从项目资料到日常协作，都在同一套本地工作流里衔接。</p>
+        </div>
+        <div className="auth-capabilities" aria-label="工作台能力">
+          <div>
+            <Mic aria-hidden="true" />
+            <span><strong>会议不断档</strong><small>实时 ASR、完整转写与纪要流程直接衔接</small></span>
+          </div>
+          <div>
+            <FolderOpen aria-hidden="true" />
+            <span><strong>资料有归属</strong><small>对话、文件和产出按账户与项目隔离保存</small></span>
+          </div>
+          <div>
+            <ShieldCheck aria-hidden="true" />
+            <span><strong>本地优先</strong><small>密码只存摘要，私有工作内容留在当前工作区</small></span>
+          </div>
+        </div>
         <div className="auth-signal" aria-label="服务状态">
           <span aria-hidden="true" /> 局域网服务已连接
         </div>
       </section>
       <section className="auth-panel" aria-label={mode === "login" ? "登录" : "注册账户"}>
+        <header className="auth-panel-heading">
+          <span>账户工作区</span>
+          <p>登录后继续上次的对话、会议和项目。</p>
+        </header>
         <div className="auth-mode-tabs" role="tablist" aria-label="账户操作">
           <button type="button" role="tab" aria-selected={mode === "login"} className={mode === "login" ? "is-active" : ""} onClick={() => onModeChange("login")}>登录</button>
           <button type="button" role="tab" aria-selected={mode === "register"} className={mode === "register" ? "is-active" : ""} onClick={() => onModeChange("register")}>注册</button>
@@ -8585,7 +10008,7 @@ function AuthScreen({
         <form className="auth-form" onSubmit={onSubmit}>
           <div>
             <h2>{mode === "login" ? "欢迎回来" : "建立独立工作区"}</h2>
-            <p>{mode === "login" ? "输入账户信息继续。" : "注册完成后会自动登录。"}</p>
+            <p>{mode === "login" ? "从你上次停下的地方继续。" : "注册完成后会自动进入新的独立工作区。"}</p>
           </div>
           <label>
             <span>用户名</span>
@@ -8596,10 +10019,16 @@ function AuthScreen({
             <input type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} value={form.password} onChange={(event) => onFormChange((value) => ({ ...value, password: event.target.value }))} placeholder="至少 8 位" required minLength={8} />
           </label>
           {mode === "register" ? (
-            <label>
-              <span>确认密码</span>
-              <input type="password" autoComplete="new-password" value={form.confirm} onChange={(event) => onFormChange((value) => ({ ...value, confirm: event.target.value }))} placeholder="再输入一次" required minLength={8} />
-            </label>
+            <>
+              <label>
+                <span>确认密码</span>
+                <input type="password" autoComplete="new-password" value={form.confirm} onChange={(event) => onFormChange((value) => ({ ...value, confirm: event.target.value }))} placeholder="再输入一次" required minLength={8} />
+              </label>
+              <label>
+                <span>邀请码</span>
+                <input type="password" autoComplete="off" value={form.inviteCode} onChange={(event) => onFormChange((value) => ({ ...value, inviteCode: event.target.value }))} placeholder="向管理员获取邀请码" required />
+              </label>
+            </>
           ) : null}
           {error ? <p className="auth-error" role="alert"><AlertCircle aria-hidden="true" />{error}</p> : null}
           <button type="submit" className="auth-submit" disabled={busy}>
@@ -9112,6 +10541,13 @@ function MarkdownContent({ content, onOpenFile }: MarkdownContentProps) {
   );
 }
 
+// Activity updates arrive while a long chat is running. Keep unchanged
+// historical replies from reparsing their Markdown on every progress tick.
+const CachedMarkdownContent = memo(
+  MarkdownContent,
+  (previous, next) => previous.content === next.content
+);
+
 function renderMarkdownBlock(
   block: MarkdownBlock,
   index: number,
@@ -9595,10 +11031,13 @@ function titleForView(view: View, artifactTab: ArtifactTab) {
   if (view === "projects") return "项目";
   if (view === "skills") return "技能";
   if (view === "transcribe") return "实时转写";
+  if (view === "record") return "单纯录音";
   if (view === "artifacts") return artifactTab === "files" ? "文件库" : "会议纪要";
   if (view === "models") return "模型与设置";
   if (view === "sync") return "临时同步区";
   if (view === "work-calendar") return "工作日历";
+  if (view === "apple-pim") return "日程与提醒";
+  if (view === "office") return "文件办公区";
   if (view === "more") return "更多";
   return "智能体对话";
 }
@@ -9626,6 +11065,46 @@ function explainMicrophonePermissionError(error: unknown) {
     }
   }
   return "无法获取麦克风权限，请检查浏览器和系统麦克风权限。";
+}
+
+function recordingCapabilityError() {
+  const hostname = window.location.hostname.toLowerCase();
+  const isLoopbackHost = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+  if (!window.isSecureContext && !isLoopbackHost) {
+    return "当前通过局域网 HTTP 地址打开，浏览器不会开放麦克风；请改用 HTTPS，或在本机访问 http://localhost:8787。";
+  }
+  if (typeof navigator.mediaDevices?.getUserMedia !== "function") {
+    return "当前浏览器环境没有可用的麦克风接口；请使用最新版 Chrome、Edge 或 Safari，并检查页面权限。";
+  }
+  if (typeof MediaRecorder === "undefined") {
+    return "当前浏览器环境没有可用的录音接口；请使用最新版 Chrome、Edge 或 Safari。";
+  }
+  return null;
+}
+
+function recordingEnvironmentError(mode: MeetingCaptureMode) {
+  const capabilityError = recordingCapabilityError();
+  if (capabilityError) return capabilityError;
+  if (mode === "system-audio" && typeof navigator.mediaDevices?.getDisplayMedia !== "function") {
+    return "当前浏览器不支持系统声音捕获；请使用最新版 Chrome 或 Edge，或切换为“仅麦克风”。";
+  }
+  return null;
+}
+
+function explainSystemAudioCaptureError(error: unknown) {
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError" || error.name === "AbortError") {
+      return "系统声音共享被取消。请重新开始，并在共享弹窗中选择屏幕或会议标签页，勾选“共享声音”。";
+    }
+    if (error.name === "NotFoundError") {
+      return "没有找到可共享的屏幕或标签页，请使用最新版 Chrome 或 Edge。";
+    }
+  }
+  if (error instanceof Error && error.message.includes("系统声音捕获")) {
+    return `${error.message} 如果只需要录麦克风，请切换为“仅麦克风”。`;
+  }
+  const message = error instanceof Error ? error.message : "";
+  return message || "系统声音捕获失败，请重新选择屏幕并勾选“共享声音”。";
 }
 
 function explainRecorderStartError(error: unknown) {
@@ -9828,8 +11307,65 @@ function orderConversationHistory(items: ConversationHistoryItem[]) {
   });
 }
 
+type ConversationTaskStatus = "idle" | "running" | "waiting" | "completed" | "error";
+
+function conversationTaskStatus(
+  item: ConversationHistoryItem,
+  hasActiveRun = false
+): ConversationTaskStatus {
+  const records = item.activities ?? {};
+  const activityIndex = item.activeActivityIndex ?? lastActivityRecordIndex(records);
+  const record = activityIndex === null ? undefined : records[activityIndex];
+  if (hasActiveRun) return "running";
+  const taskKey = conversationTaskKey(item);
+  if (taskKey && item.acknowledgedTaskKey === taskKey) return "idle";
+  if (!record?.completed && item.activeTurnStatus === "waiting_approval") return "waiting";
+  const lastAssistantMessage = [...item.messages]
+    .reverse()
+    .find((message) => message.role === "assistant")?.content ?? "";
+  if (isRetryableChatFailure(lastAssistantMessage)) {
+    return "error";
+  }
+  // Only an in-memory run handle proves that work is still executing. A
+  // persisted `running` marker without that handle belongs to an interrupted
+  // stream or an older page session and must not spin forever.
+  if (!record) return item.activeTurnStatus === "running" ? "error" : "idle";
+  if (!record.completed) return "error";
+  const lastEvent = record.events[record.events.length - 1];
+  if (lastEvent?.phase === "error" || lastEvent?.command_status === "error") {
+    return "error";
+  }
+  return "completed";
+}
+
+function conversationTaskKey(item: ConversationHistoryItem) {
+  const records = item.activities ?? {};
+  const activityIndex = item.activeActivityIndex ?? lastActivityRecordIndex(records);
+  const record = activityIndex === null ? undefined : records[activityIndex];
+  if (record?.turnId) return `turn:${record.turnId}`;
+  if (item.activeTurnId) return `turn:${item.activeTurnId}`;
+  if (activityIndex !== null && record) {
+    return `activity:${activityIndex}:${record.elapsedMs}:${record.events.length}`;
+  }
+  return "";
+}
+
+function conversationTaskStatusLabel(status: ConversationTaskStatus) {
+  if (status === "running") return "执行中";
+  if (status === "waiting") return "等待确认";
+  if (status === "completed") return "已完成";
+  if (status === "error") return "执行失败";
+  return "未开始";
+}
+
 function upsertConversation(items: ConversationHistoryItem[], next: ConversationHistoryItem) {
-  return orderConversationHistory([next, ...items.filter((item) => item.id !== next.id)]);
+  const existingIndex = items.findIndex((item) => item.id === next.id);
+  if (existingIndex === -1) {
+    return orderConversationHistory([next, ...items]);
+  }
+  return orderConversationHistory(
+    items.map((item, index) => (index === existingIndex ? next : item))
+  );
 }
 
 function mergeConversationHistories(
@@ -9851,15 +11387,17 @@ function mergeConversationHistories(
       byId.set(local.id, archived);
       continue;
     }
-    // Browser state is normally newer, but older browser archives could be
-    // missing projectId after the first-turn title save.  Merge that durable
-    // server-side association back instead of hiding the chat from its project.
-    byId.set(
-      local.id,
-      archived && !local.projectId && archived.projectId
-        ? { ...local, projectId: archived.projectId }
-        : local
-    );
+    if (archived) {
+      const mergedActivities = mergeConversationActivities(archived.activities, local.activities);
+      byId.set(local.id, {
+        ...local,
+        projectId: local.projectId ?? archived.projectId,
+        activities: mergedActivities,
+        activeActivityIndex: local.activeActivityIndex ?? archived.activeActivityIndex
+      });
+      continue;
+    }
+    byId.set(local.id, local);
   }
   return orderConversationHistory(Array.from(byId.values()));
 }
@@ -10240,6 +11778,52 @@ function compactActivityLine(text: string, limit = 150) {
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }
 
+function latestRuntimeSummaryEvent(events: AgentActivityEvent[]) {
+  const event = events[events.length - 1];
+  return event?.activity_type === "runtime_summary" ? event : null;
+}
+
+function latestCompletedRuntimeSummaryEvent(events: AgentActivityEvent[]) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.activity_type === "runtime_summary" && event.runtime_stage === "complete") return event;
+  }
+  return null;
+}
+
+function summarizeFileChanges(events: AgentActivityEvent[]) {
+  const changes = new Map<string, { filePath: string; additions: number; deletions: number }>();
+  for (const event of events) {
+    if (event.activity_type !== "file_edit" || event.command_status === "error") continue;
+    const eventChanges = event.file_changes?.length
+      ? event.file_changes.map((entry) => ({
+          filePath: entry.file_path,
+          additions: entry.additions,
+          deletions: entry.deletions
+        }))
+      : event.file_path
+        ? [{ filePath: event.file_path, additions: event.additions ?? 0, deletions: event.deletions ?? 0 }]
+        : [];
+    for (const entry of eventChanges) {
+      const current = changes.get(entry.filePath) ?? { filePath: entry.filePath, additions: 0, deletions: 0 };
+      changes.set(entry.filePath, {
+        filePath: entry.filePath,
+        additions: current.additions + entry.additions,
+        deletions: current.deletions + entry.deletions
+      });
+    }
+  }
+  return Array.from(changes.values());
+}
+
+function latestPlanActivity(events: AgentActivityEvent[]) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.activity_type === "plan" && event.plan?.length) return event;
+  }
+  return null;
+}
+
 function activityRowCommandLine(event: AgentActivityEvent) {
   const command = event.command ?? event.tool_name ?? "";
   if (!command) return event.title;
@@ -10360,6 +11944,20 @@ function commandStatusText(status: NonNullable<AgentActivityEvent["command_statu
   return "运行中";
 }
 
+function executionDeliveryLabel(item: AgentActivityEvent) {
+  if (item.delivery_status === "applied") return "已验证并写回";
+  if (item.delivery_status === "validated") return "已验证";
+  if (item.delivery_status === "changes_ready") return "等待写回";
+  if (item.delivery_status === "conflicted") return "写回冲突";
+  if (item.execution_status === "running") return "执行中";
+  if (item.execution_status === "failed") return "执行失败";
+  return "受策略约束";
+}
+
+function shortExecutionId(value: string) {
+  return value.length <= 18 ? value : `${value.slice(0, 9)}…${value.slice(-6)}`;
+}
+
 function weixinLoginStatusLabel(login: WeixinLoginState) {
   if (login.needs_verify_code || login.status === "need_verifycode") return "需要输入配对数字";
   if (login.status === "scaned") return "已扫码，请在手机上确认";
@@ -10421,10 +12019,16 @@ function appendActivityDelta(
         file_path: delta.file_path,
         additions: delta.additions,
         deletions: delta.deletions,
+        file_changes: delta.file_changes,
         step: delta.step,
         tool_name: delta.tool_name,
         selected_skill: delta.selected_skill,
-        elapsed_ms: delta.elapsed_ms
+        elapsed_ms: delta.elapsed_ms,
+        execution_id: delta.execution_id,
+        execution_status: delta.execution_status,
+        delivery_status: delta.delivery_status,
+        change_set_id: delta.change_set_id,
+        receipt_id: delta.receipt_id
       }
     ];
   }
@@ -10463,10 +12067,16 @@ function appendActivityDelta(
           file_path: delta.file_path ?? item.file_path,
           additions: delta.additions ?? item.additions,
           deletions: delta.deletions ?? item.deletions,
+          file_changes: delta.file_changes ?? item.file_changes,
           step: delta.step ?? item.step,
           tool_name: delta.tool_name ?? item.tool_name,
           selected_skill: delta.selected_skill ?? item.selected_skill,
-          elapsed_ms: delta.elapsed_ms ?? item.elapsed_ms
+          elapsed_ms: delta.elapsed_ms ?? item.elapsed_ms,
+          execution_id: delta.execution_id ?? item.execution_id,
+          execution_status: delta.execution_status ?? item.execution_status,
+          delivery_status: delta.delivery_status ?? item.delivery_status,
+          change_set_id: delta.change_set_id ?? item.change_set_id,
+          receipt_id: delta.receipt_id ?? item.receipt_id
         }
       : item
   );
@@ -10523,11 +12133,18 @@ function browserConversationHistoryItem(item: ConversationHistoryItem): Conversa
 }
 
 function sanitizeConversationHistoryItem(item: ConversationHistoryItem): ConversationHistoryItem {
-  return {
+  const sanitized = {
     ...item,
     messages: item.messages.map(sanitizeChatMessage),
     activities: item.activities ? sanitizeActivityRecords(item.activities) : item.activities
   };
+  const records = sanitized.activities ?? {};
+  const activityIndex = sanitized.activeActivityIndex ?? lastActivityRecordIndex(records);
+  const activeRecord = activityIndex === null ? undefined : records[activityIndex];
+  if (activeRecord?.completed) {
+    return { ...sanitized, activeTurnId: undefined, activeTurnStatus: undefined };
+  }
+  return sanitized;
 }
 
 function sanitizeChatMessage(message: ChatMessage): ChatMessage {
@@ -10603,6 +12220,7 @@ function isConversationHistoryItem(value: unknown): value is ConversationHistory
     (item.activeActivityIndex === undefined ||
       item.activeActivityIndex === null ||
       typeof item.activeActivityIndex === "number") &&
+    (item.acknowledgedTaskKey === undefined || typeof item.acknowledgedTaskKey === "string") &&
     (item.pinned === undefined || typeof item.pinned === "boolean") &&
     (item.projectId === undefined || typeof item.projectId === "string")
   );
@@ -10669,6 +12287,11 @@ function isAgentActivityEvent(value: unknown): value is AgentActivityEvent {
     (event.file_path === undefined || typeof event.file_path === "string") &&
     (event.additions === undefined || typeof event.additions === "number") &&
     (event.deletions === undefined || typeof event.deletions === "number") &&
+    (event.file_changes === undefined ||
+      (Array.isArray(event.file_changes) && event.file_changes.every((entry) =>
+        entry && typeof entry.file_path === "string" &&
+        typeof entry.additions === "number" && typeof entry.deletions === "number"
+      ))) &&
     (event.step === undefined || typeof event.step === "number") &&
     (event.tool_name === undefined || typeof event.tool_name === "string") &&
     (event.selected_skill === undefined ||
@@ -10677,6 +12300,11 @@ function isAgentActivityEvent(value: unknown): value is AgentActivityEvent {
     (event.elapsed_ms === undefined || typeof event.elapsed_ms === "number") &&
     (event.trace_id === undefined || typeof event.trace_id === "string") &&
     (event.debug_trace_path === undefined || typeof event.debug_trace_path === "string")
+    && (event.execution_id === undefined || typeof event.execution_id === "string")
+    && (event.execution_status === undefined || typeof event.execution_status === "string")
+    && (event.delivery_status === undefined || typeof event.delivery_status === "string")
+    && (event.change_set_id === undefined || event.change_set_id === null || typeof event.change_set_id === "string")
+    && (event.receipt_id === undefined || typeof event.receipt_id === "string")
   );
 }
 
@@ -10689,11 +12317,12 @@ function updateConversationMessages(
   fallbackTitle = titleFromMessages(messages),
   contextSummary = "",
   contextSummaryMessageCount = 0,
-  projectId?: string
+  projectId?: string,
+  runState?: ConversationRunState
 ) {
   const current = items.find((item) => item.id === id);
   if (!current) {
-    return upsertConversation(items, {
+    return upsertConversation(items, applyConversationRunState({
       id,
       title: fallbackTitle,
       group: "最近",
@@ -10703,16 +12332,31 @@ function updateConversationMessages(
       activities,
       activeActivityIndex,
       projectId
-    });
+    }, runState));
   }
-  return upsertConversation(items, {
+  return upsertConversation(items, applyConversationRunState({
     ...current,
     messages,
     contextSummary,
     contextSummaryMessageCount,
     activities,
     activeActivityIndex
-  });
+  }, runState));
+}
+
+function applyConversationRunState(
+  item: ConversationHistoryItem,
+  runState: ConversationRunState | undefined
+): ConversationHistoryItem {
+  if (runState === undefined) return item;
+  if (runState === null) {
+    return { ...item, activeTurnId: undefined, activeTurnStatus: undefined };
+  }
+  return {
+    ...item,
+    activeTurnId: runState.turnId,
+    activeTurnStatus: runState.status
+  };
 }
 
 function shouldGenerateModelTitle(item: ConversationHistoryItem) {
@@ -11019,23 +12663,82 @@ function iconForLibraryFile(file: Pick<FileItem, "kind" | "extension">) {
 function filterLibraryFiles(files: FileItem[], query: string, filter: FileFilter) {
   const normalizedQuery = query.trim().toLowerCase();
   return files.filter((file) => {
+    const isOfficeFile = isOfficeWorkspaceFile(file);
     const matchesFilter =
       filter === "all" ||
-      (filter === "output" ? isGeneratedOutput(file) : getLibraryKind(file) === filter);
+      (filter === "office"
+        ? isOfficeFile
+        : !isOfficeFile && (filter === "output" ? isGeneratedOutput(file) : getLibraryKind(file) === filter));
     if (!matchesFilter) return false;
     if (!normalizedQuery) return true;
     return `${file.name} ${file.path} ${file.extension}`.toLowerCase().includes(normalizedQuery);
   });
 }
 
+function groupLibraryFiles(files: FileItem[], filter: FileFilter): LibraryFileGroup[] {
+  const officeFiles = files.filter(isOfficeWorkspaceFile);
+  const standardFiles = files.filter((file) => !isOfficeWorkspaceFile(file));
+  if (filter === "all") {
+    const groups: LibraryFileGroup[] = [
+      {
+        id: "standard",
+        title: "工作资料",
+        description: "上传材料与智能体生成的常规工作文件",
+        files: standardFiles
+      },
+      {
+        id: "office",
+        title: "文件办公区",
+        description: "PDF 合并时加入的原件与已生成的合并结果",
+        files: officeFiles
+      }
+    ];
+    return groups.filter((group) => group.files.length > 0);
+  }
+  if (filter === "office") {
+    return [
+      {
+        id: "office",
+        title: "文件办公区",
+        description: "PDF 合并时加入的原件与已生成的合并结果",
+        files: officeFiles
+      }
+    ];
+  }
+  const labels: Record<Exclude<FileFilter, "all" | "office">, [string, string]> = {
+    audio: ["录音", "已上传的音频与录音材料"],
+    image: ["图片", "已上传的图片与截图材料"],
+    document: ["文件", "常规文档、PDF 与表格"],
+    output: ["智能体产出", "由智能体生成的纪要与工作文件"]
+  };
+  const [title, description] = labels[filter];
+  return [{ id: "standard", title, description, files: standardFiles }];
+}
+
 function countLibraryFiles(files: FileItem[]): Record<FileFilter, number> {
+  const standardFiles = files.filter((file) => !isOfficeWorkspaceFile(file));
   return {
     all: files.length,
-    audio: files.filter((file) => getLibraryKind(file) === "audio").length,
-    image: files.filter((file) => getLibraryKind(file) === "image").length,
-    document: files.filter((file) => getLibraryKind(file) === "document").length,
-    output: files.filter(isGeneratedOutput).length
+    audio: standardFiles.filter((file) => getLibraryKind(file) === "audio").length,
+    image: standardFiles.filter((file) => getLibraryKind(file) === "image").length,
+    document: standardFiles.filter((file) => getLibraryKind(file) === "document").length,
+    output: standardFiles.filter(isGeneratedOutput).length,
+    office: files.filter(isOfficeWorkspaceFile).length
   };
+}
+
+function isOfficeWorkspaceFile(file: Pick<FileItem, "path" | "library_section">) {
+  return (
+    file.library_section === "office_input" ||
+    file.library_section === "office_output" ||
+    file.path.startsWith("meet_files/office_workspace/")
+  );
+}
+
+function librarySectionLabel(section: FileItem["library_section"]) {
+  if (section === "office_input") return "待合并原件";
+  if (section === "office_output") return "合并结果";
+  return "文件办公区";
 }
 
 function getLibraryKind(file: Pick<FileItem, "kind" | "extension">): AttachmentItem["kind"] {

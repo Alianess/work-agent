@@ -125,6 +125,18 @@ class SessionStore:
             tmp_path.replace(path)
         return session
 
+    def delete(self, conversation_id: str) -> bool:
+        """Delete one conversation's durable runtime session, if present."""
+        safe_id = sanitize_conversation_id(conversation_id)
+        if not safe_id:
+            raise ValueError("conversation_id is required")
+        path = self._path_for(safe_id)
+        with self._lock:
+            existed = path.is_file()
+            path.unlink(missing_ok=True)
+            path.with_suffix(".tmp").unlink(missing_ok=True)
+        return existed
+
     def bootstrap_from_display_messages(
         self,
         session: ConversationSession,

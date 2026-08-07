@@ -4,6 +4,7 @@ import base64
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
@@ -62,6 +63,41 @@ class ProjectPayloadTests(unittest.TestCase):
         deleted = web_server.delete_project_file_payload(created["id"], {"path": file_path})
         self.assertTrue(deleted["ok"])
         self.assertEqual(deleted["project"]["file_count"], 0)
+
+    def test_concurrent_project_and_attachment_writes_preserve_every_entry(self) -> None:
+        project = web_server.create_project_payload({"name": "并发写入测试"})["project"]
+
+        def upload_project_file(index: int) -> None:
+            web_server.add_project_file_bytes_payload(
+                project["id"],
+                {"name": f"项目资料-{index}.txt", "mime_type": "text/plain"},
+                f"project-{index}".encode("utf-8"),
+            )
+
+        def upload_attachment(index: int) -> None:
+            web_server.add_attachment_bytes_payload(
+                {
+                    "name": f"附件-{index}.txt",
+                    "mime_type": "text/plain",
+                    "last_modified": index + 1,
+                },
+                f"attachment-{index}".encode("utf-8"),
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(upload_project_file, range(8)))
+            list(executor.map(upload_attachment, range(8)))
+
+        detail = web_server.project_detail_payload(project["id"])["project"]
+        self.assertEqual(detail["file_count"], 8)
+        attachment_dir = self.workspace / "meet_files" / "attachments"
+        attachment_index = web_server.load_attachment_index(attachment_dir)
+        self.assertEqual(len(attachment_index), 8)
+        self.assertEqual(
+            len([path for path in attachment_dir.iterdir() if path.is_file() and not path.name.startswith(".")]),
+            8,
+        )
+        self.assertFalse(any(path.name.endswith(".tmp") for path in self.workspace.rglob("*")))
 
     def test_project_timeline_understands_common_chinese_dates(self) -> None:
         self.assertEqual(

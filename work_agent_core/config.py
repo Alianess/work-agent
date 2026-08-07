@@ -97,6 +97,24 @@ def delete_env_value(path: str | Path, key: str) -> None:
     os.environ.pop(env_key, None)
 
 
+def infer_model_vision_support(data: dict[str, Any]) -> bool:
+    """Conservative fallback for legacy profiles without an explicit flag."""
+
+    identity = " ".join(
+        str(data.get(key) or "")
+        for key in ("name", "provider", "base_url", "model")
+    ).lower()
+    if "deepseek" in identity:
+        return False
+    return any(
+        marker in identity
+        for marker in (
+            "gpt-4o", "gpt-4.1", "gpt-5", "gemini", "claude-3", "claude-4",
+            "qwen-vl", "qwen2.5-vl", "qvq", "glm-4v", "pixtral", "llava", "vision",
+        )
+    )
+
+
 @dataclass(frozen=True)
 class ModelProfile:
     name: str
@@ -107,6 +125,7 @@ class ModelProfile:
     temperature: float = 0.6
     max_tokens: int = 8192
     timeout_seconds: int = 120
+    supports_vision: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelProfile":
@@ -119,6 +138,11 @@ class ModelProfile:
             temperature=float(data.get("temperature", 0.6)),
             max_tokens=int(data.get("max_tokens", 8192)),
             timeout_seconds=int(data.get("timeout_seconds", 120)),
+            supports_vision=(
+                bool(data["supports_vision"])
+                if isinstance(data.get("supports_vision"), bool)
+                else infer_model_vision_support(data)
+            ),
         )
 
     def api_key(self) -> str:

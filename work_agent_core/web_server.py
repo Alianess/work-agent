@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +14,7 @@ import argparse
 import array
 import base64
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -47,22 +48,30 @@ from .config import (
     ModelRegistry,
     api_key_env_for_profile,
     delete_env_value,
+    infer_model_vision_support,
+    load_env_file,
     save_env_value,
 )
 from .debug_trace import DebugTrace, list_debug_traces
+from .execution.store import ExecutionRecord, ExecutionStore
+from .execution.workspace import WorkspaceManager
 from .cross_chat_memory import CrossChatMemoryStore
 from .llm import OpenAICompatibleClient, chat_completions_endpoint, normalize_reasoning_effort
 from .memory import (
     CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
     CHAT_SUMMARY_TRIGGER_TOKENS,
+    ContextCompactionCancelled,
     ContextCompactionError,
     extract_recent_visible_turns,
+    inspect_session_memory,
     prepare_session_memory,
 )
 from .message_channel import ChannelMessage, ChannelReply
 from .notifications import NotificationStore
-from .history_recall import render_history_recall_system_context
+from .history_recall import delete_conversation_index, render_history_recall_system_context
+from .host_services.apple_pim import ApplePimService
 from .office_preview import OFFICE_TO_PDF_EXTENSIONS, convert_office_to_pdf
+from .office_workspace import merge_pdfs, relative_workspace_path, save_pdf_input
 from .react import (
     DEFAULT_MAX_STEPS,
     AgentCancelled,
@@ -80,7 +89,7 @@ from .skills.meeting_minutes import MeetingMinutesSkill
 from .skill_runtime import load_skill_manifests
 from .tools import WorkspaceFiles
 from .turn_runtime import TurnCancelled, TurnRuntime
-from .turn_store import TurnStore, sanitize_turn_id
+from .turn_store import TERMINAL_STATUSES, TurnStore, sanitize_turn_id
 from .weixin_channel import WeixinGatewayManager
 from .work_reports import WorkReportStore
 
@@ -105,6 +114,7 @@ CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbo
 ACTIVE_CHAT_CONVERSATIONS: set[tuple[int, str]] = set()
 ACTIVE_CHAT_CONVERSATIONS_LOCK = threading.Lock()
 PENDING_CONVERSATION_TITLE = "待命名对话"
+FRIDAY_CONVERSATION_ID = "friday-main"
 CONVERSATION_HISTORY_PATH = Path("meet_files/conversation_history/conversations.json")
 PROJECTS_ROOT = Path("meet_files/projects")
 PROJECT_ID_PATTERN = re.compile(r"^project-[a-f0-9]{12}$")
@@ -123,23 +133,34 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     "work_background": "",
     "company_document_format": "",
 }
-DEFAULT_DISABLED_SKILL_IDS = {"baidu-web-search", "tavily-search", "edge-browser"}
+# All installed skills are available by default. Users can still turn off
+# individual skills from the Skills page; missing credentials or external
+# runtimes are reported when that skill is actually invoked.
+DEFAULT_DISABLED_SKILL_IDS: set[str] = set()
 
 AUTH_STORE: AuthStore | None = None
 REQUEST_AUTH = threading.local()
 USER_STORES_LOCK = threading.RLock()
+PROJECTS_LOCK = threading.RLock()
+ATTACHMENT_INDEX_LOCK = threading.RLock()
 USER_SESSION_STORES: dict[int, SessionStore] = {}
 USER_TURN_STORES: dict[int, TurnStore] = {}
 TEMP_SYNC_LOCK = threading.RLock()
 TEMP_SYNC_FILE_TTL_SECONDS = 60 * 60
-TEMP_SYNC_MAX_FILE_BYTES = 100 * 1024 * 1024
+TEMP_SYNC_MAX_FILE_BYTES = 250 * 1024 * 1024
 TEMP_SYNC_MAX_TEXT_CHARS = 200_000
+UPLOAD_MAX_FILE_BYTES = 250 * 1024 * 1024
 TEMP_SYNC_FILE_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+REALTIME_TRANSCRIPT_SESSION_ID_PATTERN = re.compile(r"^rt-[a-z0-9][a-z0-9-]{7,79}$")
+EXECUTION_ID_PATTERN = re.compile(r"^exe_[a-f0-9]{32}$")
+REALTIME_TRANSCRIPT_LOCK = threading.RLock()
 CONVERSATION_ARCHIVE_LOCK = threading.RLock()
 CONVERSATION_ARCHIVE_SCHEMA_VERSION = 2
 WEIXIN_GATEWAY: WeixinGatewayManager | None = None
 FRIDAY_SCHEDULER_STOP = threading.Event()
 FRIDAY_SCHEDULER_THREAD: threading.Thread | None = None
+AUTO_DAILY_REPORT_LOCK = threading.RLock()
+AUTO_DAILY_REPORT_IN_PROGRESS: set[tuple[int, str]] = set()
 
 
 def get_auth_store() -> AuthStore:
@@ -209,7 +230,10 @@ def account_workspace_root(user: AuthUser | None = None) -> Path:
     account = user or current_auth_user()
     if account.role == "admin":
         return WORKSPACE_ROOT
-    root = user_data_dir(account) / "workspace"
+    # Keep all later relative_to() checks on the same canonical path.  This
+    # matters on macOS where temporary directories can be addressed through
+    # both /var and /private/var.
+    root = (user_data_dir(account) / "workspace").resolve()
     (root / "meet_files").mkdir(parents=True, exist_ok=True)
     return root
 
@@ -291,6 +315,41 @@ def disconnect_weixin_payload() -> dict[str, Any]:
 
 def notifications_payload() -> dict[str, Any]:
     return NotificationStore(user_notification_path()).payload()
+
+
+def apple_pim_service() -> ApplePimService:
+    return ApplePimService(WORKSPACE_ROOT)
+
+
+def apple_pim_status_payload() -> dict[str, Any]:
+    """Return host-wide EventKit state to the current Mac owner only.
+
+    Unlike ordinary Work Agent data, iCloud calendars are shared at the macOS
+    account level.  The HTTP routes therefore require the local administrator
+    and never treat this data as member-account-local storage.
+    """
+    return apple_pim_service().status()
+
+
+def apple_pim_request_access_payload(*, events: bool, reminders: bool) -> dict[str, Any]:
+    service = apple_pim_service()
+    payload = service.request_access(events=events, reminders=reminders)
+    return {**payload, "status": service.status()}
+
+
+def apple_pim_items_payload(
+    *,
+    start_at: str,
+    end_at: str,
+    include_events: bool,
+    include_reminders: bool,
+) -> dict[str, Any]:
+    return apple_pim_service().items(
+        start_at=start_at,
+        end_at=end_at,
+        include_events=include_events,
+        include_reminders=include_reminders,
+    )
 
 
 def work_report_calendar_payload(year: int, month: int) -> dict[str, Any]:
@@ -403,11 +462,7 @@ def friday_scheduler_loop() -> None:
                 notification_store = NotificationStore(user_notification_path(user))
                 audit = WorkReportStore(user_data_dir(user)).audit_if_due()
                 if audit.get("notify"):
-                    notification_store.add(
-                        kind="conversation",
-                        title="日报缺失提醒",
-                        body=work_report_gap_message(audit),
-                    )
+                    schedule_automatic_daily_reports(user, audit)
                 notification_store.claim_due(kind="reminder")
                 for item in notification_store.due_conversations():
                     append_friday_proactive_message(str(item.get("body") or ""))
@@ -422,6 +477,212 @@ def friday_scheduler_loop() -> None:
         FRIDAY_SCHEDULER_STOP.wait(5)
 
 
+def schedule_automatic_daily_reports(user: AuthUser, audit: dict[str, Any]) -> None:
+    missing = [str(item) for item in audit.get("missing_daily_reports") or [] if str(item)]
+    counts = audit.get("evidence_counts_by_date") if isinstance(audit.get("evidence_counts_by_date"), dict) else {}
+    with_evidence = [day for day in missing if int(counts.get(day) or 0) > 0]
+    without_evidence = [day for day in missing if day not in with_evidence]
+    if without_evidence:
+        append_friday_proactive_message(
+            "以下工作日没有发现可用于自动生成日报的本地记录："
+            f"{'、'.join(without_evidence)}。如果当天有线下工作，你有空时直接补充事实即可；"
+            "系统不会凭空编写。"
+        )
+    for target_date in with_evidence:
+        key = (int(user.id), target_date)
+        with AUTO_DAILY_REPORT_LOCK:
+            if key in AUTO_DAILY_REPORT_IN_PROGRESS:
+                continue
+            AUTO_DAILY_REPORT_IN_PROGRESS.add(key)
+        threading.Thread(
+            target=automatic_daily_report_worker,
+            args=(user, target_date),
+            name=f"friday-auto-daily-{user.id}-{target_date}",
+            daemon=True,
+        ).start()
+
+
+def automatic_daily_report_worker(user: AuthUser, target_date: str) -> None:
+    key = (int(user.id), str(target_date))
+    previous_user = getattr(REQUEST_AUTH, "user", None)
+    REQUEST_AUTH.user = user
+    turn_runtime: TurnRuntime | None = None
+    try:
+        report_store = WorkReportStore(user_data_dir(user))
+        existing = report_store.load_report(
+            "daily",
+            date.fromisoformat(target_date),
+            date.fromisoformat(target_date),
+        )
+        if existing is not None:
+            return
+        registry = load_registry()
+        profile = registry.get(registry.default_profile)
+        turn_runtime = TurnRuntime.start(
+            get_turn_store(),
+            conversation_id="friday-main",
+            profile=profile.name,
+            model=profile.model,
+            route="/scheduler/work-reports/daily",
+            metadata={"report_type": "daily", "target_date": target_date, "automatic": True},
+        )
+        turn_runtime.emit(
+            {
+                "event": "activity",
+                "phase": "thinking",
+                "title": "自动生成日报",
+                "detail": f"正在根据 {target_date} 的本地工作记录整理并保存日报。",
+                "activity_type": "automatic_daily_report",
+            }
+        )
+        evidence = report_store.collect(report_type="daily", target_date=target_date)
+        if int(evidence.get("raw_evidence_count") or 0) <= 0:
+            raise ValueError(f"{target_date} 没有可用于自动生成日报的本地工作记录。")
+        model_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是 Friday 的自动日报整理器。只能使用提供的日期范围和本地工作证据，"
+                    "不得补写未发生的工作，不得把计划、失败尝试或工具调用写成完成结果。"
+                    "按业务或项目合并重复事项，输出简洁中文 Markdown，不要代码围栏。结构为："
+                    f"# {target_date} 工作简报；## 今日完成；必要时 ## 推进中；## 下一步。"
+                    "没有内容的章节直接省略，不要写‘无’或占位符。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(evidence, ensure_ascii=False),
+            },
+        ]
+        response, selected_profile, attempted_profiles = automatic_report_model_response(
+            model_messages,
+            registry=registry,
+            preferred_profile=profile,
+            turn_runtime=turn_runtime,
+        )
+        turn_runtime.store.update_metadata(
+            turn_runtime.turn_id,
+            {
+                "selected_profile": selected_profile.name,
+                "attempted_profiles": attempted_profiles,
+            },
+        )
+        content = strip_markdown_code_fence(response.content)
+        saved = report_store.save_report(
+            report_type="daily",
+            target_date=target_date,
+            content=content,
+            source_coverage=(
+                "partial" if evidence.get("evidence_truncated_for_context") else "full"
+            ),
+            needs_user_input=False,
+        )
+        if not saved.get("verified"):
+            raise RuntimeError("自动日报保存后未通过校验。")
+        final_text = (
+            f"已根据本地工作记录自动生成并保存 {target_date} 日报："
+            f"{saved.get('content_path')}。不需要回复“补日报”。"
+        )
+        append_friday_proactive_message(final_text)
+        turn_runtime.emit(
+            {
+                "event": "final",
+                "content": final_text,
+                "used_tools": False,
+                "steps_used": 1,
+            }
+        )
+    except Exception as error:
+        failure_text = (
+            f"{target_date} 日报自动生成失败：{friendly_error_message(error)}。"
+            "已保留本地工作记录，稍后会重新检测；不需要回复固定口令。"
+        )
+        try:
+            append_friday_proactive_message(failure_text)
+        except Exception:
+            pass
+        if turn_runtime is not None:
+            turn_runtime.fail_event(error)
+    finally:
+        with AUTO_DAILY_REPORT_LOCK:
+            AUTO_DAILY_REPORT_IN_PROGRESS.discard(key)
+        if isinstance(previous_user, AuthUser):
+            REQUEST_AUTH.user = previous_user
+        elif hasattr(REQUEST_AUTH, "user"):
+            delattr(REQUEST_AUTH, "user")
+
+
+def strip_markdown_code_fence(value: str) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"```(?:markdown|md)?\s*\n([\s\S]*?)\n```", text, re.IGNORECASE)
+    return match.group(1).strip() if match else text
+
+
+def automatic_report_model_response(
+    messages: list[dict[str, Any]],
+    *,
+    registry: ModelRegistry,
+    preferred_profile: ModelProfile,
+    turn_runtime: TurnRuntime,
+) -> tuple[Any, ModelProfile, list[str]]:
+    ordered_names = [
+        preferred_profile.name,
+        *[name for name in registry.names() if name != preferred_profile.name],
+    ]
+    attempted: list[str] = []
+    last_error: Exception | None = None
+    for profile_name in ordered_names:
+        profile = registry.get(profile_name)
+        attempted.append(profile.name)
+        try:
+            response = OpenAICompatibleClient().chat(
+                messages,
+                profile=profile,
+                temperature=0.2,
+                max_tokens=min(int(profile.max_tokens), 3500),
+                reasoning_effort="light",
+            )
+            if not str(response.content or "").strip():
+                raise RuntimeError("自动日报模型返回空内容。")
+            return response, profile, attempted
+        except Exception as error:
+            last_error = error
+            if not automatic_report_model_error_is_retryable(error) or profile_name == ordered_names[-1]:
+                raise
+            turn_runtime.emit(
+                {
+                    "event": "activity",
+                    "phase": "observation",
+                    "title": "自动日报切换可用模型",
+                    "detail": f"{profile.name} 暂时不可用，正在尝试下一个已配置模型。",
+                    "activity_type": "automatic_model_fallback",
+                }
+            )
+    raise RuntimeError(f"自动日报没有可用模型：{last_error}")
+
+
+def automatic_report_model_error_is_retryable(error: Exception) -> bool:
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "insufficient balance",
+            "http 402",
+            "http 408",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "timed out",
+            "timeout",
+            "connection refused",
+            "remote end closed",
+            "unexpected_eof",
+        )
+    )
+
+
 def work_report_gap_message(audit: dict[str, Any]) -> str:
     missing = [str(item) for item in audit.get("missing_daily_reports") or [] if str(item)]
     counts = audit.get("evidence_counts_by_date") if isinstance(audit.get("evidence_counts_by_date"), dict) else {}
@@ -434,7 +695,10 @@ def work_report_gap_message(audit: dict[str, Any]) -> str:
         lines.append(
             f"{'、'.join(without_evidence)} 没有发现本地工作记录，可能包含外出开会、公司电脑或其他工具完成的事项。"
         )
-    lines.append("你可以直接回复“补日报”，并补充无记录日期做了什么；我会先复用已有记录，不重复翻查聊天。")
+    if with_evidence:
+        lines.append("这些日期会由 Friday 自动整理并保存，不需要回复“补日报”。")
+    if without_evidence:
+        lines.append("只有无本地记录的日期需要你在方便时补充线下工作事实。")
     return "\n".join(lines)
 
 
@@ -913,6 +1177,24 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/channels/weixin":
                 self._send_json(weixin_channel_status_payload())
                 return
+            if parsed.path == "/api/apple-pim/status":
+                if not self._require_admin():
+                    return
+                self._send_json(apple_pim_status_payload())
+                return
+            if parsed.path == "/api/apple-pim/items":
+                if not self._require_admin():
+                    return
+                params = parse_qs(parsed.query)
+                self._send_json(
+                    apple_pim_items_payload(
+                        start_at=first(params, "start_at", ""),
+                        end_at=first(params, "end_at", ""),
+                        include_events=first(params, "include_events", "true") != "false",
+                        include_reminders=first(params, "include_reminders", "true") != "false",
+                    )
+                )
+                return
             if parsed.path == "/api/notifications":
                 self._send_json(notifications_payload())
                 return
@@ -973,6 +1255,22 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                     after = int(first(params, "after", "-1"))
                     self._send_json(turn_events_payload(turn_id, after=after))
                     return
+            execution_route = parse_execution_route(parsed.path)
+            if execution_route:
+                execution_id, suffix = execution_route
+                params = parse_qs(parsed.query)
+                if suffix == "":
+                    self._send_json(execution_payload(execution_id))
+                    return
+                if suffix == "events":
+                    self._send_json(execution_events_payload(execution_id, after=int(first(params, "after", "-1"))))
+                    return
+                if suffix == "changes":
+                    self._send_json(execution_changes_payload(execution_id))
+                    return
+                if suffix == "receipt":
+                    self._send_json(execution_receipt_payload(execution_id))
+                    return
             if parsed.path == "/api/skills":
                 self._send_json(skill_catalog_payload())
                 return
@@ -988,6 +1286,10 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/meeting-archives":
                 self._send_json(meeting_archives_payload())
+                return
+            if parsed.path == "/api/realtime-transcript/session":
+                params = parse_qs(parsed.query)
+                self._send_json(realtime_transcript_session_payload(first(params, "session_id", "")))
                 return
             if parsed.path == "/api/conversations":
                 self._send_json(load_conversations_payload())
@@ -1025,6 +1327,11 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 path = first(params, "path", "")
                 self._send_workspace_file(path)
                 return
+            if parsed.path == "/api/file/download":
+                params = parse_qs(parsed.query)
+                path = first(params, "path", "")
+                self._send_workspace_file(path, as_attachment=True)
+                return
             if self._try_static(parsed.path):
                 return
             self._send_json({"error": "Not found", "path": parsed.path}, status=404)
@@ -1036,6 +1343,36 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            # Browser uploads use a raw binary request.  Reading the body before
+            # routing it through JSON used to force every file through a 33%
+            # larger base64 representation, which is particularly fragile
+            # behind public reverse proxies and tunnels.
+            if parsed.path == "/api/attachments/upload":
+                if not self._require_auth():
+                    return
+                self._send_json(
+                    add_attachment_bytes_payload(
+                        upload_metadata_from_query(parsed),
+                        self._read_binary_body(),
+                    )
+                )
+                return
+            project_upload_match = re.fullmatch(
+                r"/api/projects/(project-[a-f0-9]{12})/files/upload",
+                parsed.path,
+            )
+            if project_upload_match:
+                if not self._require_auth():
+                    return
+                self._send_json(
+                    add_project_file_bytes_payload(
+                        project_upload_match.group(1),
+                        upload_metadata_from_query(parsed),
+                        self._read_binary_body(),
+                    ),
+                    status=201,
+                )
+                return
             payload = self._read_json()
             if parsed.path == "/api/auth/login":
                 user = get_auth_store().authenticate(
@@ -1049,6 +1386,7 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 self._send_auth_json(user, token)
                 return
             if parsed.path == "/api/auth/register":
+                validate_registration_invite(payload)
                 user = get_auth_store().register(
                     required_string(payload, "username"),
                     required_string(payload, "password"),
@@ -1191,6 +1529,16 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/channels/weixin/disconnect":
                 self._send_json(disconnect_weixin_payload())
                 return
+            if parsed.path == "/api/apple-pim/access":
+                if not self._require_admin():
+                    return
+                self._send_json(
+                    apple_pim_request_access_payload(
+                        events=bool(payload.get("events", True)),
+                        reminders=bool(payload.get("reminders", True)),
+                    )
+                )
+                return
             if parsed.path == "/api/notifications/read":
                 self._send_json(mark_notifications_read_payload(payload))
                 return
@@ -1247,8 +1595,17 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/realtime-transcript/save":
                 self._send_json(save_realtime_transcript_payload(payload))
                 return
+            if parsed.path == "/api/realtime-transcript/retry":
+                self._send_json(retry_realtime_transcript_segment_payload(payload))
+                return
             if parsed.path == "/api/attachments/add":
                 self._send_json(add_attachment_payload(payload))
+                return
+            if parsed.path == "/api/office-workspace/pdf/add":
+                self._send_json(add_office_pdf_payload(payload), status=201)
+                return
+            if parsed.path == "/api/office-workspace/pdf/merge":
+                self._send_json(merge_office_pdfs_payload(payload), status=201)
                 return
             if parsed.path == "/api/temporary-sync/text":
                 self._send_json(save_temporary_sync_text_payload(payload))
@@ -1319,6 +1676,23 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("Request JSON body must be an object.")
+        return data
+
+    def _read_binary_body(self) -> bytes:
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length or "0")
+        except ValueError as error:
+            raise ValueError("上传请求的文件大小无效。") from error
+        if length <= 0:
+            raise ValueError("上传请求为空。")
+        if length > UPLOAD_MAX_FILE_BYTES:
+            raise ValueError(
+                f"单个文件不能超过 {UPLOAD_MAX_FILE_BYTES // (1024 * 1024)} MB。"
+            )
+        data = self.rfile.read(length)
+        if len(data) != length:
+            raise ValueError("文件上传未完成，请重试。")
         return data
 
     def _session_token(self) -> str:
@@ -1424,11 +1798,26 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         client_disconnected = False
+        last_turn_id = ""
         try:
             for event in events:
+                if isinstance(event, dict):
+                    last_turn_id = str(event.get("turn_id") or last_turn_id)
                 self._write_sse_event(event)
         except CLIENT_DISCONNECT_ERRORS:
             client_disconnected = True
+            # The generator is no longer observable by the browser. Request
+            # cancellation immediately so model/tool work does not continue
+            # invisibly until a later request reconciles the stale turn.
+            if last_turn_id:
+                try:
+                    turn_store = get_turn_store()
+                    current_turn = turn_store.load(last_turn_id)
+                    if current_turn.status not in TERMINAL_STATUSES:
+                        turn_store.request_cancel(last_turn_id)
+                        turn_store.mark_cancelled(last_turn_id, reason="客户端连接已断开，已停止本轮处理。")
+                except Exception:
+                    pass
         except Exception as error:
             trace_lines = traceback.format_exc().splitlines()
             print("[web] SSE handler failed:")
@@ -1452,7 +1841,7 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 except CLIENT_DISCONNECT_ERRORS:
                     pass
 
-    def _send_workspace_file(self, path: str) -> None:
+    def _send_workspace_file(self, path: str, *, as_attachment: bool = False) -> None:
         workspace = WorkspaceFiles(account_workspace_root())
         file_path = workspace.resolve(path)
         if not file_path.is_file():
@@ -1463,7 +1852,8 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
         self._send_common_headers()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(stat.st_size))
-        self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{quote(file_path.name)}")
+        disposition = "attachment" if as_attachment else "inline"
+        self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{quote(file_path.name)}")
         self.end_headers()
         with file_path.open("rb") as handle:
             shutil.copyfileobj(handle, self.wfile)
@@ -1552,6 +1942,19 @@ def parse_turn_route(path: str) -> tuple[str, str] | None:
     return turn_id, suffix
 
 
+def parse_execution_route(path: str) -> tuple[str, str] | None:
+    match = re.fullmatch(r"/api/executions/([^/]+)(?:/([^/]+))?", path)
+    if not match:
+        return None
+    execution_id = str(match.group(1) or "")
+    suffix = str(match.group(2) or "")
+    if not EXECUTION_ID_PATTERN.fullmatch(execution_id):
+        return None
+    if suffix not in {"", "events", "changes", "receipt"}:
+        return None
+    return execution_id, suffix
+
+
 def friendly_error_message(error: Exception) -> str:
     text = str(error) or type(error).__name__
     lower = text.lower()
@@ -1573,6 +1976,15 @@ def required_string(payload: dict[str, Any], key: str) -> str:
     if not value:
         raise ValueError(f"Missing required field: {key}")
     return value
+
+
+def validate_registration_invite(payload: dict[str, Any]) -> None:
+    configured = os.getenv("WORK_AGENT_INVITE_CODE", "").strip()
+    if not configured:
+        raise ValueError("管理员尚未配置注册邀请码，新用户注册已关闭。")
+    provided = required_string(payload, "invite_code")
+    if not hmac.compare_digest(provided, configured):
+        raise ValueError("邀请码无效。")
 
 
 def load_registry() -> ModelRegistry:
@@ -1635,6 +2047,11 @@ def validated_model_profile_data(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "timeout_seconds": timeout_seconds,
+        "supports_vision": (
+            bool(payload["supports_vision"])
+            if isinstance(payload.get("supports_vision"), bool)
+            else infer_model_vision_support(payload)
+        ),
     }
 
 
@@ -2141,6 +2558,7 @@ def tools_payload() -> dict[str, Any]:
         data_workspace=account_workspace_root(),
         report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
+        execution_account_id=str(current_auth_user().id),
         enabled_skill_ids=enabled_skill_ids(),
     )
     return {
@@ -2235,6 +2653,17 @@ def agent_system_context(*, mode: str = "task") -> str:
             "不得为套格式虚构红头、文号、签发人、印章、密级或日期。"
         )
     return "\n\n".join(blocks)
+
+
+def agent_turn_time_context() -> str:
+    """Return per-turn time context kept at the cache-friendly tail of the prompt."""
+    current_local_time_text = datetime.now().astimezone().isoformat(timespec="seconds")
+    return (
+        "系统当前本地日期时间（本轮提示词生成时读取，含时区偏移）："
+        f"{current_local_time_text}。"
+        "处理‘今天’‘昨天’‘明天’等相对日期时，必须以这个日期为锚点；"
+        "用户明确提供的绝对日期优先。不要把未来日期或模型猜测当作相对日期的依据。"
+    )
 
 
 def memory_context_for_reply(*, query: str, project_id: str = "") -> str:
@@ -2607,6 +3036,42 @@ def load_conversations_payload() -> dict[str, Any]:
     }
 
 
+def cascade_delete_conversations(conversation_ids: Iterable[str]) -> dict[str, int]:
+    """Delete a conversation from runtime, retrieval, and derived-memory stores."""
+    ids = {
+        sanitize_conversation_id(value)
+        for value in conversation_ids
+        if sanitize_conversation_id(value)
+    }
+    # The main Friday chat is a protected account entry, even if a stale or
+    # malicious client includes it in deleted_ids.
+    ids.discard(FRIDAY_CONVERSATION_ID)
+    if not ids:
+        return {"sessions": 0, "history_index_rows": 0, "memories": 0, "pending_turns": 0}
+
+    session_store = get_session_store()
+    deleted_sessions = sum(1 for conversation_id in ids if session_store.delete(conversation_id))
+    history_index_rows = delete_conversation_index(
+        session_store.session_dir.parent / "history_search.sqlite3",
+        ids,
+    )
+    memory_store = CrossChatMemoryStore(session_store)
+    deleted_memories = sum(
+        memory_store.delete_for_conversation(conversation_id)
+        for conversation_id in ids
+    )
+    deleted_pending_turns = sum(
+        get_turn_store().discard_pending_for_conversation(conversation_id)
+        for conversation_id in ids
+    )
+    return {
+        "sessions": deleted_sessions,
+        "history_index_rows": history_index_rows,
+        "memories": deleted_memories,
+        "pending_turns": deleted_pending_turns,
+    }
+
+
 def save_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Persist a conversation archive change without accepting a stale overwrite.
 
@@ -2670,13 +3135,15 @@ def save_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if isinstance(item, dict) and sanitize_conversation_id(item.get("id"))
         }
         requested_deleted_ids = {sanitize_conversation_id(raw_id) for raw_id in deleted_ids or []}
+        cascade_deleted_ids = (current_ids - next_ids) | requested_deleted_ids
         _write_conversation_archive_snapshot(
             path,
             next_items,
             next_revision,
             changed_ids=changed_ids,
-            deleted_ids=(current_ids - next_ids) | requested_deleted_ids,
+            deleted_ids=cascade_deleted_ids,
         )
+        cascade_delete_conversations(cascade_deleted_ids)
 
     return {
         "ok": True,
@@ -3160,12 +3627,11 @@ def read_project(project_id: str) -> dict[str, Any]:
 
 
 def write_project(data: dict[str, Any]) -> None:
-    project_id = sanitize_project_id(data.get("id"))
-    manifest = project_manifest_path(project_id)
-    manifest.parent.mkdir(parents=True, exist_ok=True)
-    temp = manifest.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(manifest)
+    with PROJECTS_LOCK:
+        project_id = sanitize_project_id(data.get("id"))
+        manifest = project_manifest_path(project_id)
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomically(manifest, data)
 
 
 def project_files(project_id: str) -> list[dict[str, Any]]:
@@ -3450,32 +3916,34 @@ def normalize_project_instructions(raw_value: Any) -> str:
 
 
 def create_project_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    now = int(time.time())
-    project_id = f"project-{uuid.uuid4().hex[:12]}"
-    data = {
-        "schema_version": 1,
-        "id": project_id,
-        "name": normalize_project_name(payload.get("name")),
-        "instructions": normalize_project_instructions(payload.get("instructions")),
-        "memory_scope": "project_only",
-        "created_at": now,
-        "updated_at": now,
-    }
-    directory = project_dir(project_id)
-    (directory / "sources").mkdir(parents=True, exist_ok=False)
-    write_project(data)
-    return {"project": project_payload(data, include_files=True)}
+    with PROJECTS_LOCK:
+        now = int(time.time())
+        project_id = f"project-{uuid.uuid4().hex[:12]}"
+        data = {
+            "schema_version": 1,
+            "id": project_id,
+            "name": normalize_project_name(payload.get("name")),
+            "instructions": normalize_project_instructions(payload.get("instructions")),
+            "memory_scope": "project_only",
+            "created_at": now,
+            "updated_at": now,
+        }
+        directory = project_dir(project_id)
+        (directory / "sources").mkdir(parents=True, exist_ok=False)
+        write_project(data)
+        return {"project": project_payload(data, include_files=True)}
 
 
 def update_project_payload(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    data = read_project(project_id)
-    if "name" in payload:
-        data["name"] = normalize_project_name(payload.get("name"))
-    if "instructions" in payload:
-        data["instructions"] = normalize_project_instructions(payload.get("instructions"))
-    data["updated_at"] = int(time.time())
-    write_project(data)
-    return {"project": project_payload(data, include_files=True)}
+    with PROJECTS_LOCK:
+        data = read_project(project_id)
+        if "name" in payload:
+            data["name"] = normalize_project_name(payload.get("name"))
+        if "instructions" in payload:
+            data["instructions"] = normalize_project_instructions(payload.get("instructions"))
+        data["updated_at"] = int(time.time())
+        write_project(data)
+        return {"project": project_payload(data, include_files=True)}
 
 
 def create_project_timeline_payload(project_id: str) -> dict[str, Any]:
@@ -3532,42 +4000,62 @@ def decode_uploaded_file(payload: dict[str, Any]) -> tuple[str, str, bytes]:
         raise ValueError("文件内容无效。") from error
     if not data:
         raise ValueError("文件不能为空。")
+    validate_upload_size(len(data))
     return name, mime_type, data
 
 
 def add_project_file_payload(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    project = read_project(project_id)
     name, mime_type, data = decode_uploaded_file(payload)
-    sources = project_dir(project_id) / "sources"
-    sources.mkdir(parents=True, exist_ok=True)
-    target = unique_path(sources / name)
-    target.write_bytes(data)
-    project["updated_at"] = int(time.time())
-    write_project(project)
-    attachment = attachment_payload_from_path(
-        target,
-        display_name=name,
-        mime_type=mime_type,
-        deduplicated=False,
+    return add_project_file_bytes_payload(
+        project_id,
+        {**payload, "name": name, "mime_type": mime_type},
+        data,
     )
-    return {"file": file_item_payload(target), "attachment": attachment, "project": project_payload(project)}
+
+
+def add_project_file_bytes_payload(
+    project_id: str,
+    payload: dict[str, Any],
+    data: bytes,
+) -> dict[str, Any]:
+    with PROJECTS_LOCK:
+        project = read_project(project_id)
+        name = sanitize_filename(required_string(payload, "name"))
+        mime_type = normalize_mime_type(payload.get("mime_type"))
+        if not data:
+            raise ValueError("文件不能为空。")
+        validate_upload_size(len(data))
+        sources = project_dir(project_id) / "sources"
+        sources.mkdir(parents=True, exist_ok=True)
+        target = unique_path(sources / name)
+        target.write_bytes(data)
+        project["updated_at"] = int(time.time())
+        write_project(project)
+        attachment = attachment_payload_from_path(
+            target,
+            display_name=name,
+            mime_type=mime_type,
+            deduplicated=False,
+        )
+        return {"file": file_item_payload(target), "attachment": attachment, "project": project_payload(project)}
 
 
 def delete_project_file_payload(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    project = read_project(project_id)
-    raw_path = required_string(payload, "path")
-    file_path = WorkspaceFiles(account_workspace_root()).resolve(raw_path)
-    sources = (project_dir(project_id) / "sources").resolve()
-    try:
-        file_path.relative_to(sources)
-    except ValueError as error:
-        raise ValueError("只能删除当前项目资料目录中的文件。") from error
-    if not file_path.is_file():
-        raise ValueError("项目文件不存在。")
-    file_path.unlink()
-    project["updated_at"] = int(time.time())
-    write_project(project)
-    return {"ok": True, "project": project_payload(project)}
+    with PROJECTS_LOCK:
+        project = read_project(project_id)
+        raw_path = required_string(payload, "path")
+        file_path = WorkspaceFiles(account_workspace_root()).resolve(raw_path)
+        sources = (project_dir(project_id) / "sources").resolve()
+        try:
+            file_path.relative_to(sources)
+        except ValueError as error:
+            raise ValueError("只能删除当前项目资料目录中的文件。") from error
+        if not file_path.is_file():
+            raise ValueError("项目文件不存在。")
+        file_path.unlink()
+        project["updated_at"] = int(time.time())
+        write_project(project)
+        return {"ok": True, "project": project_payload(project)}
 
 
 def sync_meeting_to_project_payload(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3749,6 +4237,8 @@ def file_item_payload(path: Path) -> dict[str, Any]:
         "kind": classify_attachment(extension, mime_type),
         "previewable": preview_mode != "none",
         "preview_mode": preview_mode,
+        "library_section": file_library_section(path),
+        "download_url": download_file_url(account_relative_path(path)),
     }
 
 
@@ -3815,6 +4305,8 @@ def is_file_library_visible(path: Path) -> bool:
         return False
     if is_attachment_file(path):
         return True
+    if len(parts) >= 3 and parts[0] == "meet_files" and parts[1] == "office_workspace":
+        return parts[2] in {"pdf_inputs", "pdf_outputs"} and path.suffix.lower() == ".pdf"
     if len(parts) >= 3 and parts[0] == "meet_files" and parts[1] == "office_extracts":
         return path.suffix.lower() == ".md"
     if len(parts) >= 3 and parts[0] == "meet_files" and parts[1] == "realtime_transcripts":
@@ -3887,6 +4379,7 @@ def read_file_payload(path: str, *, max_chars: int) -> dict[str, Any]:
         if truncated:
             text = text[:max_chars]
     source_url = raw_file_url(str(file_path.relative_to(storage_root)))
+    download_url = download_file_url(str(file_path.relative_to(storage_root)))
     return {
         "path": str(file_path.relative_to(storage_root)),
         "name": file_path.name,
@@ -3902,6 +4395,8 @@ def read_file_payload(path: str, *, max_chars: int) -> dict[str, Any]:
         "preview_mode": preview_mode,
         "preview_url": rendered_url or (source_url if previewable and preview_mode not in {"text", "markdown"} else ""),
         "source_url": source_url,
+        "download_url": download_url,
+        "library_section": file_library_section(file_path),
         "rendered_path": rendered_path,
         "editable": extension in EDITABLE_FILE_EXTENSIONS,
     }
@@ -3943,6 +4438,23 @@ def raw_file_url(path: str) -> str:
     return f"/api/file/raw?path={quote(path)}"
 
 
+def download_file_url(path: str) -> str:
+    return f"/api/file/download?path={quote(path)}"
+
+
+def file_library_section(path: Path) -> str:
+    try:
+        parts = path.relative_to(account_workspace_root()).parts
+    except ValueError:
+        return "standard"
+    if len(parts) >= 3 and parts[0] == "meet_files" and parts[1] == "office_workspace":
+        if parts[2] == "pdf_inputs":
+            return "office_input"
+        if parts[2] == "pdf_outputs":
+            return "office_output"
+    return "standard"
+
+
 def open_workspace_file_payload(payload: dict[str, Any], *, reveal: bool) -> dict[str, Any]:
     workspace = WorkspaceFiles(account_workspace_root())
     file_path = workspace.resolve(required_string(payload, "path"))
@@ -3974,49 +4486,113 @@ def add_attachment_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not data:
         raise ValueError("Attachment is empty.")
+    return add_attachment_bytes_payload(
+        {**payload, "name": name},
+        data,
+    )
 
-    mime_type = str(payload.get("mime_type") or "application/octet-stream")
+
+def add_attachment_bytes_payload(payload: dict[str, Any], data: bytes) -> dict[str, Any]:
+    name = sanitize_filename(required_string(payload, "name"))
+    validate_upload_size(len(data))
+
+    mime_type = normalize_mime_type(payload.get("mime_type"))
     storage_root = account_workspace_root()
     target_dir = (storage_root / "meet_files" / "attachments").resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
+    with ATTACHMENT_INDEX_LOCK:
+        index = load_attachment_index(target_dir)
+        fingerprint = attachment_fingerprint(payload, name=name, size=len(data))
+        if fingerprint:
+            existing_path = indexed_attachment_path(index, fingerprint, target_dir)
+            if existing_path is not None:
+                return {
+                    "attachment": attachment_payload_from_path(
+                        existing_path,
+                        display_name=name,
+                        mime_type=mime_type,
+                        deduplicated=True,
+                    )
+                }
 
-    index = load_attachment_index(target_dir)
-    fingerprint = attachment_fingerprint(payload, name=name, size=len(data))
-    if fingerprint:
-        existing_path = indexed_attachment_path(index, fingerprint, target_dir)
-        if existing_path is not None:
-            return {
-                "attachment": attachment_payload_from_path(
-                    existing_path,
-                    display_name=name,
-                    mime_type=mime_type,
-                    deduplicated=True,
-                )
+        uploaded_at = time.strftime("%Y%m%d-%H%M%S")
+        target_path = unique_path(target_dir / f"{uploaded_at}-{name}")
+        target_path.write_bytes(data)
+        if fingerprint:
+            index[fingerprint] = {
+                "path": str(target_path.relative_to(storage_root)),
+                "name": name,
+                "size": len(data),
+                "mime_type": mime_type,
+                "source_path": clean_optional_string(payload.get("source_path")),
+                "relative_path": clean_optional_string(payload.get("relative_path")),
+                "last_modified": optional_int(payload.get("last_modified")),
+                "saved_at": int(time.time()),
+                "recording_metadata": probe_audio_metadata(target_path),
             }
-
-    uploaded_at = time.strftime("%Y%m%d-%H%M%S")
-    target_path = unique_path(target_dir / f"{uploaded_at}-{name}")
-    target_path.write_bytes(data)
-    if fingerprint:
-        index[fingerprint] = {
-            "path": str(target_path.relative_to(storage_root)),
-            "name": name,
-            "size": len(data),
-            "mime_type": mime_type,
-            "source_path": clean_optional_string(payload.get("source_path")),
-            "relative_path": clean_optional_string(payload.get("relative_path")),
-            "last_modified": optional_int(payload.get("last_modified")),
-            "saved_at": int(time.time()),
-            "recording_metadata": probe_audio_metadata(target_path),
+            save_attachment_index(target_dir, index)
+        return {
+            "attachment": attachment_payload_from_path(
+                target_path,
+                display_name=name,
+                mime_type=mime_type,
+                deduplicated=False,
+            )
         }
-        save_attachment_index(target_dir, index)
-    return {
-        "attachment": attachment_payload_from_path(
-            target_path,
-            display_name=name,
-            mime_type=mime_type,
-            deduplicated=False,
+
+
+def validate_upload_size(size: int) -> None:
+    if size <= 0:
+        raise ValueError("文件不能为空。")
+    if size > UPLOAD_MAX_FILE_BYTES:
+        raise ValueError(
+            f"单个文件不能超过 {UPLOAD_MAX_FILE_BYTES // (1024 * 1024)} MB。"
         )
+
+
+def upload_metadata_from_query(parsed: Any) -> dict[str, Any]:
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    payload: dict[str, Any] = {
+        "name": first(params, "name", "attachment"),
+        "mime_type": first(params, "mime_type", "application/octet-stream"),
+    }
+    for key in ("last_modified", "relative_path", "source_path"):
+        value = first(params, key, "")
+        if value:
+            payload[key] = value
+    return payload
+
+
+def add_office_pdf_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    name, _mime_type, data = decode_uploaded_file(payload)
+    target, pages = save_pdf_input(account_workspace_root(), name=name, data=data)
+    return {
+        "ok": True,
+        "input": {
+            "path": relative_workspace_path(account_workspace_root(), target),
+            "name": Path(name).with_suffix(".pdf").name,
+            "size": target.stat().st_size,
+            "pages": pages,
+        },
+        "message": f"已添加 {Path(name).with_suffix('.pdf').name}，共 {pages} 页。",
+    }
+
+
+def merge_office_pdfs_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    source_paths = payload.get("source_paths")
+    if not isinstance(source_paths, list):
+        raise ValueError("请按顺序提供待合并的 PDF 列表。")
+    output_path, pages, source_count = merge_pdfs(
+        account_workspace_root(),
+        source_paths=[str(path) for path in source_paths],
+        output_name=required_string(payload, "output_name"),
+    )
+    return {
+        "ok": True,
+        "output": file_item_payload(output_path),
+        "source_count": source_count,
+        "pages": pages,
+        "message": f"已按当前顺序合并 {source_count} 个 PDF，共 {pages} 页。",
     }
 
 
@@ -4038,9 +4614,7 @@ def load_attachment_index(directory: Path) -> dict[str, Any]:
 
 def save_attachment_index(directory: Path, index: dict[str, Any]) -> None:
     index_path = directory / ATTACHMENT_INDEX_NAME
-    tmp_path = directory / f"{ATTACHMENT_INDEX_NAME}.tmp"
-    tmp_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(index_path)
+    _write_json_atomically(index_path, index)
 
 
 def indexed_attachment_path(index: dict[str, Any], fingerprint: str, target_dir: Path) -> Path | None:
@@ -4154,6 +4728,97 @@ def speech_vad_payload(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+def sanitize_realtime_transcript_session_id(raw_value: Any) -> str:
+    session_id = str(raw_value or "").strip().lower()
+    if not REALTIME_TRANSCRIPT_SESSION_ID_PATTERN.fullmatch(session_id):
+        return ""
+    return session_id
+
+
+def realtime_transcript_session_root(session_id: str) -> Path:
+    clean_id = sanitize_realtime_transcript_session_id(session_id)
+    if not clean_id:
+        raise ValueError("实时转写会话标识无效。")
+    return (account_workspace_root() / "meet_files" / "realtime_sessions" / clean_id).resolve()
+
+
+def realtime_transcript_manifest_path(session_id: str) -> Path:
+    return realtime_transcript_session_root(session_id) / "session.json"
+
+
+def load_realtime_transcript_manifest(session_id: str) -> dict[str, Any]:
+    path = realtime_transcript_manifest_path(session_id)
+    if not path.is_file():
+        raise ValueError("未找到可恢复的实时转写会话。")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("实时转写会话记录损坏，无法恢复。") from error
+    if not isinstance(payload, dict):
+        raise ValueError("实时转写会话记录格式无效。")
+    return payload
+
+
+def update_realtime_transcript_manifest(
+    session_id: str,
+    *,
+    title: str | None = None,
+    segment: dict[str, Any] | None = None,
+    status: str | None = None,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    clean_id = sanitize_realtime_transcript_session_id(session_id)
+    if not clean_id:
+        raise ValueError("实时转写会话标识无效。")
+    manifest_path = realtime_transcript_manifest_path(clean_id)
+    now_ms = int(time.time() * 1000)
+    with REALTIME_TRANSCRIPT_LOCK:
+        manifest: dict[str, Any]
+        if manifest_path.is_file():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest = loaded if isinstance(loaded, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+        else:
+            manifest = {}
+        manifest.setdefault("schema_version", 1)
+        manifest["session_id"] = clean_id
+        manifest.setdefault("created_at", now_ms)
+        manifest["updated_at"] = now_ms
+        manifest["title"] = str(title or manifest.get("title") or "实时会议转写").strip() or "实时会议转写"
+        manifest["status"] = status or str(manifest.get("status") or "draft")
+        segments = manifest.get("segments")
+        if not isinstance(segments, list):
+            segments = []
+        if segment is not None:
+            segment_index = int(segment.get("index") or 0)
+            segments = [
+                item
+                for item in segments
+                if not isinstance(item, dict) or int(item.get("index") or 0) != segment_index
+            ]
+            segments.append(segment)
+            segments.sort(key=lambda item: int(item.get("index") or 0) if isinstance(item, dict) else 0)
+        manifest["segments"] = segments
+        if output_path is not None:
+            manifest["output_path"] = output_path
+        _write_json_atomically(manifest_path, manifest)
+        return manifest
+
+
+def realtime_transcript_session_payload(raw_session_id: Any) -> dict[str, Any]:
+    session_id = sanitize_realtime_transcript_session_id(raw_session_id)
+    if not session_id:
+        raise ValueError("实时转写会话标识无效。")
+    manifest = load_realtime_transcript_manifest(session_id)
+    return {
+        "ok": True,
+        **manifest,
+        "manifest_path": str(realtime_transcript_manifest_path(session_id).relative_to(account_workspace_root())),
+    }
+
+
 def transcribe_speech_payload(payload: dict[str, Any]) -> dict[str, Any]:
     name = sanitize_filename(str(payload.get("name") or "voice-input.webm"))
     mime_type = str(payload.get("mime_type") or "audio/webm").strip() or "audio/webm"
@@ -4170,84 +4835,213 @@ def transcribe_speech_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not data:
         raise ValueError("录音内容为空，请重新录制。")
-    if len(data) > 100 * 1024 * 1024:
+    if len(data) > UPLOAD_MAX_FILE_BYTES:
         raise ValueError("录音文件过大，请先缩短录音后再转写。")
 
+    storage_root = account_workspace_root()
+    raw_realtime_session_id = str(payload.get("realtime_session_id") or "").strip()
+    realtime_session_id = sanitize_realtime_transcript_session_id(raw_realtime_session_id)
+    if raw_realtime_session_id and not realtime_session_id:
+        raise ValueError("实时转写会话标识无效。")
+    try:
+        segment_index = int(payload.get("segment_index") or 0)
+    except (TypeError, ValueError):
+        segment_index = 0
+    if realtime_session_id and not (1 <= segment_index <= 100_000):
+        raise ValueError("实时转写分片序号无效。")
+
     uploaded_at = time.strftime("%Y%m%d-%H%M%S")
-    session_dir = (account_workspace_root() / "meet_files" / "voice_inputs" / uploaded_at).resolve()
+    if realtime_session_id:
+        session_dir = realtime_transcript_session_root(realtime_session_id) / "segments" / f"{segment_index:04d}"
+    else:
+        session_dir = storage_root / "meet_files" / "voice_inputs" / f"{uploaded_at}-{uuid.uuid4().hex[:8]}"
+    session_dir = session_dir.resolve()
     session_dir.mkdir(parents=True, exist_ok=True)
 
     source_path = unique_path(session_dir / name)
     source_path.write_bytes(data)
-
-    wav_path = session_dir / "voice_16k.wav"
-    filter_chain = realtime_audio_filter_chain(use_denoise=use_denoise)
-    command = [
-        require_executable("ffmpeg", "FFmpeg 未安装，无法把浏览器录音转换为本地 ASR 可用的 WAV。"),
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(source_path),
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-    ]
-    if filter_chain:
-        command.extend(["-af", filter_chain])
-    command.append(str(wav_path))
-    run_process(command, timeout_seconds=60, label="音频格式转换")
-
-    signal_stats = wav_signal_stats(wav_path)
-    if skip_if_silent and not signal_stats["has_voice_like_signal"]:
-        transcript_path = write_worker_transcript(
-            session_dir,
-            "",
-            {
-                "text": "",
-                "skipped": True,
-                "reason": "voice_gate",
-                "signal": signal_stats,
-            },
-        )
-        return {
-            "text": "",
-            "audio_path": str(source_path.relative_to(WORKSPACE_ROOT)),
-            "wav_path": str(wav_path.relative_to(WORKSPACE_ROOT)),
-            "transcript_path": str(transcript_path.relative_to(WORKSPACE_ROOT)),
-            "engine": "voice-gate",
-            "asr_elapsed_ms": 0,
-            "filter_chain": filter_chain,
-            "signal": signal_stats,
-            "skipped": True,
-        }
-
-    asr_started_at = time.perf_counter()
-    engine = "qwen3-asr-worker"
+    title = str(payload.get("title") or "实时会议转写").strip() or "实时会议转写"
     try:
-        worker_result = transcribe_with_asr_worker(wav_path, timeout_seconds=180)
-        text = str(worker_result.get("text") or "").strip()
-        transcript_path = write_worker_transcript(session_dir, text, worker_result)
-        asr_elapsed_ms = int(worker_result.get("elapsed_ms") or ((time.perf_counter() - asr_started_at) * 1000))
-    except Exception as worker_error:
-        engine = "qwen3-asr-mlx-cli"
-        transcript_path = run_local_qwen3_asr(wav_path, session_dir / "asr")
-        text = transcript_path.read_text(encoding="utf-8", errors="replace").strip()
-        asr_elapsed_ms = int((time.perf_counter() - asr_started_at) * 1000)
-        print(f"[asr] worker unavailable; used MLX CLI: {worker_error}")
-    return {
-        "text": text,
-        "audio_path": str(source_path.relative_to(WORKSPACE_ROOT)),
-        "wav_path": str(wav_path.relative_to(WORKSPACE_ROOT)),
-        "transcript_path": str(transcript_path.relative_to(WORKSPACE_ROOT)),
-        "engine": engine,
-        "asr_elapsed_ms": asr_elapsed_ms,
-        "filter_chain": filter_chain,
-        "signal": signal_stats,
-        "skipped": False,
-    }
+        started_at = int(payload.get("started_at") or 0)
+    except (TypeError, ValueError):
+        started_at = 0
+    try:
+        requested_finished_at = int(payload.get("finished_at") or 0)
+    except (TypeError, ValueError):
+        requested_finished_at = 0
+
+    segment_record: dict[str, Any] | None = None
+    if realtime_session_id:
+        segment_record = {
+            "index": segment_index,
+            "status": "processing",
+            "text": "",
+            "started_at": started_at,
+            "finished_at": requested_finished_at,
+            "audio_path": str(source_path.relative_to(storage_root)),
+            "mime_type": mime_type,
+            "size": len(data),
+            "error": "",
+        }
+        update_realtime_transcript_manifest(
+            realtime_session_id,
+            title=title,
+            segment=segment_record,
+            status="recording",
+        )
+
+    try:
+        wav_path = unique_path(session_dir / "voice_16k.wav")
+        filter_chain = realtime_audio_filter_chain(use_denoise=use_denoise)
+        command = [
+            require_executable("ffmpeg", "FFmpeg 未安装，无法把浏览器录音转换为本地 ASR 可用的 WAV。"),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source_path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+        ]
+        if filter_chain:
+            command.extend(["-af", filter_chain])
+        command.append(str(wav_path))
+        run_process(command, timeout_seconds=60, label="音频格式转换")
+
+        signal_stats = wav_signal_stats(wav_path)
+        if skip_if_silent and not signal_stats["has_voice_like_signal"]:
+            transcript_path = write_worker_transcript(
+                session_dir,
+                "",
+                {
+                    "text": "",
+                    "skipped": True,
+                    "reason": "voice_gate",
+                    "signal": signal_stats,
+                },
+            )
+            result = {
+                "text": "",
+                "audio_path": str(source_path.relative_to(storage_root)),
+                "wav_path": str(wav_path.relative_to(storage_root)),
+                "transcript_path": str(transcript_path.relative_to(storage_root)),
+                "engine": "voice-gate",
+                "asr_elapsed_ms": 0,
+                "filter_chain": filter_chain,
+                "signal": signal_stats,
+                "skipped": True,
+            }
+        else:
+            asr_started_at = time.perf_counter()
+            engine = "qwen3-asr-worker"
+            try:
+                worker_result = transcribe_with_asr_worker(wav_path, timeout_seconds=180)
+                text = str(worker_result.get("text") or "").strip()
+                transcript_path = write_worker_transcript(session_dir, text, worker_result)
+                asr_elapsed_ms = int(
+                    worker_result.get("elapsed_ms")
+                    or ((time.perf_counter() - asr_started_at) * 1000)
+                )
+            except Exception as worker_error:
+                engine = "qwen3-asr-mlx-cli"
+                transcript_path = run_local_qwen3_asr(wav_path, session_dir / "asr")
+                text = transcript_path.read_text(encoding="utf-8", errors="replace").strip()
+                asr_elapsed_ms = int((time.perf_counter() - asr_started_at) * 1000)
+                print(f"[asr] worker unavailable; used MLX CLI: {worker_error}")
+            result = {
+                "text": text,
+                "audio_path": str(source_path.relative_to(storage_root)),
+                "wav_path": str(wav_path.relative_to(storage_root)),
+                "transcript_path": str(transcript_path.relative_to(storage_root)),
+                "engine": engine,
+                "asr_elapsed_ms": asr_elapsed_ms,
+                "filter_chain": filter_chain,
+                "signal": signal_stats,
+                "skipped": False,
+            }
+        if realtime_session_id and segment_record is not None:
+            segment_record.update(
+                {
+                    "status": "skipped" if result["skipped"] else "complete",
+                    "text": str(result["text"]),
+                    "finished_at": requested_finished_at or int(time.time() * 1000),
+                    "wav_path": str(result["wav_path"]),
+                    "transcript_path": str(result["transcript_path"]),
+                    "engine": str(result["engine"]),
+                    "asr_elapsed_ms": int(result["asr_elapsed_ms"] or 0),
+                    "signal": result["signal"],
+                    "error": "",
+                }
+            )
+            update_realtime_transcript_manifest(
+                realtime_session_id,
+                title=title,
+                segment=segment_record,
+                status="recording",
+            )
+            result["realtime_session_id"] = realtime_session_id
+            result["segment_index"] = segment_index
+        return result
+    except Exception as error:
+        if realtime_session_id and segment_record is not None:
+            segment_record.update(
+                {
+                    "status": "error",
+                    "finished_at": requested_finished_at or int(time.time() * 1000),
+                    "error": str(error),
+                }
+            )
+            update_realtime_transcript_manifest(
+                realtime_session_id,
+                title=title,
+                segment=segment_record,
+                status="error",
+            )
+        raise
+
+
+def retry_realtime_transcript_segment_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    session_id = sanitize_realtime_transcript_session_id(payload.get("session_id"))
+    if not session_id:
+        raise ValueError("实时转写会话标识无效。")
+    try:
+        segment_index = int(payload.get("segment_index") or 0)
+    except (TypeError, ValueError):
+        segment_index = 0
+    manifest = load_realtime_transcript_manifest(session_id)
+    segment = next(
+        (
+            item
+            for item in manifest.get("segments", [])
+            if isinstance(item, dict) and int(item.get("index") or 0) == segment_index
+        ),
+        None,
+    )
+    if segment is None:
+        raise ValueError("未找到要重试的实时转写分片。")
+    storage_root = account_workspace_root()
+    session_root = realtime_transcript_session_root(session_id)
+    source_path = (storage_root / str(segment.get("audio_path") or "")).resolve()
+    if not source_path.is_relative_to(session_root) or not source_path.is_file():
+        raise ValueError("实时转写分片音频不存在，无法重试。")
+    mime_type = str(segment.get("mime_type") or mimetypes.guess_type(source_path.name)[0] or "audio/webm")
+    return transcribe_speech_payload(
+        {
+            "name": source_path.name,
+            "mime_type": mime_type,
+            "content_base64": base64.b64encode(source_path.read_bytes()).decode("ascii"),
+            "use_denoise": True,
+            "skip_if_silent": True,
+            "realtime_session_id": session_id,
+            "segment_index": segment_index,
+            "started_at": int(segment.get("started_at") or 0),
+            "finished_at": int(segment.get("finished_at") or 0),
+            "title": str(manifest.get("title") or "实时会议转写"),
+        }
+    )
 
 
 def realtime_audio_filter_chain(*, use_denoise: bool) -> str:
@@ -4351,6 +5145,9 @@ def format_seconds(seconds: float) -> str:
 
 def save_realtime_transcript_payload(payload: dict[str, Any]) -> dict[str, Any]:
     title = str(payload.get("title") or "实时会议转写").strip() or "实时会议转写"
+    session_id = sanitize_realtime_transcript_session_id(payload.get("session_id"))
+    if not session_id:
+        session_id = f"rt-{uuid.uuid4().hex}"
     segments_raw = payload.get("segments")
     if not isinstance(segments_raw, list):
         raise ValueError("segments must be a list.")
@@ -4380,11 +5177,42 @@ def save_realtime_transcript_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "text": text,
                 "started_at": started_at,
                 "finished_at": finished_at,
+                "audio_path": str(raw.get("audio_path") or raw.get("audioPath") or ""),
+                "transcript_path": str(raw.get("transcript_path") or raw.get("transcriptPath") or ""),
+                "engine": str(raw.get("engine") or ""),
+                "asr_elapsed_ms": int(raw.get("asr_elapsed_ms") or raw.get("asrElapsedMs") or 0),
             }
         )
 
     if not segments:
         raise ValueError("没有可保存的转写文本。")
+
+    # The browser may submit only successful rows, so the authoritative session
+    # manifest must also be checked.  Without this guard an errored/processing
+    # fragment could silently disappear from the canonical Markdown and then
+    # be handed to a new chat or the minutes skill as if the meeting were whole.
+    manifest_path = realtime_transcript_manifest_path(session_id)
+    session_manifest = load_realtime_transcript_manifest(session_id) if manifest_path.is_file() else None
+    if session_manifest is not None:
+        submitted_indices = {int(segment["index"]) for segment in segments}
+        unresolved_indices: list[int] = []
+        missing_completed_indices: list[int] = []
+        for raw_segment in session_manifest.get("segments", []):
+            if not isinstance(raw_segment, dict):
+                continue
+            index = int(raw_segment.get("index") or 0)
+            state = str(raw_segment.get("status") or "").strip().lower()
+            if state not in {"complete", "skipped"}:
+                unresolved_indices.append(index)
+            elif state == "complete" and index not in submitted_indices:
+                missing_completed_indices.append(index)
+        if unresolved_indices or missing_completed_indices:
+            details: list[str] = []
+            if unresolved_indices:
+                details.append("异常或仍在识别的分片：" + "、".join(str(item) for item in unresolved_indices))
+            if missing_completed_indices:
+                details.append("未包含在本次保存中的已完成分片：" + "、".join(str(item) for item in missing_completed_indices))
+            raise ValueError("实时转写尚不完整，不能保存为会议流程输入；" + "；".join(details) + "。")
 
     saved_at = time.strftime("%Y-%m-%d %H:%M:%S")
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -4394,12 +5222,19 @@ def save_realtime_transcript_payload(payload: dict[str, Any]) -> dict[str, Any]:
     output_path = unique_path(output_dir / f"{stamp}-{sanitize_filename(title)}.md")
 
     full_text = "\n\n".join(segment["text"] for segment in segments)
+    started_values = [segment["started_at"] for segment in segments if segment["started_at"] > 0]
+    finished_values = [segment["finished_at"] for segment in segments if segment["finished_at"] > 0]
+    started_at = min(started_values) if started_values else 0
+    finished_at = max(finished_values) if finished_values else 0
+    duration_ms = max(0, finished_at - started_at) if started_at and finished_at else 0
     lines = [
         f"# {title}",
         "",
         f"- 保存时间：{saved_at}",
         "- 来源：浏览器麦克风实时分片识别",
+        f"- 实时会话：{session_id}",
         f"- 片段数：{len(segments)}",
+        f"- 录音时长：{format_seconds(duration_ms / 1000)}" if duration_ms else "- 录音时长：未记录",
         "",
         "## 完整转写",
         "",
@@ -4409,9 +5244,17 @@ def save_realtime_transcript_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "",
     ]
     for segment in segments:
+        detail_parts = []
+        if segment["started_at"]:
+            detail_parts.append(time.strftime("%H:%M:%S", time.localtime(segment["started_at"] / 1000)))
+        if segment["asr_elapsed_ms"]:
+            detail_parts.append(f"ASR {segment['asr_elapsed_ms'] / 1000:.1f}s")
         lines.extend(
             [
                 f"### 片段 {segment['index']}",
+                "",
+                f"- {' · '.join(detail_parts)}" if detail_parts else "- 时间未记录",
+                f"- 音频：`{segment['audio_path']}`" if segment["audio_path"] else "- 音频：未保留路径",
                 "",
                 segment["text"],
                 "",
@@ -4420,12 +5263,29 @@ def save_realtime_transcript_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     content = "\n".join(lines).rstrip() + "\n"
     output_path.write_text(content, encoding="utf-8")
+    relative_output_path = str(output_path.relative_to(storage_root))
+    for segment in segments:
+        update_realtime_transcript_manifest(
+            session_id,
+            title=title,
+            segment={**segment, "status": "complete", "error": ""},
+        )
+    manifest = update_realtime_transcript_manifest(
+        session_id,
+        title=title,
+        status="saved",
+        output_path=relative_output_path,
+    )
     return {
         "ok": True,
         "title": title,
-        "path": str(output_path.relative_to(storage_root)),
+        "path": relative_output_path,
+        "session_id": session_id,
+        "manifest_path": str(realtime_transcript_manifest_path(session_id).relative_to(storage_root)),
         "segments": len(segments),
         "chars": len(content),
+        "duration_ms": duration_ms,
+        "status": manifest["status"],
     }
 
 
@@ -4645,6 +5505,14 @@ def run_process(command: list[str], *, timeout_seconds: int, label: str) -> subp
     except subprocess.CalledProcessError as error:
         output = "\n".join(part for part in (error.stdout, error.stderr) if part).strip()
         output = output[-2000:] if output else "无详细输出"
+        if label == "音频格式转换" and any(
+            marker in output.lower()
+            for marker in ("invalid data", "ebml header", "moov atom not found", "end of file")
+        ):
+            raise RuntimeError(
+                "浏览器生成的录音分片不完整，无法读取音频容器。该分片已保留，可在实时转写中重试；"
+                "如果连续出现，请停止后重新开始录音。"
+            ) from error
         raise RuntimeError(f"{label}失败：{output}") from error
 
 
@@ -4673,6 +5541,7 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         data_workspace=account_workspace_root(),
         report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
+        execution_account_id=str(current_auth_user().id),
         enabled_skill_ids=enabled_skill_ids(),
     )
     max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
@@ -4684,7 +5553,10 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         max_steps=max_steps,
         extra_system_context=agent_system_context(),
     )
-    result = agent.run(goal)
+    result = agent.run_messages(
+        [{"role": "user", "content": goal}],
+        system_context=agent_turn_time_context(),
+    )
     return {"result": asdict(result)}
 
 
@@ -4707,6 +5579,108 @@ def turn_events_payload(turn_id: str, *, after: int = -1) -> dict[str, Any]:
         "cancel_requested": turn.cancel_requested,
         "latest_event_index": turn.latest_event_index,
         "events": store.events_after(turn.id, after=after),
+    }
+
+
+def execution_store_for_current_account() -> ExecutionStore:
+    return ExecutionStore(account_workspace_root() / "meet_files" / "execution")
+
+
+def _current_account_execution(execution_id: str) -> tuple[ExecutionStore, ExecutionRecord]:
+    store = execution_store_for_current_account()
+    record = store.get(execution_id)
+    if record.account_id != str(current_auth_user().id):
+        # Keep account isolation non-enumerable: cross-account IDs look absent.
+        raise FileNotFoundError("未找到当前账户的执行记录。")
+    return store, record
+
+
+def execution_payload(execution_id: str) -> dict[str, Any]:
+    store, record = _current_account_execution(execution_id)
+    return {
+        "ok": True,
+        "execution": execution_record_payload(record),
+        "permissions": store.permissions_for_execution(record.execution_id),
+        "receipt": store.receipt(record.execution_id),
+    }
+
+
+def execution_events_payload(execution_id: str, *, after: int = -1) -> dict[str, Any]:
+    store, record = _current_account_execution(execution_id)
+    all_events = store.events(record.execution_id, after=-1)
+    events = [event for event in all_events if int(event.get("event_index") or -1) > max(-1, after)]
+    return {
+        "ok": True,
+        "execution_id": record.execution_id,
+        "status": record.status,
+        "latest_event_index": int(all_events[-1].get("event_index") or -1) if all_events else -1,
+        "events": events,
+    }
+
+
+def execution_changes_payload(execution_id: str) -> dict[str, Any]:
+    _store, record = _current_account_execution(execution_id)
+    result = record.result or {}
+    change_set_id = str(result.get("change_set_id") or "")
+    if not change_set_id:
+        return {"ok": True, "execution_id": record.execution_id, "change_set": None}
+    workspace = WorkspaceManager(account_workspace_root() / "meet_files" / "execution")
+    change_set = workspace.load_change_set(change_set_id)
+    if change_set.execution_id != record.execution_id:
+        raise FileNotFoundError("当前账户没有该变更集。")
+    return {
+        "ok": True,
+        "execution_id": record.execution_id,
+        "change_set": {
+            "change_set_id": change_set.change_set_id,
+            "snapshot_id": change_set.snapshot_id,
+            "digest": change_set.digest,
+            "generated_at_ms": change_set.generated_at_ms,
+            "changes": [
+                {
+                    "path": item.path,
+                    "change_type": item.change_type,
+                    "base_hash": item.base_hash,
+                    "result_hash": item.result_hash,
+                    "size_before": item.size_before,
+                    "size_after": item.size_after,
+                    "binary": item.binary,
+                    "diff_ref": item.diff_ref,
+                }
+                for item in change_set.changes
+            ],
+        },
+    }
+
+
+def execution_receipt_payload(execution_id: str) -> dict[str, Any]:
+    store, record = _current_account_execution(execution_id)
+    return {
+        "ok": True,
+        "execution_id": record.execution_id,
+        "receipt": store.receipt(record.execution_id),
+    }
+
+
+def execution_record_payload(record: ExecutionRecord) -> dict[str, Any]:
+    return {
+        "execution_id": record.execution_id,
+        "account_id": record.account_id,
+        "turn_id": record.turn_id,
+        "conversation_id": record.conversation_id,
+        "project_id": record.project_id,
+        "tool_call_id": record.tool_call_id,
+        "mode": record.mode,
+        "backend": record.backend,
+        "status": record.status,
+        "phase": record.phase,
+        "delivery_status": record.delivery_status,
+        "request": record.request,
+        "contract": record.contract,
+        "result": record.result,
+        "error": record.error,
+        "created_at_ms": record.created_at_ms,
+        "updated_at_ms": record.updated_at_ms,
     }
 
 
@@ -4884,6 +5858,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         session_store=store,
         conversation_id=conversation_id,
         project_id=project_id,
+        execution_account_id=str(current_auth_user().id),
         enabled_skill_ids=enabled_skill_ids(),
         friday_notification_handler=(
             friday_notification_handler
@@ -4911,7 +5886,18 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         auto_approve=auto_approve,
         plan_update_callback=persist_task_plan,
         initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
-        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id))
+        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
+        reasoning_effort=reasoning_effort,
+    )
+    image_preparation = enrich_image_attachments_for_model(
+        list(prepared_context.messages),
+        profile,
+    )
+    runtime_messages = image_preparation.messages
+    runtime_system_context = (
+        prepared_context.system_context
+        + image_fallback_system_context(image_preparation.notice)
+        + agent_turn_time_context()
         + (
             memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
             if assistant_runtime_mode(conversation_id) == "friday"
@@ -4923,16 +5909,14 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             prepared_context.messages,
             skill_hint=skill_hint,
             context_file_paths=context_file_paths,
-        ),
-        reasoning_effort=reasoning_effort,
+        )
     )
-    runtime_messages = list(prepared_context.messages)
     runtime_message_count_before_run = len(runtime_messages)
     result = agent.run_messages(
         runtime_messages,
-        system_context=prepared_context.system_context,
+        system_context=runtime_system_context,
     )
-    session.messages.extend(runtime_messages[runtime_message_count_before_run:])
+    session.messages.extend(dehydrate_model_messages(runtime_messages[runtime_message_count_before_run:]))
     final_content = result.final
     if contains_tool_call_markup(final_content):
         final_content = (
@@ -4941,6 +5925,9 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
         if session.messages and session.messages[-1].get("role") == "assistant":
             session.messages[-1]["content"] = final_content
+    final_content = image_fallback_final_content(final_content, image_preparation.notice)
+    if session.messages and session.messages[-1].get("role") == "assistant":
+        session.messages[-1]["content"] = final_content
     clear_completed_task_plan(session)
     store.save(session)
     if assistant_runtime_mode(conversation_id) == "friday":
@@ -5094,15 +6081,42 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             payload.get("conversation_summary_message_count")
         )
     session.metadata["project_id"] = project_id
+    reserved_tokens = profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS
     if is_compact_command(messages[-1]["content"]):
+        memory_inspection = inspect_session_memory(
+            session,
+            reserved_tokens=reserved_tokens,
+        )
+        estimated_tokens = memory_inspection.estimated_tokens
+        yield turn_runtime.emit(
+            {
+                "event": "activity",
+                "phase": "thinking",
+                "title": "正在压缩上下文",
+                "detail": (
+                    "正在调用当前模型生成续作摘要。"
+                ),
+                "activity_type": "runtime_summary",
+                "runtime_stage": "compacting",
+                "context_estimated_tokens": estimated_tokens,
+                "context_trigger_tokens": CHAT_SUMMARY_TRIGGER_TOKENS,
+                "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+            }
+        )
         try:
             prepared_context = prepare_session_memory(
                 client,
                 profile,
                 session,
-                reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+                reserved_tokens=reserved_tokens,
                 force=True,
+                inspection=memory_inspection,
+                cancel_check=turn_runtime.cancelled,
             )
+        except ContextCompactionCancelled:
+            debug_trace.emit("explicit_stream_compaction_cancelled")
+            yield turn_runtime.cancel_event()
+            return
         except ContextCompactionError as error:
             content = f"压缩失败：{error}"
             debug_trace.emit("explicit_stream_compaction_failed", error=str(error))
@@ -5136,8 +6150,12 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             {
                 "event": "activity",
                 "phase": "thinking",
-                "title": "压缩当前任务",
+                "title": "上下文已整理",
                 "detail": content,
+                "activity_type": "runtime_summary",
+                "runtime_stage": "complete",
+                "context_estimated_tokens": prepared_context.estimated_tokens,
+                "context_trigger_tokens": CHAT_SUMMARY_TRIGGER_TOKENS,
                 "elapsed_ms": int((time.monotonic() - started_at) * 1000),
             }
         )
@@ -5158,13 +6176,38 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         )
         return
     store.append_user_message(session, messages[-1]["content"])
+    memory_inspection = inspect_session_memory(
+        session,
+        reserved_tokens=reserved_tokens,
+    )
+    estimated_tokens = memory_inspection.estimated_tokens
+    if estimated_tokens >= CHAT_SUMMARY_TRIGGER_TOKENS:
+        yield turn_runtime.emit(
+            {
+                "event": "activity",
+                "phase": "thinking",
+                "title": "正在压缩上下文",
+                "detail": "正在压缩上下文，请稍候。",
+                "activity_type": "runtime_summary",
+                "runtime_stage": "compacting",
+                "context_estimated_tokens": estimated_tokens,
+                "context_trigger_tokens": CHAT_SUMMARY_TRIGGER_TOKENS,
+                "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+            }
+        )
     try:
         prepared_context = prepare_session_memory(
             client,
             profile,
             session,
-            reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+            reserved_tokens=reserved_tokens,
+            inspection=memory_inspection,
+            cancel_check=turn_runtime.cancelled,
         )
+    except ContextCompactionCancelled:
+        debug_trace.emit("automatic_stream_compaction_cancelled")
+        yield turn_runtime.cancel_event()
+        return
     except ContextCompactionError as error:
         store.save(session)
         debug_trace.emit("automatic_stream_compaction_failed", error=str(error))
@@ -5203,11 +6246,16 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             {
                 "event": "activity",
                 "phase": "thinking",
-                "title": "整理长上下文",
+                "title": "上下文已整理",
                 "detail": (
                     f"估算上下文 {prepared_context.estimated_tokens} tokens，已超过 "
-                    f"{CHAT_SUMMARY_TRIGGER_TOKENS} tokens，生成分点摘要并作为后续初始上下文。"
+                    f"{CHAT_SUMMARY_TRIGGER_TOKENS} tokens；"
+                    "分点摘要已生成，并作为后续初始上下文。"
                 ),
+                "activity_type": "runtime_summary",
+                "runtime_stage": "complete",
+                "context_estimated_tokens": prepared_context.estimated_tokens,
+                "context_trigger_tokens": CHAT_SUMMARY_TRIGGER_TOKENS,
                 "elapsed_ms": int((time.monotonic() - started_at) * 1000),
             }
         )
@@ -5222,6 +6270,8 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         session_store=store,
         conversation_id=conversation_id,
         project_id=project_id,
+        execution_account_id=str(current_auth_user().id),
+        execution_turn_id=turn_runtime.turn_id,
         enabled_skill_ids=enabled_skill_ids(),
         friday_notification_handler=(
             friday_notification_handler
@@ -5253,7 +6303,17 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         auto_approve=auto_approve,
         plan_update_callback=persist_stream_task_plan,
         initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
-        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id))
+        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
+    )
+    image_preparation = enrich_image_attachments_for_model(
+        list(prepared_context.messages),
+        profile,
+    )
+    runtime_messages = image_preparation.messages
+    runtime_system_context = (
+        prepared_context.system_context
+        + image_fallback_system_context(image_preparation.notice)
+        + agent_turn_time_context()
         + (
             memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
             if assistant_runtime_mode(conversation_id) == "friday"
@@ -5265,15 +6325,25 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             prepared_context.messages,
             skill_hint=skill_hint,
             context_file_paths=context_file_paths,
-        ),
+        )
     )
-    runtime_messages = list(prepared_context.messages)
     runtime_message_count_before_run = len(runtime_messages)
     session_saved_after_run = False
+    if image_preparation.notice:
+        yield turn_runtime.emit(
+            {
+                "event": "activity",
+                "phase": "thinking",
+                "title": "图片附件已降级",
+                "detail": image_preparation.notice,
+                "activity_type": "image_fallback",
+                "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+            }
+        )
     try:
         for event in agent.iter_message_events(
             runtime_messages,
-            system_context=prepared_context.system_context,
+            system_context=runtime_system_context,
         ):
             turn_runtime.raise_if_cancelled()
             event["elapsed_ms"] = int((time.monotonic() - started_at) * 1000)
@@ -5298,12 +6368,17 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                     last_runtime_message = runtime_messages[-1] if runtime_messages else None
                     if isinstance(last_runtime_message, dict) and last_runtime_message.get("role") == "assistant":
                         last_runtime_message["content"] = event["content"]
+                event["content"] = image_fallback_final_content(
+                    str(event.get("content") or ""),
+                    image_preparation.notice,
+                )
+                last_runtime_message = runtime_messages[-1] if runtime_messages else None
+                if isinstance(last_runtime_message, dict) and last_runtime_message.get("role") == "assistant":
+                    last_runtime_message["content"] = event["content"]
                 if not event.get("waiting_approval"):
                     clear_completed_task_plan(session)
                 session.messages.extend(
-                    message
-                    for message in runtime_messages[runtime_message_count_before_run:]
-                    if isinstance(message, dict)
+                    dehydrate_model_messages(runtime_messages[runtime_message_count_before_run:])
                 )
                 session.summary = prepared_context.summary
                 session.summary_message_count = prepared_context.summary_message_count
@@ -5333,8 +6408,18 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         debug_trace.emit("http_chat_stream_cancelled", turn_id=turn_runtime.turn_id)
         yield turn_runtime.cancel_event()
         return
+    except Exception as error:
+        debug_trace.emit(
+            "http_chat_stream_failed",
+            turn_id=turn_runtime.turn_id,
+            error_type=type(error).__name__,
+            error=str(error),
+            traceback=traceback.format_exc().splitlines()[-16:],
+        )
+        yield turn_runtime.fail_event(error)
+        return
     if not session_saved_after_run and len(runtime_messages) > runtime_message_count_before_run:
-        session.messages.extend(runtime_messages[runtime_message_count_before_run:])
+        session.messages.extend(dehydrate_model_messages(runtime_messages[runtime_message_count_before_run:]))
         session.summary = prepared_context.summary
         session.summary_message_count = prepared_context.summary_message_count
         store.save(session)
@@ -5413,6 +6498,26 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
 
     session_store = get_session_store()
     session = session_store.load(conversation_id)
+
+    def persist_resumed_task_plan(plan: list[dict[str, str]], explanation: str) -> None:
+        plan_state = {
+            "steps": plan,
+            "explanation": explanation,
+            "updated_at": int(time.time()),
+            "turn_id": turn_runtime.turn_id,
+        }
+        metadata = getattr(session, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            session.metadata = metadata
+        metadata["active_task_plan"] = plan_state
+        session_store.save(session)
+        if hasattr(turn_store, "update_metadata"):
+            turn_store.update_metadata(turn_runtime.turn_id, {"task_plan": plan_state})
+        debug_trace.emit("task_plan_updated_after_approval", plan=plan, explanation=explanation)
+
+    session_metadata = getattr(session, "metadata", {})
+    active_task_plan = session_metadata.get("active_task_plan", {}) if isinstance(session_metadata, dict) else {}
     tools = build_default_tools(
         WORKSPACE_ROOT,
         client,
@@ -5423,6 +6528,8 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         session_store=session_store,
         conversation_id=conversation_id,
         project_id=str(pending_approval.get("project_id") or ""),
+        execution_account_id=str(current_auth_user().id),
+        execution_turn_id=turn_runtime.turn_id,
         enabled_skill_ids=enabled_skill_ids(),
     )
     agent = ReActAgent(
@@ -5435,6 +6542,8 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         extra_system_context=extra_system_context,
         reasoning_effort=normalize_reasoning_effort(pending_approval.get("reasoning_effort")),
         auto_approve=pending_approval.get("auto_approve") is True,
+        plan_update_callback=persist_resumed_task_plan,
+        initial_task_plan=active_task_plan.get("steps", []) if isinstance(active_task_plan, dict) else [],
     )
 
     session_saved_after_run = False
@@ -5508,6 +6617,8 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
                 )
                 session_store.save(session)
                 if not event.get("waiting_approval"):
+                    clear_completed_task_plan(session)
+                    session_store.save(session)
                     turn_store.clear_pending_approval(turn_runtime.turn_id)
                 session_saved_after_run = True
                 debug_trace.emit(
@@ -5534,8 +6645,18 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         debug_trace.emit("approval_resume_cancelled", turn_id=turn_runtime.turn_id)
         yield turn_runtime.cancel_event()
         return
+    except Exception as error:
+        debug_trace.emit(
+            "approval_resume_failed",
+            turn_id=turn_runtime.turn_id,
+            error_type=type(error).__name__,
+            error=str(error),
+            traceback=traceback.format_exc().splitlines()[-16:],
+        )
+        yield turn_runtime.fail_event(error)
+        return
     if not session_saved_after_run and len(runtime_messages) > runtime_message_count_before_run:
-        session.messages.extend(runtime_messages[runtime_message_count_before_run:])
+        session.messages.extend(dehydrate_model_messages(runtime_messages[runtime_message_count_before_run:]))
         session_store.save(session)
         debug_trace.emit(
             "approval_resume_partial_saved",
@@ -5648,6 +6769,110 @@ def sanitize_chat_messages(raw_messages: Any) -> list[dict[str, str]]:
                 continue
         cleaned.append({"role": role, "content": content})
     return cleaned
+
+
+@dataclass(frozen=True)
+class ImageAttachmentPreparation:
+    messages: list[dict[str, Any]]
+    attached_count: int = 0
+    skipped_count: int = 0
+    notice: str = ""
+
+
+def enrich_image_attachments_for_model(
+    messages: list[dict[str, Any]],
+    profile: ModelProfile,
+    *,
+    workspace_root: Path | None = None,
+) -> ImageAttachmentPreparation:
+    """Turn image paths embedded in chat messages into multimodal inputs.
+
+    The browser/archive keeps the human-readable path, not a large base64 blob.
+    Immediately before the LLM call we resolve safe workspace paths and attach
+    data URLs to user messages.  This preserves compact history while giving
+    vision-capable OpenAI-compatible models the actual image bytes.
+    """
+    root = (workspace_root or WORKSPACE_ROOT).resolve()
+    enriched: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    attached_count = 0
+    skipped_count = 0
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            enriched.append(message)
+            continue
+        text = str(message.get("content") or "")
+        parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        for ref in extract_workspace_file_references(text):
+            path = str(ref.get("path") or "")
+            candidate = (root / path).resolve()
+            if root not in (candidate, *candidate.parents):
+                continue
+            if path in seen_paths or not candidate.is_file():
+                continue
+            mime_type = mimetypes.guess_type(candidate.name)[0] or ""
+            if not mime_type.startswith("image/"):
+                continue
+            seen_paths.add(path)
+            if not profile.supports_vision:
+                skipped_count += 1
+                continue
+            try:
+                encoded = base64.b64encode(candidate.read_bytes()).decode("ascii")
+            except OSError:
+                continue
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+            })
+            attached_count += 1
+        if len(parts) > 1:
+            enriched.append({**message, "content": parts})
+        else:
+            enriched.append(message)
+    notice = ""
+    if skipped_count:
+        notice = (
+            f"当前模型 {profile.model} 不支持图片识别，已跳过对话历史中的 "
+            f"{skipped_count} 张图片；其余文字、文件路径和工具仍会正常处理。"
+        )
+    return ImageAttachmentPreparation(
+        messages=enriched,
+        attached_count=attached_count,
+        skipped_count=skipped_count,
+        notice=notice,
+    )
+
+
+def image_fallback_system_context(notice: str) -> str:
+    if not notice:
+        return ""
+    return (
+        f"\n\n附件降级提示：{notice}"
+        "不要声称已经看过或识别了被跳过的图片；可以继续处理文字内容，并在确有需要时建议用户切换视觉模型。"
+    )
+
+
+def image_fallback_final_content(content: str, notice: str) -> str:
+    if not notice:
+        return content
+    return f"> ⚠️ {notice}\n\n{content}".strip()
+
+
+def dehydrate_model_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep persisted history textual; never write image base64 into archives."""
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, dict) and isinstance(message.get("content"), list):
+            text = "".join(
+                str(part.get("text") or "")
+                for part in message["content"]
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()
+            result.append({**message, "content": text})
+        else:
+            result.append(message)
+    return result
 
 
 def pending_approval_resume_turn_id(conversation_id: str, latest_user_content: str) -> str:
@@ -6134,7 +7359,7 @@ def render_chat_skill_catalog() -> str:
             "mention": str(skill.get("mention") or ""),
             "description": str(skill.get("description") or ""),
             "when_to_use": str(skill.get("when_to_use") or ""),
-            "default_enabled": bool(skill.get("default_enabled", False)),
+            "enabled": bool(skill.get("enabled", skill.get("default_enabled", False))),
         }
         for skill in skills
     ]
@@ -6442,7 +7667,12 @@ def run_meeting_minutes_payload(payload: dict[str, Any]) -> dict[str, Any]:
     profile = registry.get(str(payload.get("profile") or registry.default_profile))
     client = OpenAICompatibleClient()
     settings = load_meeting_minutes_settings()
-    skill = MeetingMinutesSkill(workspace_root=WORKSPACE_ROOT, client=client, profile=profile)
+    skill = MeetingMinutesSkill(
+        workspace_root=account_workspace_root(),
+        runtime_workspace_root=WORKSPACE_ROOT,
+        client=client,
+        profile=profile,
+    )
     result = skill.run(
         {
             "input_path": str(payload.get("input_path") or payload.get("transcript_path") or payload.get("audio_path") or ""),
@@ -6452,7 +7682,6 @@ def run_meeting_minutes_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "meeting_name": required_string(payload, "meeting_name"),
             "confirmed_info": str(payload.get("confirmed_info") or ""),
             "supplemental_paths": payload.get("supplemental_paths") or [],
-            "spec_path": str(payload.get("spec_path") or "meeting_audio_minutes/meeting_minutes_spec.md"),
             "custom_instructions": settings["custom_instructions"],
         }
     )
@@ -6549,7 +7778,9 @@ def add_temporary_sync_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not data:
         raise ValueError("不能上传空文件")
     if len(data) > TEMP_SYNC_MAX_FILE_BYTES:
-        raise ValueError("单个文件不能超过 100 MB")
+        raise ValueError(
+            f"单个文件不能超过 {TEMP_SYNC_MAX_FILE_BYTES // (1024 * 1024)} MB"
+        )
 
     uploaded_at = int(time.time())
     metadata = {
@@ -6726,6 +7957,7 @@ def main() -> int:
     WORKSPACE_ROOT = Path(args.workspace).resolve()
     CONFIG_PATH = Path(args.config)
     STATIC_DIR = Path(args.static_dir)
+    load_env_file(WORKSPACE_ROOT / ".env")
     AUTH_STORE = None
     WEIXIN_GATEWAY = None
     auth_store = get_auth_store()

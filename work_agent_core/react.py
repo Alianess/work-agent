@@ -26,7 +26,7 @@ from .memory import (
     estimate_messages_tokens,
     summarize_active_react_checkpoint,
 )
-from .progress import compact_preview_text, set_tool_progress_sink
+from .progress import compact_preview_text, set_tool_cancel_check, set_tool_progress_sink
 from .session_store import repair_runtime_message_sequence
 from .shell_tools import issue_internal_approval_grant
 from .tool_bus import ToolBus
@@ -200,7 +200,11 @@ class ReActAgent:
                     arguments=tool_input,
                 )
                 try:
-                    observation = self._execute_model_tool(tool_name, tool_input)
+                    observation = self._execute_model_tool(
+                        tool_name,
+                        tool_input,
+                        tool_call_id=tool_call.id or f"call_{step}_{index}",
+                    )
                 except Exception as error:
                     observation = f"TOOL_ERROR: {type(error).__name__}: {error}"
                     self._trace(
@@ -241,6 +245,7 @@ class ReActAgent:
                                 source="reviewer",
                             ),
                             trusted_approval=True,
+                            tool_call_id=tool_call.id or f"call_{step}_{index}",
                         )
                         approval_payload = parse_shell_approval_required_observation(tool_name, observation)
                 tool_message: Message = {
@@ -325,6 +330,7 @@ class ReActAgent:
         messages: list[Message] = self._model_messages(session_messages, system_context=system_context)
         tool_schemas = self._tool_schemas()
         used_tools = False
+        visible_content_parts: list[str] = []
         self._trace(
             "agent_start",
             mode="stream",
@@ -347,14 +353,26 @@ class ReActAgent:
             try:
                 checkpoint_event = self._maybe_compact_active_runtime(messages, step=step)
             except ContextCompactionError as error:
-                self._trace("active_runtime_compaction_failed", step=step, error=str(error))
+                fallback_count = self._compact_active_runtime_locally(messages)
+                self._trace(
+                    "active_runtime_compaction_failed",
+                    step=step,
+                    error=str(error),
+                    fallback="local_tail_compaction",
+                    fallback_message_count=fallback_count,
+                    traceback=traceback.format_exc().splitlines()[-16:],
+                )
                 yield {
-                    "event": "error",
-                    "message": str(error),
-                    "type": type(error).__name__,
-                    "detail": "本轮未继续调用模型；完整原始运行轨迹仍保留，可在模型恢复后继续本轮。",
+                    "event": "activity",
+                    "phase": "observation",
+                    "title": "上下文已本地降级整理",
+                    "detail": (
+                        "模型压缩服务暂时不可用，已保留当前请求、任务计划和最近工具结果，"
+                        "继续执行本轮；完整原始轨迹仍保留。"
+                    ),
+                    "activity_type": "runtime_compaction_fallback",
+                    "step": step,
                 }
-                return
             if checkpoint_event is not None:
                 yield checkpoint_event
             try:
@@ -362,6 +380,7 @@ class ReActAgent:
                     messages=messages,
                     tool_schemas=tool_schemas,
                     step=step,
+                    draft_prefix=visible_react_draft_prefix(visible_content_parts),
                 )
             except AgentCancelled:
                 self._trace("agent_cancelled", step=step)
@@ -411,11 +430,12 @@ class ReActAgent:
                 }
                 session_messages.append(final_message)
                 messages.append(final_message)
+                display_final = merge_visible_react_content(visible_content_parts, final)
                 self._trace(
                     "agent_final",
                     step=step,
                     used_tools=used_tools,
-                    final_chars=len(str(final_message["content"])),
+                    final_chars=len(display_final),
                 )
                 yield {
                     "event": "activity",
@@ -426,16 +446,28 @@ class ReActAgent:
                 }
                 yield {
                     "event": "final",
-                    "content": str(final_message["content"]),
+                    "content": display_final,
                     "steps_used": step,
                     "model_profile": self.profile.name,
                     "used_tools": used_tools,
                 }
                 return
 
+            raw_visible_text = str(assistant_message.get("content") or response.content or "")
             visible_text = assistant_visible_content(assistant_message).strip()
-            yield {"event": "draft_reset", "step": step}
             if visible_text:
+                if contains_tool_call_markup(raw_visible_text):
+                    yield {
+                        "event": "draft_delta",
+                        "content": visible_text,
+                        "step": step,
+                    }
+                visible_content_parts.append(visible_text)
+                yield {
+                    "event": "draft_delta",
+                    "content": "\n\n",
+                    "step": step,
+                }
                 yield {
                     "event": "activity",
                     "phase": "thinking",
@@ -479,7 +511,12 @@ class ReActAgent:
                     "tool_name": tool_name,
                 }
 
-                observation = yield from self._execute_tool_with_progress(tool_name, tool_input, step)
+                observation = yield from self._execute_tool_with_progress(
+                    tool_name,
+                    tool_input,
+                    step,
+                    tool_call_id=tool_call.id or f"call_{step}_{index}",
+                )
                 self._raise_if_cancelled()
                 approval_payload = parse_shell_approval_required_observation(tool_name, observation)
                 review: ApprovalReview | None = None
@@ -551,6 +588,7 @@ class ReActAgent:
                         ),
                         step,
                         trusted_approval=True,
+                        tool_call_id=tool_call.id or f"call_{step}_{index}",
                     )
                     self._raise_if_cancelled()
                     approval_payload = parse_shell_approval_required_observation(tool_name, observation)
@@ -570,6 +608,7 @@ class ReActAgent:
                         approval_payload=approval_payload,
                         reasoning_effort=self.reasoning_effort,
                         auto_approve=self.auto_approve,
+                        visible_content_parts=visible_content_parts,
                     )
                     del session_messages[batch_session_start:]
                     del messages[batch_model_start:]
@@ -599,6 +638,7 @@ class ReActAgent:
                         batch_count=len(tool_calls),
                         batch_remaining=len(tool_calls) - index,
                     )
+                    display_final = merge_visible_react_content(visible_content_parts, final)
                     self._trace(
                         "agent_waiting_approval",
                         step=step,
@@ -609,7 +649,7 @@ class ReActAgent:
                     )
                     yield {
                         "event": "final",
-                        "content": final,
+                        "content": display_final,
                         "steps_used": step,
                         "model_profile": self.profile.name,
                         "used_tools": True,
@@ -658,11 +698,12 @@ class ReActAgent:
                 final_message: Message = {"role": "assistant", "content": deterministic_final}
                 session_messages.append(final_message)
                 messages.append(final_message)
+                display_final = merge_visible_react_content(visible_content_parts, deterministic_final)
                 self._trace(
                     "agent_deterministic_final",
                     step=step,
                     used_tools=True,
-                    final_chars=len(deterministic_final),
+                    final_chars=len(display_final),
                 )
                 yield {
                     "event": "activity",
@@ -673,7 +714,7 @@ class ReActAgent:
                 }
                 yield {
                     "event": "final",
-                    "content": deterministic_final,
+                    "content": display_final,
                     "steps_used": step,
                     "model_profile": self.profile.name,
                     "used_tools": True,
@@ -685,6 +726,7 @@ class ReActAgent:
         final_message: Message = {"role": "assistant", "content": final}
         session_messages.append(final_message)
         messages.append(final_message)
+        display_final = merge_visible_react_content(visible_content_parts, final)
         self._trace("agent_max_steps", max_steps=self.max_steps, used_tools=used_tools)
         yield {
             "event": "activity",
@@ -695,7 +737,7 @@ class ReActAgent:
         }
         yield {
             "event": "final",
-            "content": final,
+            "content": display_final,
             "steps_used": self.max_steps,
             "model_profile": self.profile.name,
             "used_tools": used_tools,
@@ -734,6 +776,15 @@ class ReActAgent:
         ]
         step = max(1, int(pending_approval.get("step") or 1))
         assistant_history = assistant_message_for_history(assistant_history, tool_calls=tool_calls)
+        visible_content_parts = [
+            str(item).strip()
+            for item in pending_approval.get("visible_content_parts", [])
+            if str(item).strip()
+        ]
+        if not visible_content_parts:
+            legacy_visible_text = assistant_visible_content(assistant_history).strip()
+            if legacy_visible_text:
+                visible_content_parts.append(legacy_visible_text)
 
         runtime_messages_before_batch = list(session_messages)
         messages = self._model_messages(session_messages, system_context=system_context)
@@ -743,7 +794,11 @@ class ReActAgent:
             session_messages.append(tool_message)
             messages.append(tool_message)
 
-        yield {"event": "draft_reset", "step": step}
+        yield {
+            "event": "draft_reset",
+            "content": visible_react_draft_prefix(visible_content_parts),
+            "step": step,
+        }
         yield {
             "event": "activity",
             "phase": "action",
@@ -786,6 +841,7 @@ class ReActAgent:
                 tool_input,
                 step,
                 trusted_approval=(tool_name == "shell_exec" and index == approval_index),
+                tool_call_id=tool_call.id or f"call_{step}_{index}",
             )
             self._raise_if_cancelled()
             approval_payload = parse_shell_approval_required_observation(tool_name, observation)
@@ -833,6 +889,7 @@ class ReActAgent:
                     tool_input,
                     step,
                     trusted_approval=True,
+                    tool_call_id=tool_call.id or f"call_{step}_{index}",
                 )
                 self._raise_if_cancelled()
                 approval_payload = parse_shell_approval_required_observation(tool_name, observation)
@@ -852,6 +909,7 @@ class ReActAgent:
                     approval_payload=approval_payload,
                     reasoning_effort=self.reasoning_effort,
                     auto_approve=self.auto_approve,
+                    visible_content_parts=visible_content_parts,
                 )
                 yield {
                     "event": "activity",
@@ -876,10 +934,13 @@ class ReActAgent:
                 }
                 yield {
                     "event": "final",
-                    "content": approval_required_final_text(
-                        approval_payload,
-                        batch_count=len(tool_calls),
-                        batch_remaining=len(tool_calls) - index,
+                    "content": merge_visible_react_content(
+                        visible_content_parts,
+                        approval_required_final_text(
+                            approval_payload,
+                            batch_count=len(tool_calls),
+                            batch_remaining=len(tool_calls) - index,
+                        ),
                     ),
                     "steps_used": step,
                     "model_profile": self.profile.name,
@@ -917,8 +978,28 @@ class ReActAgent:
         # ReAct from that state and force used_tools=true on the final event.
         session_messages[:] = repair_runtime_message_sequence(session_messages)
         for event in self.iter_message_events(session_messages, system_context=system_context):
+            if event.get("event") == "draft_reset":
+                event["content"] = (
+                    visible_react_draft_prefix(visible_content_parts)
+                    + str(event.get("content") or "")
+                )
             if event.get("event") == "final":
                 event["used_tools"] = True
+                event["content"] = merge_visible_react_content(
+                    visible_content_parts,
+                    str(event.get("content") or ""),
+                )
+                next_pending = event.get("pending_approval")
+                if isinstance(next_pending, dict):
+                    nested_parts = next_pending.get("visible_content_parts")
+                    next_pending["visible_content_parts"] = [
+                        *visible_content_parts,
+                        *(
+                            [str(item) for item in nested_parts]
+                            if isinstance(nested_parts, list)
+                            else []
+                        ),
+                    ]
             yield event
 
     def _default_system_prompt(self) -> str:
@@ -967,9 +1048,19 @@ class ReActAgent:
             "必须优先读取/写入这些明确路径；不要为了确认而先扫描工作区。"
             "修改现有文本文件时，小范围改动优先使用 edit_text_file；跨多处或多文件改动优先使用 apply_unified_patch；"
             "只有创建完整新文件或确实需要重写成品时才使用 write_text_file。"
+            "读取、拼接、整理或改写纯文本/Markdown 文件时，必须使用 read_text_file、write_text_file、"
+            "edit_text_file 或 apply_unified_patch；不得为这类操作调用 python、shell_exec 或其他终端命令。"
+            "终端隔离后端不可用时，不要发起或请求用户审批一个必然失败的终端动作；"
+            "如果现有文件工具可以完成同一交付，必须直接改用文件工具继续。"
             "只有缺少路径且任务确实依赖本地文件时，才可以调用 list_workspace_files，并且必须限定到最小目录"
             "（例如 meet_files 或 meet_files/attachments）。"
             "除非用户明确要求查看整个项目结构，否则不要调用 list_workspace_files(path='.') 或扫描工作区根目录。\n\n"
+            "个人待办语义规则：用户问“待办”“待办事项”“我有什么待办”时，待办事项只指 Apple「提醒事项」（当前 Mac 已同步的数据），"
+            "不得从项目、日报、会议纪要、历史对话或工作上下文推测任务后混入回答。必须先通过 apple-schedule 技能读取提醒事项，"
+            "并调用 list_apple_schedule(include_events=false, include_reminders=true)；没有读到数据时如实说明。"
+            "只有用户明确说“工作任务”或“项目待办”时，才按工作上下文回答。"
+            "用户在当前对话中明确要求新增/添加/创建待办或提醒时，才可经 apple-schedule 的 create_apple_reminder 创建一项提醒；"
+            "不得从讨论、计划或会议内容推断写入，不得新增 Apple 日历事件，也不得擅自补全日期、时间、备注或列表。\n\n"
             "技能分层规则：领域任务先根据系统提示中的技能索引判断是否已有对应技能。"
             "匹配时先调用 sys_skill 的 open 读取该技能说明；关闭的技能不能在对话中 activate，"
             "必须提示用户先在网页“技能”页启用并开始新对话。需要技能专用工具时，"
@@ -987,8 +1078,9 @@ class ReActAgent:
 
     def _model_messages(self, session_messages: list[Message], *, system_context: str = "") -> list[Message]:
         messages: list[Message] = [{"role": "system", "content": self.system_prompt}]
+        late_system_messages: list[Message] = []
         if self.task_plan:
-            messages.append(
+            late_system_messages.append(
                 {
                     "role": "system",
                     "content": (
@@ -999,8 +1091,24 @@ class ReActAgent:
                 }
             )
         if system_context.strip():
-            messages.append({"role": "system", "content": system_context.strip()})
-        messages.extend(session_messages)
+            late_system_messages.append({"role": "system", "content": system_context.strip()})
+
+        # Keep per-turn state after the reusable conversation prefix.  Placing
+        # it immediately before the newest user message preserves the usual
+        # final-user role expected by OpenAI-compatible providers while a
+        # changing timestamp or task plan invalidates at most the newest turn
+        # of prompt-cache coverage instead of the entire long history.
+        latest_user_index = next(
+            (
+                index
+                for index in range(len(session_messages) - 1, -1, -1)
+                if session_messages[index].get("role") == "user"
+            ),
+            len(session_messages),
+        )
+        messages.extend(session_messages[:latest_user_index])
+        messages.extend(late_system_messages)
+        messages.extend(session_messages[latest_user_index:])
         return messages
 
     def _trace(self, event: str, **payload: Any) -> None:
@@ -1086,17 +1194,27 @@ class ReActAgent:
         tool_input: dict[str, Any],
         *,
         trusted_approval: bool = False,
+        tool_call_id: str = "",
     ) -> str:
-        if tool_name == "update_plan":
-            return self._apply_task_plan(tool_input)
-        tool = self.tools.get_model_tool(tool_name)
-        safe_input = dict(tool_input)
-        if tool_name == "shell_exec" and not trusted_approval:
-            safe_input.pop("approved_by_user", None)
-            safe_input.pop("_approval_source", None)
-            safe_input.pop("_approval_action_id", None)
-            safe_input.pop("_approval_grant", None)
-        return str(tool.handler(safe_input))
+        previous_cancel_check = set_tool_cancel_check(self.cancel_check)
+        try:
+            if tool_name == "update_plan":
+                return self._apply_task_plan(tool_input)
+            tool = self.tools.get_model_tool(tool_name)
+            safe_input = dict(tool_input)
+            # A model argument cannot choose the durable execution identity.  The
+            # native provider tool-call ID always wins and survives turn recovery.
+            safe_input.pop("_execution_tool_call_id", None)
+            if tool_name == "shell_exec" and tool_call_id:
+                safe_input["_execution_tool_call_id"] = str(tool_call_id)
+            if tool_name == "shell_exec" and not trusted_approval:
+                safe_input.pop("approved_by_user", None)
+                safe_input.pop("_approval_source", None)
+                safe_input.pop("_approval_action_id", None)
+                safe_input.pop("_approval_grant", None)
+            return str(tool.handler(safe_input))
+        finally:
+            set_tool_cancel_check(previous_cancel_check)
 
     def _review_approval(
         self,
@@ -1226,6 +1344,7 @@ class ReActAgent:
         step: int,
         *,
         trusted_approval: bool = False,
+        tool_call_id: str = "",
     ) -> Iterator[dict[str, Any]]:
         result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
         progress_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -1235,11 +1354,13 @@ class ReActAgent:
 
         def run_tool() -> None:
             previous_sink = set_tool_progress_sink(progress_queue.put)
+            previous_cancel_check = set_tool_cancel_check(self.cancel_check)
             try:
                 observation = self._execute_model_tool(
                     tool_name,
                     tool_input,
                     trusted_approval=trusted_approval,
+                    tool_call_id=tool_call_id,
                 )
             except Exception as error:
                 observation = f"TOOL_ERROR: {type(error).__name__}: {error}"
@@ -1262,6 +1383,7 @@ class ReActAgent:
                 )
             finally:
                 set_tool_progress_sink(previous_sink)
+                set_tool_cancel_check(previous_cancel_check)
             result_queue.put(str(observation))
 
         thread = threading.Thread(target=run_tool, name=f"work-agent-tool-{tool_name}", daemon=True)
@@ -1311,6 +1433,7 @@ class ReActAgent:
         messages: list[Message],
         tool_schemas: list[dict[str, Any]],
         step: int,
+        draft_prefix: str = "",
     ) -> Iterator[dict[str, Any]]:
         result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
         progress_queue: queue.Queue[dict[str, str]] = queue.Queue()
@@ -1392,6 +1515,7 @@ class ReActAgent:
                     elapsed_ms=int((time.monotonic() - started_at) * 1000),
                     error_type=type(error).__name__,
                     error=str(error),
+                    traceback=traceback.format_exc().splitlines()[-16:],
                 )
                 result_queue.put((False, error))
 
@@ -1434,7 +1558,7 @@ class ReActAgent:
                 delta_status = delta.get("status") or ""
                 if delta_status == "recovery_started":
                     if draft_content_chars:
-                        yield {"event": "draft_reset", "step": step}
+                        yield {"event": "draft_reset", "content": draft_prefix, "step": step}
                     content_buffer = ""
                     reasoning_buffer = ""
                     tool_name_buffer = ""
@@ -1482,8 +1606,6 @@ class ReActAgent:
                     }
                 if (
                     len(content_buffer) > draft_content_chars
-                    and not tool_name_buffer
-                    and not tool_arguments_buffer
                     and not contains_tool_call_markup(content_buffer)
                 ):
                     yield {
@@ -1604,7 +1726,7 @@ class ReActAgent:
                 delta_status = delta.get("status") or ""
                 if delta_status == "recovery_started":
                     if draft_content_chars:
-                        yield {"event": "draft_reset", "step": step}
+                        yield {"event": "draft_reset", "content": draft_prefix, "step": step}
                     content_buffer = ""
                     reasoning_buffer = ""
                     tool_name_buffer = ""
@@ -1650,8 +1772,6 @@ class ReActAgent:
                     }
                 if (
                     len(content_buffer) > draft_content_chars
-                    and not tool_name_buffer
-                    and not tool_arguments_buffer
                     and not contains_tool_call_markup(content_buffer)
                 ):
                     yield {
@@ -1686,19 +1806,19 @@ class ReActAgent:
                         "step": step,
                     }
                     raise RuntimeError(failure_message)
+                if final_content and not contains_tool_call_markup(final_content):
+                    remaining_content = (
+                        final_content[draft_content_chars:]
+                        if final_content.startswith(content_buffer[:draft_content_chars])
+                        else final_content
+                    )
+                    if remaining_content:
+                        yield {
+                            "event": "draft_delta",
+                            "content": remaining_content,
+                            "step": step,
+                        }
                 if final_answer_without_tools:
-                    if final_content and not contains_tool_call_markup(final_content):
-                        remaining_content = (
-                            final_content[draft_content_chars:]
-                            if final_content.startswith(content_buffer[:draft_content_chars])
-                            else final_content
-                        )
-                        if remaining_content:
-                            yield {
-                                "event": "draft_delta",
-                                "content": remaining_content,
-                                "step": step,
-                            }
                     recovery = value.raw.get("_work_agent", {}).get("recovery", {})
                     recovery_note = (
                         "流式返回停滞后已自动切换兼容请求恢复。\n"
@@ -1844,6 +1964,28 @@ def parse_complete_json_object(raw_arguments: str) -> dict[str, Any] | None:
     text = str(raw_arguments or "").strip()
     if not text:
         return None
+
+    def _compact_active_runtime_locally(self, messages: list[Message]) -> int:
+        """Bound a large active run without spending another model request."""
+        user_indexes = [index for index, message in enumerate(messages) if message.get("role") == "user"]
+        if not user_indexes:
+            return 0
+        active_start = user_indexes[-1]
+        active_messages = messages[active_start:]
+        if len(active_messages) < 3:
+            return 0
+        keep_tail = active_messages[-8:]
+        compacted: list[Message] = [dict(active_messages[0])]
+        for message in keep_tail:
+            if message is active_messages[0]:
+                continue
+            item = dict(message)
+            content = item.get("content")
+            if isinstance(content, str) and len(content) > 8000:
+                item["content"] = content[:8000] + "\n[本地降级：工具输出已截断]"
+            compacted.append(item)
+        messages[active_start:] = repair_runtime_message_sequence(compacted)
+        return len(compacted)
     for candidate in unique_candidates([text, escape_raw_control_chars_in_strings(text)]):
         try:
             parsed = json.loads(candidate)
@@ -2100,6 +2242,26 @@ def assistant_visible_content(message: dict[str, Any]) -> str:
     return content.strip()
 
 
+def merge_visible_react_content(parts: list[str], final_content: str = "") -> str:
+    visible_parts = [str(part or "").strip() for part in parts if str(part or "").strip()]
+    final = str(final_content or "").strip()
+    if final:
+        accumulated = "\n\n".join(visible_parts)
+        if not accumulated:
+            return final
+        if final == accumulated or final.startswith(accumulated):
+            return final
+        if accumulated.endswith(final):
+            return accumulated
+        visible_parts.append(final)
+    return "\n\n".join(visible_parts)
+
+
+def visible_react_draft_prefix(parts: list[str]) -> str:
+    content = merge_visible_react_content(parts)
+    return f"{content}\n\n" if content else ""
+
+
 def assistant_message_for_history(
     message: dict[str, Any],
     *,
@@ -2236,6 +2398,7 @@ def pending_tool_batch_state(
     approval_payload: dict[str, Any],
     reasoning_effort: str = "medium",
     auto_approve: bool = False,
+    visible_content_parts: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "kind": "tool_batch",
@@ -2253,6 +2416,11 @@ def pending_tool_batch_state(
         "approval_payload": approval_payload,
         "reasoning_effort": normalize_reasoning_effort(reasoning_effort),
         "auto_approve": bool(auto_approve),
+        "visible_content_parts": [
+            str(item).strip()
+            for item in (visible_content_parts or [])
+            if str(item).strip()
+        ],
         "approval_batch_commands": approval_batch_commands(tool_calls, start_index=approval_index),
     }
 

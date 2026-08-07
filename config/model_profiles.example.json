@@ -9,7 +9,8 @@
       "api_key_env": "EXAMPLE_MODEL_API_KEY",
       "temperature": 0.6,
       "max_tokens": 4096,
-      "timeout_seconds": 120
+      "timeout_seconds": 120,
+      "supports_vision": false
     }
   ]
 }

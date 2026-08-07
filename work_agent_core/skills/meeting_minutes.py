@@ -73,10 +73,14 @@ class MeetingMinutesSkill:
         self,
         *,
         workspace_root: str | Path,
+        runtime_workspace_root: str | Path | None = None,
         client: OpenAICompatibleClient,
         profile: ModelProfile,
     ) -> None:
         self.workspace = WorkspaceFiles(workspace_root)
+        self.runtime_workspace_root = Path(
+            runtime_workspace_root or self.workspace.workspace_root
+        ).resolve()
         self.client = client
         self.profile = profile
 
@@ -205,6 +209,28 @@ class MeetingMinutesSkill:
                 "asr_transcript_path": str(asr_markdown_path),
                 "asr_markdown_path": str(asr_markdown_path),
                 "asr_text_path": str(asr_text_path),
+                "status": "complete",
+                "artifacts_verified": all(
+                    path.is_file()
+                    for path in (transcript_path, asr_markdown_path, asr_text_path)
+                ),
+                "artifacts": [
+                    {
+                        "kind": "transcript",
+                        "path": str(transcript_path),
+                        "exists": transcript_path.is_file(),
+                    },
+                    {
+                        "kind": "asr_markdown",
+                        "path": str(asr_markdown_path),
+                        "exists": asr_markdown_path.is_file(),
+                    },
+                    {
+                        "kind": "asr_text",
+                        "path": str(asr_text_path),
+                        "exists": asr_text_path.is_file(),
+                    },
+                ],
                 "processing_note": processing_note,
                 "recording_metadata": recording_metadata,
             },
@@ -220,15 +246,15 @@ class MeetingMinutesSkill:
         if not target.exists():
             raise FileNotFoundError(f"断点检查路径不存在：{raw_path}")
         script_path = (
-            self.workspace.workspace_root
+            self.runtime_workspace_root
             / "meeting_audio_minutes"
             / "scripts"
             / "check_asr_progress.py"
         )
-        python = project_agent_python(self.workspace.workspace_root) or Path(sys.executable)
+        python = project_agent_python(self.runtime_workspace_root) or Path(sys.executable)
         result = run_logged_process(
             [str(python), str(script_path), str(target)],
-            cwd=self.workspace.workspace_root,
+            cwd=self.runtime_workspace_root,
             timeout_seconds=120,
             label="ASR断点检查",
             check=False,
@@ -290,11 +316,11 @@ class MeetingMinutesSkill:
         if denoise_backend not in {"ffmpeg", "none"}:
             denoise_backend = "ffmpeg"
         audio_work_dir = asr_root / "audio"
-        meeting_audio_root = self.workspace.workspace_root / "meeting_audio_minutes"
+        meeting_audio_root = self.runtime_workspace_root / "meeting_audio_minutes"
         sys.path.insert(0, str(meeting_audio_root))
         old_path = os.environ.get("PATH", "")
         os.environ["PATH"] = runtime_search_path(
-            self.workspace.workspace_root, old_path
+            self.runtime_workspace_root, old_path
         )
         try:
             from meeting_minutes.audio import preprocess_audio
@@ -478,16 +504,16 @@ class MeetingMinutesSkill:
 
     def _transcribe_with_qwen3(self, audio_path: Path, asr_root: Path, args: dict[str, Any]) -> Path:
         output_root = asr_root / "qwen3"
-        script_path = self.workspace.workspace_root / "meeting_audio_minutes" / "scripts" / "transcribe_qwen3_asr_chunked.py"
+        script_path = self.runtime_workspace_root / "meeting_audio_minutes" / "scripts" / "transcribe_qwen3_asr_chunked.py"
         if not script_path.is_file():
             raise FileNotFoundError(f"未找到本地 Qwen3-ASR 脚本：{script_path}")
-        cache_dir = self.workspace.workspace_root / "meeting_audio_minutes" / "model_cache"
-        asr_settings = load_asr_settings(self.workspace.workspace_root)
+        cache_dir = self.runtime_workspace_root / "meeting_audio_minutes" / "model_cache"
+        asr_settings = load_asr_settings(self.runtime_workspace_root)
         asr_backend = "mlx"
         asr_model_id = str(
             args.get("asr_model_id")
             or asr_settings.get("model_id")
-            or default_asr_model_id("qwen3-asr-mlx-8bit", workspace_root=self.workspace.workspace_root)
+            or default_asr_model_id("qwen3-asr-mlx-8bit", workspace_root=self.runtime_workspace_root)
         )
         command = [
             str(self._local_asr_python()),
@@ -530,7 +556,7 @@ class MeetingMinutesSkill:
         return candidates[0]
 
     def _local_asr_python(self) -> Path:
-        candidate = project_agent_python(self.workspace.workspace_root)
+        candidate = project_agent_python(self.runtime_workspace_root)
         if candidate is not None:
             return candidate
         raise FileNotFoundError(
@@ -538,7 +564,7 @@ class MeetingMinutesSkill:
         )
 
     def _require_executable(self, name: str, message: str) -> str:
-        executable = find_runtime_executable(name, self.workspace.workspace_root)
+        executable = find_runtime_executable(name, self.runtime_workspace_root)
         if not executable:
             raise FileNotFoundError(message)
         return executable
@@ -547,7 +573,7 @@ class MeetingMinutesSkill:
         try:
             run_logged_process(
                 command,
-                cwd=self.workspace.workspace_root,
+                cwd=self.runtime_workspace_root,
                 timeout_seconds=timeout_seconds,
                 label=label,
                 check=True,
@@ -560,7 +586,7 @@ class MeetingMinutesSkill:
             raise RuntimeError(f"{label}失败：{output}") from error
 
     def _export_work_docx(self, *, markdown_path: Path, output_path: Path, title: str) -> None:
-        script_path = self.workspace.workspace_root / "work_agent_core" / "docx_exporter.py"
+        script_path = self.runtime_workspace_root / "work_agent_core" / "docx_exporter.py"
         self._run_process(
             [
                 str(self._office_python()),
@@ -577,7 +603,7 @@ class MeetingMinutesSkill:
         )
 
     def _office_python(self) -> Path:
-        agent_python = project_agent_python(self.workspace.workspace_root)
+        agent_python = project_agent_python(self.runtime_workspace_root)
         candidates = [
             os.getenv("WORK_AGENT_OFFICE_PYTHON"),
             str(agent_python) if agent_python else None,
@@ -599,8 +625,19 @@ class MeetingMinutesSkill:
         return "\n\n".join(chunks)
 
     def _load_minutes_spec(self, args: dict[str, Any]) -> str:
-        base_spec = self.workspace.resolve(str(args.get("spec_path") or SPEC_PATH)).read_text(encoding="utf-8")
-        skill_path = self.workspace.resolve(str(args.get("skill_spec_path") or SKILL_SPEC_PATH))
+        raw_spec_path = str(args.get("spec_path") or "").strip()
+        raw_skill_path = str(args.get("skill_spec_path") or "").strip()
+        base_path = (
+            self.workspace.resolve(raw_spec_path)
+            if raw_spec_path
+            else self.runtime_workspace_root / SPEC_PATH
+        )
+        skill_path = (
+            self.workspace.resolve(raw_skill_path)
+            if raw_skill_path
+            else self.runtime_workspace_root / SKILL_SPEC_PATH
+        )
+        base_spec = base_path.read_text(encoding="utf-8")
         sections = [base_spec]
         if skill_path.is_file():
             skill_spec = skill_path.read_text(encoding="utf-8", errors="replace")
@@ -694,10 +731,16 @@ def register_meeting_minutes_skill(
     registry: ToolRegistry,
     *,
     workspace_root: str | Path,
+    runtime_workspace_root: str | Path | None = None,
     client: OpenAICompatibleClient,
     profile: ModelProfile,
 ) -> None:
-    skill = MeetingMinutesSkill(workspace_root=workspace_root, client=client, profile=profile)
+    skill = MeetingMinutesSkill(
+        workspace_root=workspace_root,
+        runtime_workspace_root=runtime_workspace_root,
+        client=client,
+        profile=profile,
+    )
     registry.register(
         Tool(
             name="check_meeting_asr_progress",

@@ -83,6 +83,28 @@ class WorkReportStoreTests(unittest.TestCase):
         self.assertEqual(collected["missing_daily_reports"], [])
         self.assertIn("完成测试", collected["daily_reports"][0]["content"])
 
+    def test_delete_report_removes_markdown_and_metadata(self) -> None:
+        self.store.save_report(
+            report_type="daily",
+            target_date="2026-08-06",
+            content="# 2026-08-06 工作日报\n\n休假。",
+            source_coverage="full",
+        )
+
+        deleted = self.store.delete_report(report_type="daily", target_date="2026-08-06")
+
+        self.assertTrue(deleted["verified"])
+        self.assertEqual(deleted["deleted_paths"], [
+            "work_reports/daily/2026-08-06.md",
+            "work_reports/daily/2026-08-06.json",
+        ])
+        with self.assertRaises(FileNotFoundError):
+            self.store.read_report(report_type="daily", target_date="2026-08-06")
+
+    def test_delete_report_requires_an_explicit_period(self) -> None:
+        with self.assertRaisesRegex(ValueError, "明确提供"):
+            self.store.delete_report(report_type="daily")
+
     def test_collect_reads_activity_from_per_conversation_archive_storage(self) -> None:
         timestamp = int(datetime(2026, 7, 31, 9, 0).timestamp())
         self.write_json(

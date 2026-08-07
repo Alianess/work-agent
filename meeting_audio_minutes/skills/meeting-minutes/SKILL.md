@@ -22,7 +22,9 @@ A meeting-minutes task is complete only after all of these conditions hold:
    to place another copy in the stable meeting archive folder. The internal
    archive Markdown and work-submission Markdown exist in that archive folder.
 2. The work-submission Word file exists and has passed the applicable DOCX
-   validation and rendered-page visual QA.
+   structural validation. Do not convert it to PDF solely for routine visual
+   QA: the Web file viewer generates the preview automatically, and page
+   appearance is accepted by the user.
 3. `manifest.json` exists, has a non-empty `meeting_time.display`, and its four
    `canonical_outputs` paths were read back and confirmed to exist.
 4. The final response cites the verified artifact paths and describes only work
@@ -75,7 +77,7 @@ Prefer this composable workflow:
 1. If the input is an audio file, first check whether a previous ASR run already exists unless the user explicitly asks to restart from zero. Call `check_meeting_asr_progress` with the complete attachment path as `input_path`. This is a native read-only tool: do not use `shell_exec`, do not ask for terminal approval, and do not split or manually quote paths containing spaces.
 
    Read the result before deciding the next step. If it shows partial progress such as `22/23`, do **not** discard that work and do **not** say it must start over. Resume by calling `transcribe_meeting_audio` again; the underlying Qwen3 command uses `--skip-existing`, so existing chunk results are reused and only missing chunks are transcribed. If the helper finds a complete transcript, use that transcript directly instead of rerunning ASR.
-2. If the input is an audio file and no complete transcript already exists, call `transcribe_meeting_audio`.
+2. If the input is an audio file and no complete transcript already exists, call `transcribe_meeting_audio`. Treat its returned `artifacts` array and exact `path` values as authoritative; never reconstruct an ASR path from the recording filename, model name, or guessed directory. Continue only when `status` is `complete` and `artifacts_verified` is true.
    Treat attachment/audio filenames only as file identifiers and possible weak location labels. Do **not** infer the meeting counterpart, attendees, organizer, or cooperation relationship from names such as `客户现场 4.m4a`; wait for the transcript or explicit user confirmation.
    Read the `recording_metadata` returned by the tool. Use `recording_started_at` only when `recording_time_validation` is `plausible_file_timeline`. Some imported M4A files use `creation_time` for export or container creation; when validation reports a conflict, preserve `media_created_at` for audit but do not treat it as a recording or meeting start. Never substitute file upload time, filename prefix, filesystem mtime, or browser `lastModified` for the recording time.
 3. If the input is an existing `.md` / `.txt` transcript, read it directly with `read_text_file`.
@@ -84,8 +86,8 @@ Prefer this composable workflow:
 6. Draft the work-submission version as conservative Markdown content and write it with `write_text_file`. This is an intermediate artifact, not completion.
 7. Perform the modular Word handoff for the canonical deliverable:
    - Open `official-document` when the requested output is a formal `纪要`, carries formal issuing elements, or otherwise clearly involves official-document content. Let it decide between a full statutory document and a company public-document-style text material.
-   - Then open `docx` and use the complete Word workflow for creation, editing, comments, tracked changes, validation, and rendered-page QA. Pass the company document-format setting and any template without rewriting them in this skill.
-8. Write `manifest.json`, then read it back and verify the four canonical paths, DOCX validation, and rendered-page QA before finalizing.
+   - Then open `docx` and use the complete Word workflow for creation, editing, comments, tracked changes, and structural validation. Do not convert or render the DOCX to PDF for routine preview: the Web file viewer handles DOCX rendering and the user performs visual acceptance. If the user explicitly requests PDF conversion or layout diagnosis, call the structured `docx_soffice` tool once with `input_path` and optional `output_path`; never pass raw LibreOffice arguments or retry unchanged calls. Pass the company document-format setting and any template without rewriting them in this skill.
+8. Write `manifest.json`, then read it back and verify the four canonical paths and DOCX structural validation before finalizing. Do not wait for or simulate human page-layout acceptance.
 9. Use `shell_exec` only when a skill instruction or deterministic script is needed; safe read-only commands may run directly, while script/write/install/long commands need user approval.
 
 ### Recording time metadata
@@ -320,7 +322,10 @@ conclusion-led paragraphs, ordinary body paragraphs, optional final
 recommendation, and confirmed attachment/issuer/date fields. The Word skill
 must apply the current company document-format setting or the selected official
 document specification, preserve all its read/create/edit/comment/redline
-capabilities, validate the DOCX, and inspect rendered pages.
+capabilities, and validate the DOCX. Do not manually render a PDF for routine
+completion; the Web file viewer provides the preview and the user accepts the
+page layout. Render or convert only for an explicit PDF request or a reported
+layout problem.
 
 Before handoff, verify: every paragraph carries a distinct conclusion; exact
 confirmed resources and actions are retained; no generic section duplicates

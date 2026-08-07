@@ -382,6 +382,16 @@ class OpenAICompatibleClient:
                 raise stream_error from error
         except urllib.error.URLError as error:
             stream_error = RuntimeError(f"LLM stream failed: {error}")
+        except AttributeError as error:
+            # Some OpenAI-compatible proxy stacks leak an internal
+            # ``NoneType.peek`` parser error instead of an URLError. Treat only
+            # that known transport symptom as recoverable; do not hide other
+            # programming errors behind a model retry.
+            if "peek" not in str(error).lower():
+                raise
+            stream_error = RuntimeError(
+                f"LLM stream transport parser failed: {error}"
+            )
         except (TimeoutError, socket.timeout) as error:
             stream_error = RuntimeError(
                 llm_timeout_message(

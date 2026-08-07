@@ -42,6 +42,14 @@ class _FakeSessionStore:
             messages=[],
             summary="",
             summary_message_count=0,
+            metadata={
+                "active_task_plan": {
+                    "steps": [
+                        {"step": "审批后继续", "status": "in_progress"},
+                        {"step": "完成验证", "status": "pending"},
+                    ]
+                }
+            },
         )
 
     def load(self, _conversation_id: str) -> SimpleNamespace:
@@ -74,8 +82,10 @@ class _FakeTurnRuntime:
 
 
 class _FakeAgent:
-    def __init__(self, **_kwargs: object) -> None:
-        return None
+    last_kwargs: dict[str, object] = {}
+
+    def __init__(self, **kwargs: object) -> None:
+        type(self).last_kwargs = kwargs
 
     def iter_approved_tool_batch_events(
         self,
@@ -177,6 +187,11 @@ class ApprovalResumeTests(unittest.TestCase):
         self.assertEqual(final["context_summary"], "summary-before-approval")
         self.assertEqual(final["context_summary_message_count"], 7)
         self.assertTrue(turn_store.cleared)
+        self.assertEqual(
+            _FakeAgent.last_kwargs["initial_task_plan"],
+            session_store.session.metadata["active_task_plan"]["steps"],
+        )
+        self.assertTrue(callable(_FakeAgent.last_kwargs["plan_update_callback"]))
 
     def test_a_later_approval_inherits_the_original_context(self) -> None:
         turn_store = _FakeTurnStore()
