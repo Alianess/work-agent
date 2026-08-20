@@ -103,6 +103,33 @@ def apply_reasoning_controls(
     return payload
 
 
+TRANSPORT_RETRIES = 3
+"""How many extra attempts a transport failure gets. Not counting the first."""
+
+TRANSPORT_RETRY_BACKOFF_SECONDS = (0.5, 1.5, 3.0)
+
+
+def is_transport_failure(error: BaseException | None) -> bool:
+    """Did the request fail before the endpoint ever answered?
+
+    A stream that broke mid-response can be recovered by asking the same
+    endpoint again. A host that could not be reached cannot: retrying the same
+    route just spends the one recovery attempt on the same DNS or TCP failure.
+    """
+
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, (socket.gaierror, ConnectionError, TimeoutError)):
+            return True
+        if isinstance(error, urllib.error.URLError) and not isinstance(
+            error, urllib.error.HTTPError
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 class OpenAICompatibleClient:
     """Minimal OpenAI-compatible chat completions client.
 
@@ -569,26 +596,63 @@ class OpenAICompatibleClient:
             if on_delta:
                 on_delta(replace(chunk, status="recovery_streaming"))
 
-        recovery_error: Exception | None = None
-        try:
-            recovered = self.chat_tools_stream(
-                recovery_messages,
-                profile=recovery_profile,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                reasoning_effort=recovery_effort,
-                on_delta=forward_recovery_delta,
-                cancel_event=cancel_event,
-                _allow_recovery=False,
-                _request_usage=request_usage,
-            )
-        except Exception as error:
-            recovery_error = error
+        # Never switch routes: a different endpoint is a different model, and
+        # substituting one silently would change the work the user asked for.
+        # A DNS or TCP blip clears in a second or two, so the same endpoint is
+        # simply asked again, with a short backoff, a bounded number of times.
+        retries = TRANSPORT_RETRIES if is_transport_failure(cause) else 0
 
-        if recovery_error is not None:
+        recovered = None
+        recovery_error: Exception | None = None
+        for attempt in range(retries + 1):
+            if attempt > 0:
+                delay = TRANSPORT_RETRY_BACKOFF_SECONDS[
+                    min(attempt - 1, len(TRANSPORT_RETRY_BACKOFF_SECONDS) - 1)
+                ]
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        break
+                else:
+                    time.sleep(delay)
+                if on_delta:
+                    on_delta(
+                        LLMStreamChunk(
+                            status="network_retry",
+                            status_detail=f"第 {attempt} / {retries} 次重试，等待 {delay:g} 秒后再试。",
+                        )
+                    )
+            try:
+                recovered = self.chat_tools_stream(
+                    recovery_messages,
+                    profile=recovery_profile,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    reasoning_effort=recovery_effort,
+                    on_delta=forward_recovery_delta,
+                    cancel_event=cancel_event,
+                    _allow_recovery=False,
+                    _request_usage=request_usage,
+                )
+            except Exception as error:
+                recovery_error = error
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                if not is_transport_failure(error):
+                    break
+                continue
+            recovery_error = None
+            break
+
+        if recovery_error is not None or recovered is None:
             prefix = "模型流式响应中断" if cause else "模型流式响应没有正文或工具调用"
+            if is_transport_failure(cause) or is_transport_failure(recovery_error):
+                host = urllib.parse.urlparse(profile.base_url).hostname or profile.base_url
+                raise RuntimeError(
+                    f"{prefix}：连不上 {host}（DNS 或网络故障），"
+                    f"已重试 {retries} 次仍未恢复。"
+                ) from (recovery_error or cause)
             raise RuntimeError(
                 f"{prefix}，当前模型流式恢复也失败：{recovery_error}"
             ) from recovery_error
