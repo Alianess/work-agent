@@ -10177,3 +10177,152 @@ td {
     display: none;
   }
 }
+
+/* 附件缩略图与大图 ------------------------------------------------------
+   附件在气泡里是内容，不是一行路径文本。图片要看得见，文件要点得开。 */
+
+.attachment-image .attachment-thumb {
+  background: transparent;
+  overflow: hidden;
+}
+
+.attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.chat-user .message-attachments {
+  justify-content: flex-end;
+}
+
+.message-attachment {
+  display: block;
+  padding: 0;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  background: var(--color-surface);
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 160ms ease-out, transform 160ms ease-out;
+}
+
+.message-attachment:hover {
+  border-color: var(--color-primary);
+  transform: translateY(-1px);
+}
+
+.message-attachment-image img {
+  display: block;
+  width: auto;
+  max-width: 220px;
+  height: 148px;
+  object-fit: cover;
+}
+
+.message-attachment-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 260px;
+  padding: 10px 12px;
+  color: var(--color-ink);
+  font-size: 13px;
+}
+
+.message-attachment-file span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-lightbox-layer {
+  position: fixed;
+  z-index: 60;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: oklch(0.205 0.018 250 / 0.72);
+  padding: 32px;
+}
+
+.image-lightbox {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: min(1200px, 100%);
+  max-height: calc(100vh - 64px);
+  margin: 0;
+}
+
+.image-lightbox img {
+  min-height: 0;
+  max-width: 100%;
+  /* 说明行要留得住位置，否则长图会把它顶出视口。 */
+  max-height: calc(100vh - 128px);
+  object-fit: contain;
+  border-radius: 12px;
+  background: var(--color-bg);
+}
+
+.image-lightbox figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--color-bg);
+  font-size: 13px;
+}
+
+.image-lightbox figcaption span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-lightbox figcaption button {
+  flex: none;
+  padding: 6px 12px;
+  border: 1px solid oklch(1 0 0 / 0.34);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.image-lightbox figcaption button:hover {
+  background: oklch(1 0 0 / 0.14);
+}
+
+.image-lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: oklch(1 0 0 / 0.16);
+  color: var(--color-bg);
+  cursor: pointer;
+}
+
+.image-lightbox-close:hover {
+  background: oklch(1 0 0 / 0.28);
+}
+
+@media (max-width: 720px) {
+  .image-lightbox-layer { padding: 12px; }
+  .message-attachment-image img { max-width: 150px; height: 108px; }
+}

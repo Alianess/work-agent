@@ -427,8 +427,23 @@ function reasoningOption(value: ReasoningEffort) {
   return REASONING_OPTIONS.find((option) => option.value === value) ?? REASONING_OPTIONS[1];
 }
 
-function formatProfileLabel(profile?: ModelProfile) {
-  if (!profile) return "选择模型";
+// 同一个模型名可以由不同厂商托管，而它们是不同的东西：限额不同、方言不同、
+// 出问题的时间也不同。所以标签的身份是「模型 + 端点」，不能只看模型名——
+// 否则设置里两个 deepseek-v4-flash 长得一模一样，切换了也不知道切到了哪个。
+const SERVING_VENDOR_BY_HOST: Record<string, string> = {
+  "token.sensenova.cn": "商汤",
+  "note3-prev-api.askdiandian.com": "小红书"
+};
+
+function servingVendor(profile: ModelProfile) {
+  try {
+    return SERVING_VENDOR_BY_HOST[new URL(profile.base_url).hostname] ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function formatModelName(profile: ModelProfile) {
   const raw = profile.model || profile.name;
   const normalized = raw.toLowerCase();
   if (normalized === "gpt-5.6-luna") return "5.6 Luna";
@@ -436,14 +451,32 @@ function formatProfileLabel(profile?: ModelProfile) {
   if (normalized === "gpt-5.6-sol") return "5.6 Sol";
   if (normalized === "deepseek-v4-pro") return "DeepSeek V4 Pro";
   if (normalized === "deepseek-v4-flash") return "DeepSeek V4 Flash";
+  if (normalized === "glm-5.2") return "GLM-5.2";
+  if (normalized === "sensenova-6.8-flash-lite") return "日日新 6.8 Flash Lite";
+  if (normalized === "dots3-note-prev") return "Dots3 Note";
   return raw;
 }
 
+function formatProfileLabel(profile?: ModelProfile) {
+  if (!profile) return "选择模型";
+  const name = formatModelName(profile);
+  const vendor = servingVendor(profile);
+  // 厂商自家的模型不用再标一次来源：「日日新（商汤）」是废话。
+  if (!vendor || name.includes(vendor) || name.startsWith("日日新")) return name;
+  return `${name}（${vendor}）`;
+}
+
 function formatProfileCompactLabel(profile?: ModelProfile) {
-  const label = formatProfileLabel(profile);
-  if (label === "DeepSeek V4 Pro") return "V4 Pro";
-  if (label === "DeepSeek V4 Flash") return "V4 Flash";
-  return label;
+  if (!profile) return formatProfileLabel(profile);
+  const name = formatModelName(profile);
+  const short =
+    name === "DeepSeek V4 Pro" ? "V4 Pro"
+    : name === "DeepSeek V4 Flash" ? "V4 Flash"
+    : name === "日日新 6.8 Flash Lite" ? "6.8 Flash Lite"
+    : name;
+  const vendor = servingVendor(profile);
+  if (!vendor || short.includes(vendor) || name.startsWith("日日新")) return short;
+  return `${short} · ${vendor}`;
 }
 
 function presetForModelProfile(profile: ModelProfile): ModelProviderPresetId {
@@ -680,6 +713,7 @@ export default function App() {
   const meetingLiveVadRequestActiveRef = useRef(false);
   const [selectedSkill, setSelectedSkill] = useState<SkillInfo | null>(null);
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
+  const [lightboxImage, setLightboxImage] = useState<{ path: string; name: string } | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
   const [composerModelMenuOpen, setComposerModelMenuOpen] = useState(false);
@@ -1121,6 +1155,15 @@ export default function App() {
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [historyMenu]);
+
+  useEffect(() => {
+    if (!lightboxImage) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLightboxImage(null);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [lightboxImage]);
 
   const skillQuery = useMemo(() => parseSkillQuery(chatInput), [chatInput]);
   const suggestedSkills = useMemo(() => {
@@ -5698,6 +5741,40 @@ export default function App() {
       {projectCreateOpen ? renderProjectCreateDialog() : null}
 
       {memoryManagerOpen ? renderMemoryManagerDialog() : null}
+      {lightboxImage ? (
+        <div
+          className="image-lightbox-layer"
+          role="presentation"
+          onMouseDown={() => setLightboxImage(null)}
+        >
+          <figure
+            className="image-lightbox"
+            role="dialog"
+            aria-modal="true"
+            aria-label={lightboxImage.name}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <img src={fileRawUrl(lightboxImage.path)} alt={lightboxImage.name} />
+            <figcaption>
+              <span title={lightboxImage.path}>{lightboxImage.name}</span>
+              <button
+                type="button"
+                onClick={() => void openFileInLibrary(lightboxImage.path)}
+              >
+                在文件库打开
+              </button>
+            </figcaption>
+          </figure>
+          <button
+            type="button"
+            className="image-lightbox-close"
+            aria-label="关闭大图"
+            onClick={() => setLightboxImage(null)}
+          >
+            <X aria-hidden="true" />
+          </button>
+        </div>
+      ) : null}
 
       {historyMenu ? renderHistoryMenu() : null}
 
@@ -6421,13 +6498,55 @@ export default function App() {
                       </form>
                     ) : content ? (
                       <>
-                        <div className="chat-bubble">
-                          {displayMessage.role === "assistant" ? (
+                        {displayMessage.role === "assistant" ? (
+                          <div className="chat-bubble">
                             <CachedMarkdownContent content={content} onOpenFile={openLinkedFile} />
-                          ) : (
-                            <p>{content}</p>
-                          )}
-                        </div>
+                          </div>
+                        ) : (
+                          (() => {
+                            const parsed = parseAttachmentBlock(content);
+                            return (
+                              <>
+                                {parsed.attachments.length > 0 ? (
+                                  <div className="message-attachments" aria-label="本条消息的附件">
+                                    {parsed.attachments.map((item) => (
+                                      <button
+                                        key={item.path}
+                                        type="button"
+                                        className={`message-attachment message-attachment-${item.kind}`}
+                                        title={item.path}
+                                        onClick={() =>
+                                          item.kind === "image"
+                                            ? setLightboxImage({ path: item.path, name: item.name })
+                                            : void openFileInLibrary(item.path)
+                                        }
+                                        aria-label={
+                                          item.kind === "image"
+                                            ? `查看大图：${item.name}`
+                                            : `打开文件：${item.name}`
+                                        }
+                                      >
+                                        {item.kind === "image" ? (
+                                          <img src={fileRawUrl(item.path)} alt={item.name} loading="lazy" />
+                                        ) : (
+                                          <span className="message-attachment-file">
+                                            {iconForAttachment(item.kind)}
+                                            <span>{item.name}</span>
+                                          </span>
+                                        )}
+                                      </button>
+                                    ))}
+                                  </div>
+                                ) : null}
+                                {parsed.body ? (
+                                  <div className="chat-bubble">
+                                    <p>{parsed.body}</p>
+                                  </div>
+                                ) : null}
+                              </>
+                            );
+                          })()
+                        )}
                         {displayMessage.role === "assistant" &&
                         index === chatMessages.length - 1 &&
                         isRetryableChatFailure(content) ? (
@@ -6496,11 +6615,23 @@ export default function App() {
                       <button
                         type="button"
                         className="attachment-main"
-                        onClick={() => copyPath(attachment.path)}
-                        aria-label={`复制附件路径：${attachment.name}`}
+                        onClick={() =>
+                          attachment.kind === "image"
+                            ? setLightboxImage({ path: attachment.path, name: attachment.name })
+                            : void openFileInLibrary(attachment.path)
+                        }
+                        aria-label={
+                          attachment.kind === "image"
+                            ? `查看大图：${attachment.name}`
+                            : `打开文件：${attachment.name}`
+                        }
                       >
                         <span className="attachment-thumb" aria-hidden="true">
-                          {iconForAttachment(attachment.kind)}
+                          {attachment.kind === "image" ? (
+                            <img src={fileRawUrl(attachment.path)} alt="" loading="lazy" />
+                          ) : (
+                            iconForAttachment(attachment.kind)
+                          )}
                         </span>
                         <span className="attachment-copy">
                           <strong>{attachment.name}</strong>
@@ -12590,6 +12721,51 @@ function labelForAttachment(kind: AttachmentItem["kind"]) {
   if (kind === "image") return "图片";
   if (kind === "document") return "文档";
   return "文件";
+}
+
+const ATTACHMENT_KIND_BY_LABEL: Record<string, AttachmentItem["kind"]> = {
+  音频: "audio",
+  图片: "image",
+  文档: "document",
+  文件: "file"
+};
+
+function fileRawUrl(path: string) {
+  return `/api/file/raw?path=${encodeURIComponent(path)}`;
+}
+
+export type ParsedAttachmentReference = {
+  kind: AttachmentItem["kind"];
+  name: string;
+  path: string;
+};
+
+/** 把消息末尾那段「参考附件：」还原成结构化附件。
+ *
+ * 发送时附件被拼成了散文，气泡就把整段原文照抄出来——用户看到的是一行
+ * 「- [图片] 截屏....png: meet_files/attachments/...」，而不是那张图。
+ * 拼接格式是我们自己定的（formatMessageWithAttachments），所以这里解析回去
+ * 是确定的，不是猜。
+ */
+function parseAttachmentBlock(content: string): {
+  body: string;
+  attachments: ParsedAttachmentReference[];
+} {
+  const marker = content.lastIndexOf("参考附件：");
+  if (marker < 0) return { body: content, attachments: [] };
+  const attachments: ParsedAttachmentReference[] = [];
+  const lines = content.slice(marker + "参考附件：".length).split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const match = /^-\s*\[([^\]]+)\]\s*(.+?):\s*(\S.*)$/.exec(trimmed);
+    if (!match) return { body: content, attachments: [] };
+    const kind = ATTACHMENT_KIND_BY_LABEL[match[1]];
+    if (!kind) return { body: content, attachments: [] };
+    attachments.push({ kind, name: match[2].trim(), path: match[3].trim() });
+  }
+  if (attachments.length === 0) return { body: content, attachments: [] };
+  return { body: content.slice(0, marker).trim(), attachments };
 }
 
 function iconForAttachment(kind: AttachmentItem["kind"]) {
