@@ -19,19 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     path = Path(args.path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(path)
-    extension = path.suffix.lower()
-    if extension == ".docx":
-        result = extract_docx(path)
-    elif extension in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-        result = extract_xlsx(path)
-    elif extension in {".csv", ".tsv"}:
-        result = extract_delimited(path)
-    elif extension == ".pptx":
-        result = extract_pptx(path)
-    elif extension == ".pdf":
-        result = extract_pdf(path)
-    else:
-        raise ValueError(f"Unsupported office file type: {extension or 'no extension'}")
+    result = extract_document(path)
 
     markdown = build_markdown(path, result, args.operation)
     if len(markdown) > args.max_chars:
@@ -53,6 +41,27 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     return 0
+
+
+def extract_document(path: Path) -> dict[str, Any]:
+    """Route one office or PDF file to its extractor.
+
+    Lives outside main() because indexing needs the same routing the CLI does,
+    and a second copy of it would drift the moment one of them gained a format.
+    """
+
+    extension = path.suffix.lower()
+    if extension == ".docx":
+        return extract_docx(path)
+    if extension in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        return extract_xlsx(path)
+    if extension in {".csv", ".tsv"}:
+        return extract_delimited(path)
+    if extension == ".pptx":
+        return extract_pptx(path)
+    if extension == ".pdf":
+        return extract_pdf(path)
+    raise ValueError(f"Unsupported office file type: {extension or 'no extension'}")
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:

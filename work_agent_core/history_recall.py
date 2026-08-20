@@ -14,6 +14,12 @@ import numpy as np
 
 from .cross_chat_memory import CrossChatMemoryStore
 from .retrieval_core import (
+    CJK_PATTERN,
+    CJK_STOP_TERMS,
+    TOKEN_PATTERN,
+    cjk_ngrams,
+    extract_query_terms,
+    index_terms,
     MlxRetrievalBackend,
     RetrievalBackend,
     RetrievalBackendError,
@@ -49,16 +55,6 @@ LEXICAL_CANDIDATE_LIMIT = 60
 DENSE_CANDIDATE_LIMIT = 60
 RRF_CANDIDATE_LIMIT = 40
 RRF_K = 60
-
-TOKEN_PATTERN = re.compile(
-    r"[A-Za-z][A-Za-z0-9_.+-]*|[0-9]+(?:\.[0-9]+)*|[\u3400-\u4dbf\u4e00-\u9fff]+"
-)
-CJK_PATTERN = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff]+$")
-CJK_STOP_TERMS = {
-    "之前", "我们", "你们", "他们", "这个", "那个", "一下", "什么", "怎么",
-    "聊天", "历史", "提到", "说过", "讨论", "回想", "记得", "内容", "相关", "当时",
-}
-
 
 @dataclass(frozen=True)
 class HistoryChunk:
@@ -929,46 +925,6 @@ def normalize_keywords(value: Any) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result[:12]
-
-
-def index_terms(text: str) -> list[str]:
-    terms: list[str] = []
-    for raw in TOKEN_PATTERN.findall(str(text or "")):
-        token = raw.lower()
-        if CJK_PATTERN.fullmatch(token):
-            terms.extend(cjk_ngrams(token, include_unigrams=True))
-        elif len(token) >= 2 or token.isdigit():
-            terms.append(token)
-    return dedupe(terms)
-
-
-def extract_query_terms(text: str) -> list[str]:
-    terms: list[str] = []
-    cleaned = str(text or "")
-    for stop_term in sorted(CJK_STOP_TERMS, key=len, reverse=True):
-        cleaned = cleaned.replace(stop_term, " ")
-    for raw in TOKEN_PATTERN.findall(cleaned):
-        token = raw.lower()
-        if CJK_PATTERN.fullmatch(token):
-            grams = cjk_ngrams(token, include_unigrams=len(token) == 1)
-            terms.extend(term for term in grams if term not in CJK_STOP_TERMS)
-        elif len(token) >= 2 or token.isdigit():
-            terms.append(token)
-    unique = dedupe(terms)
-    if len(unique) <= MAX_QUERY_TERMS:
-        return unique
-    ranked = sorted(enumerate(unique), key=lambda item: (-len(item[1]), item[0]))[:MAX_QUERY_TERMS]
-    keep = {index for index, _ in ranked}
-    return [term for index, term in enumerate(unique) if index in keep]
-
-
-def cjk_ngrams(value: str, *, include_unigrams: bool) -> list[str]:
-    if len(value) == 1:
-        return [value]
-    terms = [value[index : index + 2] for index in range(len(value) - 1)]
-    if include_unigrams:
-        terms.extend(value)
-    return terms
 
 
 def dedupe(items: Iterable[str]) -> list[str]:
