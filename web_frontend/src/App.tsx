@@ -665,7 +665,11 @@ export default function App() {
   const [meetingLiveTitle, setMeetingLiveTitle] = useState("实时会议转写");
   const [meetingCaptureMode, setMeetingCaptureMode] = useState<MeetingCaptureMode>("system-audio");
   const [simpleRecordingStatus, setSimpleRecordingStatus] = useState<"idle" | "recording" | "saving" | "error">("idle");
-  const [simpleRecordingPath, setSimpleRecordingPath] = useState("");
+  // 录音本来就是通过 uploadAttachment 上传的，拿到的就是一个完整附件。
+  // 原来只留了 path 字符串，于是面板只能把一行路径贴出来——而它和拖进来的
+  // 文件是同一种东西，就该长成同一个样子。
+  const [simpleRecordingAttachment, setSimpleRecordingAttachment] =
+    useState<AttachmentItem | null>(null);
   const [simpleRecordingElapsedMs, setSimpleRecordingElapsedMs] = useState(0);
   const simpleRecordingStartedAtRef = useRef(0);
   const simpleRecordingTimerRef = useRef<number | null>(null);
@@ -2556,7 +2560,7 @@ export default function App() {
       simpleRecorderRef.current = recorder;
       simpleRecordingStartedAtRef.current = Date.now();
       setSimpleRecordingElapsedMs(0);
-      setSimpleRecordingPath("");
+      setSimpleRecordingAttachment(null);
       setSimpleRecordingStatus("recording");
       setStatus({
         tone: "loading",
@@ -2610,9 +2614,11 @@ export default function App() {
               { type: mimeType }
             );
             const payload = await api.uploadAttachment(file);
-            setSimpleRecordingPath(payload.attachment.path);
+            setSimpleRecordingAttachment(payload.attachment);
+            // 录完就挂进本轮附件，省掉"复制路径再粘回输入框"这一步。
+            setAttachments((items) => mergeAttachmentsByPath(items, [payload.attachment]));
             setSimpleRecordingStatus("idle");
-            setStatus({ tone: "success", text: "录音已保存，可在文件库或会议处理中继续使用。" });
+            setStatus({ tone: "success", text: "录音已保存，已添加为本轮附件。" });
           } catch (error) {
             setSimpleRecordingStatus("error");
             setStatus({ tone: "error", text: `录音保存失败：${explainError(error)}` });
@@ -8711,7 +8717,7 @@ export default function App() {
                 <span>默认录制系统声音和麦克风，也可以只录麦克风。</span>
               </div>
               <Badge tone={simpleRecordingStatus === "recording" ? "success" : simpleRecordingStatus === "saving" ? "warning" : "neutral"}>
-                {simpleRecordingStatus === "recording" ? "正在录音" : simpleRecordingStatus === "saving" ? "正在保存" : simpleRecordingPath ? "已保存" : "未开始"}
+                {simpleRecordingStatus === "recording" ? "正在录音" : simpleRecordingStatus === "saving" ? "正在保存" : simpleRecordingAttachment ? "已保存" : "未开始"}
               </Badge>
             </div>
             <div className="simple-recording-modes" role="radiogroup" aria-label="录音来源">
@@ -8763,9 +8769,19 @@ export default function App() {
               {simpleRecordingStatus === "recording" ? (
                 <span className="simple-recording-elapsed">{formatActivityDuration(simpleRecordingElapsedMs)}</span>
               ) : null}
-              {simpleRecordingPath ? (
-                <button type="button" className="path-button" onClick={() => openLinkedFile(simpleRecordingPath)}>
-                  {simpleRecordingPath}
+              {simpleRecordingAttachment ? (
+                <button
+                  type="button"
+                  className="message-attachment message-attachment-audio"
+                  title={simpleRecordingAttachment.path}
+                  onClick={() => void openFileInLibrary(simpleRecordingAttachment.path)}
+                  aria-label={`打开录音：${simpleRecordingAttachment.name}`}
+                >
+                  <span className="message-attachment-file">
+                    {iconForAttachment("audio")}
+                    <span>{simpleRecordingAttachment.name}</span>
+                    <small>{formatBytes(simpleRecordingAttachment.size)}</small>
+                  </span>
                 </button>
               ) : null}
             </div>

@@ -175,6 +175,9 @@ TEMP_SYNC_FILE_TTL_SECONDS = 60 * 60
 TEMP_SYNC_MAX_FILE_BYTES = 250 * 1024 * 1024
 TEMP_SYNC_MAX_TEXT_CHARS = 200_000
 UPLOAD_MAX_FILE_BYTES = 250 * 1024 * 1024
+DRAIN_CHUNK_BYTES = 1024 * 1024
+DRAIN_REQUEST_BODY_MAX_BYTES = 64 * 1024 * 1024
+"""空读请求体的上限。超过它，空读的代价比直接关连接更不划算。"""
 TEMP_SYNC_FILE_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 REALTIME_TRANSCRIPT_SESSION_ID_PATTERN = re.compile(r"^rt-[a-z0-9][a-z0-9-]{7,79}$")
 EXECUTION_ID_PATTERN = re.compile(r"^exe_[a-f0-9]{32}$")
@@ -1566,6 +1569,7 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             # behind public reverse proxies and tunnels.
             if parsed.path == "/api/attachments/upload":
                 if not self._require_auth():
+                    self._drain_request_body()
                     return
                 self._send_json(
                     add_attachment_bytes_payload(
@@ -1580,6 +1584,7 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             )
             if project_upload_match:
                 if not self._require_auth():
+                    self._drain_request_body()
                     return
                 self._send_json(
                     add_project_file_bytes_payload(
@@ -1898,15 +1903,41 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
             raise ValueError("Request JSON body must be an object.")
         return data
 
+    def _drain_request_body(self) -> None:
+        """拒绝一个上传之前，先把请求体读掉。
+
+        不读就回包，等于在浏览器还在上传时掐断连接，浏览器只会报一个
+        "Failed to fetch"——和"后端没启动"长得一模一样，于是真正的原因
+        （太大、没登录）永远到不了用户眼前。
+        体量大到不值得空读时，改成明确标记连接关闭。
+        """
+
+        try:
+            remaining = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            return
+        if remaining <= 0:
+            return
+        if remaining > DRAIN_REQUEST_BODY_MAX_BYTES:
+            self.close_connection = True
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(DRAIN_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _read_binary_body(self) -> bytes:
         raw_length = self.headers.get("Content-Length")
         try:
             length = int(raw_length or "0")
         except ValueError as error:
+            self._drain_request_body()
             raise ValueError("上传请求的文件大小无效。") from error
         if length <= 0:
             raise ValueError("上传请求为空。")
         if length > UPLOAD_MAX_FILE_BYTES:
+            self._drain_request_body()
             raise ValueError(
                 f"单个文件不能超过 {UPLOAD_MAX_FILE_BYTES // (1024 * 1024)} MB。"
             )

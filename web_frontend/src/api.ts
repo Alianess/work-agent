@@ -82,7 +82,29 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   return data;
 }
 
+/** 上传前先确认这个 File 真的读得出来。
+ *
+ * 从微信这类沙盒应用拖进来的文件，浏览器拿到的可能是一个指向它读不到（或已被
+ * 清理）的路径的 File。这时 fetch(body: file) 只会抛一个 "Failed to fetch"，
+ * 和"后端没启动"长得一模一样——于是用户被指去查一个根本没问题的服务。
+ * 读一个字节就能把这两件事分开，代价可以忽略。
+ */
+async function assertFileIsReadable(file: File) {
+  if (file.size === 0) {
+    throw new Error(`「${file.name}」是空文件，或者拖拽来源没有提供文件内容。`);
+  }
+  try {
+    await file.slice(0, 1).arrayBuffer();
+  } catch {
+    throw new Error(
+      `无法读取「${file.name}」。从微信、企业微信这类应用里直接拖拽时，` +
+        `浏览器拿不到文件内容；请先"另存为"到桌面或下载文件夹，再拖进来。`
+    );
+  }
+}
+
 async function uploadFile<T>(path: string, file: File): Promise<T> {
+  await assertFileIsReadable(file);
   const query = new URLSearchParams({
     name: file.name,
     mime_type: file.type || "application/octet-stream",
