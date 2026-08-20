@@ -647,6 +647,10 @@ export default function App() {
   const chatMessagesRef = useRef<ChatMessage[]>(chatMessages);
   const titleGenerationInFlightRef = useRef<Set<string>>(new Set());
   const conversationArchiveReadyRef = useRef(false);
+  // 只有成功从服务端读到过存档，才允许往回写。读取失败（服务重启、掉登录）
+  // 时本地只有一条默认 Friday 问候，若此时放行保存，会把服务端完整存档冲掉
+  // ——2026-08-20 Friday 会话就是这样被清空的。
+  const conversationArchiveLoadedRef = useRef(false);
   const conversationArchiveRevisionRef = useRef(0);
   const conversationArchiveShadowRef = useRef<ConversationHistoryItem[]>([]);
   const conversationArchivePendingRef = useRef<ConversationHistoryItem[] | null>(null);
@@ -808,6 +812,7 @@ export default function App() {
       conversationArchiveSaveTimerRef.current = null;
     }
     conversationArchiveReadyRef.current = false;
+    conversationArchiveLoadedRef.current = false;
     conversationArchiveRevisionRef.current = 0;
     conversationArchiveShadowRef.current = [];
     conversationArchivePendingRef.current = null;
@@ -1036,7 +1041,7 @@ export default function App() {
       },
       activityRunningRef.current ? 1200 : 0
     );
-    if (conversationArchiveReadyRef.current && !activityRunningRef.current) {
+    if (conversationArchiveLoadedRef.current && !activityRunningRef.current) {
       queueConversationArchiveSave(conversationHistory);
     }
     return () => {
@@ -3609,7 +3614,7 @@ export default function App() {
   }
 
   function queueConversationArchiveSave(items: ConversationHistoryItem[], delayMs = 350) {
-    if (!conversationArchiveReadyRef.current || !currentUser) return;
+    if (!conversationArchiveLoadedRef.current || !currentUser) return;
     // Keep this enqueue path cheap. Sanitizing and diffing a very long chat is
     // deferred to the scheduled flush so a streamed activity event can paint.
     conversationArchivePendingRef.current = items;
@@ -3624,7 +3629,7 @@ export default function App() {
   }
 
   async function flushConversationArchiveSave() {
-    if (conversationArchiveSavingRef.current || !conversationArchiveReadyRef.current) return;
+    if (conversationArchiveSavingRef.current || !conversationArchiveLoadedRef.current) return;
     const requestedSnapshot = conversationArchivePendingRef.current;
     conversationArchivePendingRef.current = null;
     if (!requestedSnapshot) return;
@@ -3683,7 +3688,7 @@ export default function App() {
       const pending = conversationArchivePendingRef.current;
       if (
         pending &&
-        conversationArchiveReadyRef.current &&
+        conversationArchiveLoadedRef.current &&
         (retryAfterConflict || pending !== requestedSnapshot)
       ) {
         queueConversationArchiveSave(pending, 0);
@@ -3727,6 +3732,7 @@ export default function App() {
     } finally {
       conversationArchiveReadyRef.current = true;
       if (loaded) {
+        conversationArchiveLoadedRef.current = true;
         queueConversationArchiveSave(conversationHistoryRef.current);
       }
     }
