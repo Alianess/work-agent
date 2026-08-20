@@ -1,0 +1,158 @@
+"""Built-in observers: the things the assistant should notice on its own.
+
+Each of these corresponds to something that actually went unnoticed while the
+user worked. They read workspace state only — no model call — so the attention
+pass stays cheap enough to run continuously.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path, PurePosixPath
+from typing import Iterable
+import re
+
+from .attention import FunctionObserver, Observation, ObserverContext, ObserverRegistry
+
+
+MATERIALS_DIRNAME = "材料"
+ARCHIVE_DIRNAME = "会议项目"
+ATTACHMENTS_DIRNAME = "attachments"
+TRANSCRIBABLE_SUFFIXES = {".m4a", ".mp3", ".wav", ".mp4", ".mov"}
+DOCUMENT_SUFFIXES = {".md", ".docx", ".pdf"}
+
+
+def observe_material_versions(context: ObserverContext) -> Iterable[Observation]:
+    """Notice work the assistant itself split across several parallel files.
+
+    Read from the ledger, not the folder: the assistant made every one of these
+    writes, so it should recall doing so rather than infer it from what is left
+    on disk. Counting files also cannot tell a revision apart from an unrelated
+    document that happens to sit in the same place.
+    """
+
+    ledger = context.ledger
+    if ledger is None:
+        return []
+    observations: list[Observation] = []
+    for artifact in ledger.sorted_artifacts():
+        names = artifact.distinct_paths
+        if len(names) < 3:
+            continue
+        latest = artifact.latest
+        observations.append(
+            Observation(
+                key=f"versions:{artifact.key}:{len(names)}",
+                summary=(
+                    f"《{artifact.title}》我先后写成了 {len(names)} 个文件、"
+                    f"改过 {len(artifact.revisions)} 次，没有哪一个被标记为当前稿。"
+                ),
+                detail=(
+                    "文件："
+                    + "、".join(PurePosixPath(name).name for name in names[:6])
+                    + (f"\n最近一次是我在 {latest.when:%m-%d %H:%M} 写的。" if latest else "")
+                    + "\n要的话我把它们并成一份带版本记录的材料，只留一个当前稿。"
+                ),
+                salience=0.55 + min(0.3, 0.05 * (len(names) - 3)),
+                source="material-versions",
+                data={"artifact": artifact.key, "files": names},
+            )
+        )
+    return observations
+
+
+def observe_unprocessed_recordings(context: ObserverContext) -> Iterable[Observation]:
+    """Notice a recording that came in but never became a set of minutes."""
+    attachments = context.data_root / "meet_files" / ATTACHMENTS_DIRNAME
+    archives = context.data_root / "meet_files" / ARCHIVE_DIRNAME
+    if not attachments.is_dir():
+        return []
+    archived_names = " ".join(path.name for path in archives.glob("*")) if archives.is_dir() else ""
+    observations: list[Observation] = []
+    cutoff = context.now - timedelta(days=7)
+    for path in sorted(attachments.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in TRANSCRIBABLE_SUFFIXES:
+            continue
+        modified = datetime.fromtimestamp(path.stat().st_mtime).astimezone(context.now.tzinfo)
+        if modified < cutoff:
+            continue
+        # A recording is handled once an archive folder references its name.
+        stem = re.sub(r"^\d{8}-\d{6}-", "", path.stem)
+        if stem and stem in archived_names:
+            continue
+        observations.append(
+            Observation(
+                key=f"recording:{path.name}",
+                summary=f"录音《{path.name}》还没有整理成纪要。",
+                detail="需要的话我现在就可以转写并生成纪要。",
+                salience=0.7,
+                quiet_hours=24.0,
+                source="unprocessed-recording",
+                data={"path": str(path)},
+            )
+        )
+    return observations
+
+
+def observe_inconsistent_entity_spellings(
+    context: ObserverContext,
+    *,
+    alias_groups: dict[str, list[str]] | None = None,
+) -> Iterable[Observation]:
+    """Notice one name written several ways across the archive.
+
+    ASR turns a company name into two or three homophones, they get written into
+    minutes, and every later material inherits the error. Nobody checks because
+    each document looks internally consistent.
+    """
+
+    groups = alias_groups or {}
+    if not groups:
+        return []
+    archive = context.data_root / "meet_files"
+    if not archive.is_dir():
+        return []
+    corpus: list[str] = []
+    for path in archive.rglob("*.md"):
+        if any(part in {"execution", "debug_traces", "asr_full"} for part in path.parts):
+            continue
+        try:
+            corpus.append(path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+        if len(corpus) > 400:
+            break
+    text = "\n".join(corpus)
+    observations: list[Observation] = []
+    for canonical, variants in groups.items():
+        seen = [variant for variant in variants if variant in text]
+        if not seen:
+            continue
+        observations.append(
+            Observation(
+                key=f"spelling:{canonical}:{','.join(sorted(seen))}",
+                summary=f"归档里“{canonical}”还有 {'、'.join(seen)} 这些写法，应该是同一个对象。",
+                detail="我可以把它登记成别名，以后转写和材料生成会自动纠正。",
+                salience=0.6,
+                quiet_hours=72.0,
+                source="entity-spelling",
+                data={"canonical": canonical, "variants": seen},
+            )
+        )
+    return observations
+
+
+def build_default_registry(*, alias_groups: dict[str, list[str]] | None = None) -> ObserverRegistry:
+    return ObserverRegistry(
+        [
+            FunctionObserver("material-versions", observe_material_versions),
+            FunctionObserver("unprocessed-recording", observe_unprocessed_recordings),
+            FunctionObserver(
+                "entity-spelling",
+                lambda context: observe_inconsistent_entity_spellings(
+                    context, alias_groups=alias_groups
+                ),
+            ),
+        ]
+    )
