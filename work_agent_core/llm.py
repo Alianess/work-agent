@@ -58,9 +58,23 @@ def reduced_recovery_reasoning_effort(value: str | None) -> str:
     return "light"
 
 
+def endpoint_host(profile: ModelProfile) -> str:
+    return (urllib.parse.urlparse(chat_completions_endpoint(profile.base_url)).hostname or "").lower()
+
+
+DEEPSEEK_OFFICIAL_HOSTS = frozenset({"api.deepseek.com", "api.deepseek.cn"})
+
+
 def is_deepseek_profile(profile: ModelProfile) -> bool:
-    identity = " ".join([profile.name, profile.provider, profile.base_url, profile.model]).lower()
-    return "deepseek" in identity
+    """参数方言属于**端点**，不属于模型名。
+
+    DeepSeek 官方要 thinking:{type:enabled} 加 reasoning_effort:max；同一个
+    deepseek-v4-flash 挂在商汤的 token.sensenova.cn 上，要的却是普通的
+    reasoning_effort:low/medium/high/none。按模型名认，就会把官方的方言发给
+    转售方，参数直接被拒。
+    """
+
+    return endpoint_host(profile) in DEEPSEEK_OFFICIAL_HOSTS
 
 
 def should_prefer_direct_connection(profile: ModelProfile) -> bool:
@@ -70,8 +84,7 @@ def should_prefer_direct_connection(profile: ModelProfile) -> bool:
     HTTPS_PROXY.  Model selection is a user decision and is not a substitute
     for a stable route to this endpoint.
     """
-    host = (urllib.parse.urlparse(chat_completions_endpoint(profile.base_url)).hostname or "").lower()
-    return is_deepseek_profile(profile) and host in {"api.deepseek.com", "api.deepseek.cn"}
+    return is_deepseek_profile(profile)
 
 
 def is_dots_profile(profile: ModelProfile) -> bool:
@@ -79,11 +92,19 @@ def is_dots_profile(profile: ModelProfile) -> bool:
     return "dots" in identity or "askdiandian" in profile.base_url.lower()
 
 
+SENSENOVA_HOSTS = frozenset({"token.sensenova.cn"})
+
+
+def is_sensenova_profile(profile: ModelProfile) -> bool:
+    return endpoint_host(profile) in SENSENOVA_HOSTS
+
+
 def supports_reasoning_effort(profile: ModelProfile) -> bool:
     identity = " ".join([profile.name, profile.provider, profile.model]).lower()
     return (
         is_deepseek_profile(profile)
         or is_dots_profile(profile)
+        or is_sensenova_profile(profile)
         or any(marker in identity for marker in ("gpt-5", "o3", "o4"))
     )
 
@@ -105,6 +126,15 @@ def apply_reasoning_controls(
         payload.pop("temperature", None)  # DeepSeek ignores sampling controls in thinking mode.
         payload["thinking"] = {"type": "enabled"}
         payload["reasoning_effort"] = "max" if effort == "very_high" else "high"
+        return payload
+    if is_sensenova_profile(profile):
+        # 商汤走朴素的 reasoning_effort，四档直接对上，关闭思考用 none。
+        payload["reasoning_effort"] = {
+            "light": "none",
+            "medium": "medium",
+            "high": "high",
+            "very_high": "high",
+        }[effort]
         return payload
     if is_dots_profile(profile):
         # Dots 只有开/关两档（该模型固定 max 思考档），没有 reasoning_effort。
@@ -667,15 +697,22 @@ class OpenAICompatibleClient:
         # substituting one silently would change the work the user asked for.
         # A DNS or TCP blip clears in a second or two, so the same endpoint is
         # simply asked again, with a short backoff, a bounded number of times.
-        retries = TRANSPORT_RETRIES if is_transport_failure(cause) else 0
+        # 重试预算属于**这个恢复请求**，不属于主流为什么结束。原来写的是
+        # `TRANSPORT_RETRIES if is_transport_failure(cause) else 0`——主流"返回了
+        # 但没正文"时 cause 为空，恢复请求就只剩一发子弹，正好撞上 429 就是一轮
+        # 彻底失败。而 429 恰恰是最该退避重试的那类。
+        retries = TRANSPORT_RETRIES
 
         recovered = None
         recovery_error: Exception | None = None
         for attempt in range(retries + 1):
             if attempt > 0:
+                # 退避档位看**上一次恢复请求**的错，不看主流的：限流要等几十秒，
+                # DNS 抖动等一秒就够，拿错了对象就等错了时间。
+                last_status = retryable_status(recovery_error) or retryable_status(cause)
                 schedule = (
                     RATE_LIMIT_BACKOFF_SECONDS
-                    if retryable_status(cause) in {429, 503}
+                    if last_status in {429, 503}
                     else TRANSPORT_RETRY_BACKOFF_SECONDS
                 )
                 delay = schedule[min(attempt - 1, len(schedule) - 1)]
@@ -723,6 +760,18 @@ class OpenAICompatibleClient:
                     f"{prefix}：连不上 {host}（DNS 或网络故障），"
                     f"已重试 {retries} 次仍未恢复。"
                 ) from (recovery_error or cause)
+            status = retryable_status(recovery_error) or retryable_status(cause)
+            if status in {429, 503}:
+                # 限流和额度用尽都走 429，但对用户是两件事：一个等一会儿就好，
+                # 一个要去后台加额度。报文里已经写明了是哪一种，把那句话拎出来，
+                # 而不是把整段 JSON 糊上去。
+                detail = str(recovery_error or cause)
+                quota = "insufficient_quota" in detail or "quota exceeded" in detail
+                raise RuntimeError(
+                    f"{prefix}，{'该模型额度已用尽' if quota else '该模型正在限流'}"
+                    f"（HTTP {status}），已退避重试 {retries} 次仍未通过。"
+                    + ("请到服务商后台提额，或在设置里换一个模型。" if quota else "请稍后重试，或换一个模型。")
+                ) from recovery_error
             raise RuntimeError(
                 f"{prefix}，当前模型流式恢复也失败：{recovery_error}"
             ) from recovery_error

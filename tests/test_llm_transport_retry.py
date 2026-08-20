@@ -7,10 +7,15 @@
 from __future__ import annotations
 
 import socket
+import time
 import unittest
 import urllib.error
+from unittest import mock
 
+import work_agent_core.llm as llm_module
 from work_agent_core.llm import (
+    ModelProfile,
+    OpenAICompatibleClient,
     RATE_LIMIT_BACKOFF_SECONDS,
     TRANSPORT_RETRIES,
     TRANSPORT_RETRY_BACKOFF_SECONDS,
@@ -71,6 +76,98 @@ class TransportFailureClassificationTests(unittest.TestCase):
     def test_retry_budget_is_bounded(self) -> None:
         # An unreachable host must not be retried forever.
         self.assertEqual(TRANSPORT_RETRIES, 3)
+
+
+class RecoveryRetryBudgetTests(unittest.TestCase):
+    """恢复请求的重试预算，属于恢复请求自己。
+
+    实测踩过的洞：主流"返回了但没正文或工具调用"时 cause 为空，于是恢复请求
+    只被允许发一次；正好撞上 429，一轮就彻底判死，而 429 是最该退避重试的那类。
+    """
+
+    def _profile(self) -> ModelProfile:
+        return ModelProfile(
+            name="recovery-budget-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+            timeout_seconds=10,
+        )
+
+    def _run_recovery(self, errors: list[Exception]) -> tuple[int, Exception | None]:
+        client = OpenAICompatibleClient()
+        attempts = {"n": 0}
+
+        def fake_stream(*_args: object, **_kwargs: object) -> None:
+            index = attempts["n"]
+            attempts["n"] += 1
+            raise errors[min(index, len(errors) - 1)]
+
+        client.chat_tools_stream = fake_stream  # type: ignore[method-assign]
+        failure: Exception | None = None
+        with mock.patch.object(llm_module.time, "sleep"):
+            try:
+                client._recover_tools_response(
+                    [{"role": "user", "content": "hi"}],
+                    profile=self._profile(),
+                    temperature=None,
+                    max_tokens=None,
+                    tools=None,
+                    tool_choice=None,
+                    reasoning_effort=None,
+                    started_at=time.monotonic(),
+                    reason="empty",
+                    cause=None,
+                    on_delta=None,
+                    cancel_event=None,
+                )
+            except Exception as error:  # noqa: BLE001 - 这里就是要看它抛什么
+                failure = error
+        return attempts["n"], failure
+
+    def test_an_empty_primary_still_buys_the_recovery_a_full_retry_budget(self) -> None:
+        rate_limited = urllib.error.HTTPError("u", 429, "Too Many Requests", None, None)
+        attempts, failure = self._run_recovery([rate_limited])
+
+        self.assertEqual(attempts, TRANSPORT_RETRIES + 1)
+        self.assertIsNotNone(failure)
+
+    def test_a_refusal_during_recovery_is_not_retried(self) -> None:
+        # 401 再试一百次也一样，退避只会把失败拖慢。
+        attempts, failure = self._run_recovery(
+            [urllib.error.HTTPError("u", 401, "Unauthorized", None, None)]
+        )
+
+        self.assertEqual(attempts, 1)
+        self.assertIsNotNone(failure)
+
+    def test_quota_exhaustion_is_reported_as_quota_not_as_raw_json(self) -> None:
+        """限流和额度用尽都走 429，但对用户是两件事。
+
+        一个等一会儿就好，一个要去后台提额——把整段 JSON 糊上去，用户两件事
+        都分不出来。
+        """
+
+        exhausted = RuntimeError(
+            'LLM stream failed with HTTP 429: {"error":{"code":"insufficient_quota",'
+            '"message":"Workspace allocated quota exceeded"}}'
+        )
+        _attempts, failure = self._run_recovery([exhausted])
+
+        self.assertIsNotNone(failure)
+        message = str(failure)
+        self.assertIn("额度已用尽", message)
+        self.assertNotIn("insufficient_quota", message)
+
+    def test_plain_rate_limiting_tells_the_user_to_wait_not_to_top_up(self) -> None:
+        _attempts, failure = self._run_recovery(
+            [RuntimeError("LLM stream failed with HTTP 429: rate limit reached")]
+        )
+
+        self.assertIsNotNone(failure)
+        self.assertIn("正在限流", str(failure))
+        self.assertNotIn("提额", str(failure))
 
 
 if __name__ == "__main__":
