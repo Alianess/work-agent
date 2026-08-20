@@ -597,6 +597,15 @@ def run_recall_maintenance(user: AuthUser) -> None:
     outcome = backfill_vectors_once(user_data_dir(user))
     if outcome.get("error"):
         print(f"[recall] user={user.id}: 向量补算未完成：{outcome['error']}")
+    # 顺手回收没人再引用的执行快照。它没有回收路径时会一直堆——实测 42 个攒到
+    # 4.4G，占了检索索引 82% 的节点。
+    try:
+        workspace = WorkspaceManager(WORKSPACE_ROOT / "meet_files" / "execution")
+        removed = workspace.prune_snapshots(keep_ids=workspace.referenced_snapshot_ids())
+        if removed:
+            print(f"[recall] 回收执行快照 {removed} 个")
+    except Exception as error:
+        print(f"[recall] 快照回收跳过：{type(error).__name__}: {error}")
 
 
 ATTENTION_INTERVAL_SECONDS = 15 * 60

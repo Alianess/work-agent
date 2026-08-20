@@ -25,3 +25,23 @@ DeepFilterNet 因 Python 版本冲突不进主运行环境，音频降噪默认�
 ```
 .venv/bin/python -m unittest discover -s tests -q
 ```
+
+## 工作区文件的去处
+
+判据是**生命周期**，不是内容类型：这份东西能不能重建。
+
+| 放哪 | 什么 | 能否删 |
+|---|---|---|
+| `meet_files/attachments/` `voice_inputs/` | 用户给的原件 | 不能，只进不出 |
+| `meet_files/材料/` `文字稿/` `会议项目/` | 交付物与转写稿 | 不能 |
+| `meet_files/asr_full/` | 会议转写正本 | 不能 |
+| `meet_files/execution/` `office_workspace/` `debug_traces/` | 机器产物：沙箱快照、解包目录、调试轨迹 | **能，随时** |
+| `_` 开头的目录 | 隔离区、临时解包 | **能，且不进检索索引** |
+
+两条规矩：
+
+- **不要往 `meet_files/` 根目录直接写文件。** 转写稿进 `文字稿/`，成品进 `材料/`。
+  曾经根目录散着 141 个文件，找不着也备份不动。
+- **机器产物不进检索索引。** 沙箱快照曾占索引 82% 的节点——每次 `shell_exec`
+  复制一份工作区，同一段内容出现 882 次。排除规则见
+  `work_agent_core/recall/sync.py` 的 `DEFAULT_SKIP_DIRECTORIES`。

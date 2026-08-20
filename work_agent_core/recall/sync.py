@@ -210,7 +210,13 @@ class RecallSync:
                 break
             if not path.is_file() or path.suffix.lower() not in INDEXABLE_SUFFIXES:
                 continue
-            if any(part in skip or part.startswith(".") for part in path.relative_to(base).parts[:-1]):
+            parts = path.relative_to(base).parts[:-1]
+            # 下划线开头的目录按约定是"不是内容"：隔离区、解包临时目录、旧散件。
+            # 和点号开头同一个道理，只是这个约定是我们自己的。
+            if any(
+                part in skip or part.startswith(".") or part.startswith("_")
+                for part in parts
+            ):
                 continue
             seen += 1
             try:

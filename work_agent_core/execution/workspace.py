@@ -131,6 +131,50 @@ class WorkspaceManager:
             shutil.rmtree(root, ignore_errors=True)
             raise
 
+    def prune_snapshots(self, *, keep_ids: set[str] | None = None, max_age_days: int = 7) -> int:
+        """回收没人再引用的执行快照。
+
+        以前只在创建失败时清理，成功的一份不删——42 个快照攒到 4.4G，占了检索
+        索引 82% 的节点。就地执行成为默认之后新快照本就少了，但没有回收路径，
+        旧的会一直躺着。
+
+        保留：仍被变更集引用的，以及 max_age_days 之内的（可能正在用）。
+        """
+
+        if not self.snapshots_root.is_dir():
+            return 0
+        keep = set(keep_ids or ())
+        cutoff = time.time() - max_age_days * 86400
+        removed = 0
+        for entry in self.snapshots_root.iterdir():
+            if not entry.is_dir() or entry.name in keep:
+                continue
+            try:
+                if entry.stat().st_mtime > cutoff:
+                    continue
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
+    def referenced_snapshot_ids(self) -> set[str]:
+        """变更集里提到的快照。它们还可能被应用，不能回收。"""
+
+        found: set[str] = set()
+        changes_root = self.change_root
+        if not changes_root.is_dir():
+            return found
+        for path in changes_root.glob("*/change_set.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            snapshot_id = str(payload.get("snapshot_id") or "")
+            if snapshot_id:
+                found.add(snapshot_id)
+        return found
+
     def load_snapshot(self, snapshot_id: str) -> WorkspaceSnapshot:
         root = (self.snapshots_root / snapshot_id).resolve()
         if self.snapshots_root not in (root, *root.parents):
