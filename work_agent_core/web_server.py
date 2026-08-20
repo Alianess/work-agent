@@ -6828,12 +6828,19 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         session.summary_message_count = prepared_context.summary_message_count
         store.save(session)
         # 让检索索引跟上这一轮。后台线程：索引写入不许挡住回复。
-        index_conversation_async(
-            user_data_dir(),
-            conversation_id,
-            conversation_runtime.log,
-            title=str(session.title or conversation_id),
-        )
+        #
+        # 这段包在 try 里，是因为它跑在 persist_runtime_history 里——每条退出路径
+        # 都会走。索引是投影，删了随时能重建；让它把一轮已经算完的回答连同工具
+        # 结果一起弄丢，是拿最贵的东西赔最便宜的东西。
+        try:
+            index_conversation_async(
+                user_data_dir(),
+                conversation_id,
+                conversation_runtime.log,
+                title=str(session.metadata.get("title") or conversation_id),
+            )
+        except Exception as error:  # pragma: no cover - 后台维护不得影响主路径
+            print(f"[recall] 本轮索引未能启动：{type(error).__name__}: {error}")
 
     session_saved_after_run = False
     if image_preparation.notice:
