@@ -299,7 +299,9 @@
 # 2026-08-19 会话沉淀：架构重建与待办
 
 > 本节独立于上文的 Friday 建设计划，记录 8/19 这轮重构完成的部分、留下的欠账，以及为什么这么排。
-> 阻塞项：事实抽取需要本地模型，等新机器和显卡到位后再启动。
+> 原记的阻塞项（事实抽取需等显卡）**已解除**：V5_dev 走的是硅基流动云端
+> （`Pro/BAAI/bge-m3` + `BAAI/bge-reranker-v2-m3`），embedding、rerank 和抽取
+> 都不需要本地模型。显卡只影响"完全离线"这一个诉求。
 
 ## 一、本轮已完成（有测试，348 项全绿）
 
@@ -345,7 +347,7 @@
 - [x] Apple 提醒与智能体铃铛提醒互通（`agent_reminder_source`）
 - [x] 纯聊天轮活动栏不再空白
 
-## 二、下一步：事实抽取（等本地模型）
+## 二、写入侧：事实抽取（不再阻塞于显卡）
 
 > 骨架已就位：`facts.py` 有闸门、事实模型、调和逻辑和日志写入，缺的是真正调模型的抽取器。
 > 闸门已用典型对话验过：该抓的 4 条全中、该跳的 6 条全跳，9 轮里只需 3 轮调模型。
@@ -548,7 +550,8 @@
 # 线 B / 线 C 的位置
 
 - **线 B（记忆层）**：设计见 [docs/memory-layer-design.md](docs/memory-layer-design.md)，
-  实现阻塞于本地模型。骨架（闸门、调和、事实模型）已在 `work_agent_core/facts.py`。
+  骨架（闸门、调和、事实模型）已在 `work_agent_core/facts.py`；
+  RAG 侧已有 `history_recall.py`（FTS5 + MLX 向量 + RRF）。实施顺序见设计文档第七节。
   详见上文「二、下一步：事实抽取」。
 - **线 C（Friday 产品面）**：即本文件 Phase 0–8。其中 **Phase 8（消息通道）依赖 A6 的会话服务端化**——
   没有 attach/detach，每接一个通道都要复制一遍运行逻辑。
@@ -587,3 +590,16 @@
       活动栏"网络未就绪，正在重试同一端点"+ toast，并明说**不会更换模型**
 - [x] `stream_status` 作为字段下发，前端不靠匹配提示文字判断状态
 - [x] 测试：`tests/test_llm_transport_retry.py`
+
+## 线 B 实施顺序（详见 [docs/memory-layer-design.md](docs/memory-layer-design.md) 第七节）
+
+1. [ ] 语料扩到文件库 + 会议转写（零模型依赖，收益最大）
+2. [ ] 层级切片 + 标价展开地图（`recall_expand`，纯改造，省 token 而不损信息）
+3. [ ] `work_ledger` 接进对话（"第几版"这类聚合问题，已有实现但没人问它）
+4. [ ] 接硅基流动 embedding + rerank（`RetrievalBackend` 已是 Protocol，加一个实现即可）
+5. [ ] 时间维度进排序（V5_dev 完全没有，而记忆检索里"上次/最新"是最高频意图）
+6. [ ] 检索语料切到事件日志（消掉 session_store 与事件日志两个数据源）
+7. [ ] 抽取器（可用便宜 API 模型）
+
+> ⚠️ V5_dev `retrieval_engine.py:49` 把硅基流动 API key 明文写死在源码里当默认值。
+> **本仓库要公开，绝不能抄过来**，只能走环境变量；那个 key 本身也该轮换。

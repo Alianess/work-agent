@@ -197,7 +197,7 @@ Pi 的循环本体约 110 行，可变部分全是钩子：
 | 线 | 内容 | 阻塞条件 | 状态 |
 |---|---|---|---|
 | **A. Harness 归位** | 见 [harness-comparison-pi.md §四](harness-comparison-pi.md) 七步 | 无 | 进行中（第 2 步已完成）|
-| **B. 记忆层** | 见 [memory-layer-design.md](memory-layer-design.md) | **本地模型（等显卡）** | 设计完成，待实现 |
+| **B. 记忆层** | 见 [memory-layer-design.md](memory-layer-design.md) | 无（原以为要等显卡，实为云端 API 可解） | 架构已定，RAG 已建大半 |
 | **C. Friday 产品面** | TODO Phase 0–8 | Phase 8 依赖 A 的会话服务端化 | 未启动 |
 
 **A 不依赖任何外部条件，应当先做完。** 它降低的是每一轮的固定成本，
