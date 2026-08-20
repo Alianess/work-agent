@@ -1,0 +1,21 @@
+0 verbose cli /opt/homebrew/Cellar/node/26.3.0/bin/node /opt/homebrew/bin/npm
+1 info using npm@11.16.0
+2 info using node@v26.3.0
+3 silly config load:file:/opt/homebrew/lib/node_modules/npm/npmrc
+4 silly config load:file:/Users/alian/workspace/work_agent/.npmrc
+5 silly config load:file:/Users/alian/workspace/work_agent/.work-agent-home/.npmrc
+6 silly config load:file:/opt/homebrew/etc/npmrc
+7 verbose title npm list docx
+8 verbose argv "list" "docx"
+9 verbose logfile logs-max:10 dir:/Users/alian/workspace/work_agent/.work-agent-home/.npm/_logs/2026-08-20T06_27_21_485Z-
+10 verbose logfile /Users/alian/workspace/work_agent/.work-agent-home/.npm/_logs/2026-08-20T06_27_21_485Z-debug-0.log
+11 silly logfile done cleaning log files
+12 http fetch GET https://registry.npmjs.org/npm attempt 1 failed with ENOTFOUND
+13 silly packumentCache heap:4395630592 maxSize:1098907648 maxEntrySize:549453824
+14 verbose shrinkwrap failed to load node_modules/.package-lock.json missing from node_modules: node_modules/fsevents
+15 verbose cwd /Users/alian/workspace/work_agent/meet_files/会议项目/本龙科技共建运营项目沟通会
+16 verbose os Darwin 27.0.0
+17 verbose node v26.3.0
+18 verbose npm  v11.16.0
+19 verbose exit 1
+20 verbose code 1

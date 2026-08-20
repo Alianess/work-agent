@@ -223,7 +223,11 @@ def index_conversation_async(
 
     def _run() -> None:
         try:
-            sync_for(data_root).index_conversation(conversation_id, log, title=title)
+            report = sync_for(data_root).index_conversation(conversation_id, log, title=title)
+            # 词法索引完成后顺手把这一轮的新窗口补上向量。一轮只新增几个窗口，
+            # 一次调用就够；等调度线程 60 秒后再来，这段时间稠密召回是缺的。
+            if report.touched:
+                backfill_vectors_once(data_root, budget=32)
         except Exception as error:  # pragma: no cover - 后台维护不得影响主路径
             if on_error is not None:
                 on_error(error)
@@ -243,7 +247,9 @@ def index_file_async(
 
     def _run() -> None:
         try:
-            sync_for(data_root).index_file(path)
+            report = sync_for(data_root).index_file(path)
+            if report.touched:
+                backfill_vectors_once(data_root, budget=32)
         except Exception as error:  # pragma: no cover - 后台维护不得影响主路径
             if on_error is not None:
                 on_error(error)

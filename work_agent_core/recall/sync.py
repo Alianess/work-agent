@@ -29,7 +29,30 @@ from .nodes import SOURCE_CHAT
 
 
 VECTOR_BATCH = 64
-DEFAULT_SKIP_DIRECTORIES = frozenset({".git", ".venv", "node_modules", "__pycache__", "tmp"})
+DEFAULT_SKIP_DIRECTORIES = frozenset(
+    {
+        ".git",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        "tmp",
+        # 以下是**本系统自己生成**的目录，不是用户的材料。排除它们不是猜测，
+        # 是我们知道自己往哪里写东西——就像 AGENTS.md 里写 .venv 一样。
+        # 实测不排除时，沙箱快照占了索引 82% 的节点：每次 shell_exec 复制一份
+        # 工作区，同一段内容出现 882 次。
+        "execution",       # 沙箱执行快照：工作区的逐次副本
+        "file_previews",   # 已索引文件的生成预览
+        "office_extracts", # 已索引 docx 的生成 Markdown
+        "qwen3_denoise_trials",  # 降噪试验输出
+        "users",           # 账户数据目录，索引本身就在里面
+        "model_cache",
+    }
+)
+"""不进索引的目录。
+
+判据是"这里的东西是本系统写出来的，还是用户给的"。
+`asr_full` 虽然也是我们写的，但里面是真实会议转写——那是内容，不是产物。
+"""
 MAX_FILE_BYTES = 20 * 1024 * 1024
 
 

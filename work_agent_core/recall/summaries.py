@@ -19,7 +19,7 @@ import sqlite3
 from .index import RecallIndex
 
 
-SUMMARY_MIN_TOKENS = 200
+SUMMARY_MIN_TOKENS = 600
 """比这更短的章节不值得摘要——直接读正文比读摘要还便宜。"""
 
 SUMMARY_MAX_INPUT_CHARS = 6000
@@ -56,8 +56,8 @@ def sections_needing_summary(
         rows = connection.execute(
             """
             SELECT id, title, path, text, tokens FROM recall_nodes
-            WHERE is_leaf = 0 AND summary = '' AND tokens >= ?
-            ORDER BY tokens DESC
+            WHERE is_leaf = 0 AND summary = '' AND title != '' AND tokens >= ?
+            ORDER BY summary_wanted DESC, tokens DESC
             LIMIT ?
             """,
             (int(min_tokens), int(limit)),
@@ -71,7 +71,8 @@ def summary_debt(index: RecallIndex, *, min_tokens: int = SUMMARY_MIN_TOKENS) ->
         return int(
             connection.execute(
                 "SELECT COUNT(*) AS c FROM recall_nodes"
-                " WHERE is_leaf = 0 AND summary = '' AND tokens >= ?",
+                " WHERE is_leaf = 0 AND summary = '' AND title != ''"
+                " AND summary_wanted > 0 AND tokens >= ?",
                 (int(min_tokens),),
             ).fetchone()["c"]
         )

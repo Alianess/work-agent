@@ -113,8 +113,10 @@ class VectorStoreTests(unittest.TestCase):
 
         index.store_vectors("m1", [(pending[0]["text_hash"], [0.1, 0.2, 0.3])])
 
-        stored = dict(index.vectors_for("m1"))
-        self.assertEqual([round(value, 3) for value in stored[pending[0]["id"]]], [0.1, 0.2, 0.3])
+        stored = dict(index.vectors_by_text("m1"))
+        self.assertEqual(
+            [round(value, 3) for value in stored[pending[0]["text_hash"]]], [0.1, 0.2, 0.3]
+        )
         self.assertLess(len(index.leaves_without_vectors("m1")), len(pending))
 
     def test_identical_text_in_two_files_shares_one_vector(self) -> None:
@@ -129,8 +131,9 @@ class VectorStoreTests(unittest.TestCase):
 
         self.assertEqual(len(pending), 1)
         index.store_vectors("m1", [(pending[0]["text_hash"], [0.5, 0.5])])
-        # 一条向量，三个节点都能用上
-        self.assertEqual(len(index.vectors_for("m1")), 3)
+        # 一条向量，三个节点都能用上——打分只算一次，映射回节点时才展开
+        self.assertEqual(len(index.vectors_by_text("m1")), 1)
+        self.assertEqual(len(index.nodes_for_texts([pending[0]["text_hash"]])[pending[0]["text_hash"]]), 3)
         self.assertEqual(index.vector_coverage("m1"), {
             "distinct_texts": 1, "embedded": 1, "remaining": 0
         })

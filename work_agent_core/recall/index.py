@@ -183,6 +183,10 @@ class RecallIndex:
                 connection.execute(
                     f"ALTER TABLE recall_nodes ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
                 )
+        if "summary_wanted" not in columns:
+            connection.execute(
+                "ALTER TABLE recall_nodes ADD COLUMN summary_wanted INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ------------------------------------------------------------------
     # 写入
@@ -467,26 +471,45 @@ class RecallIndex:
                 written += 1
         return written
 
-    def vectors_for(
+    def vectors_by_text(self, model: str) -> list[tuple[str, list[float]]]:
+        """返回 (text_hash, 向量)，每种正文一条。
+
+        打分要在**内容层**做，不在节点层：同一条向量被多少节点共用不影响它的
+        相似度。按节点取会把 1.6 万条向量放大成 17 万行，光加载就要几秒。
+        """
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT text_hash, embedding FROM recall_vectors WHERE model = ?",
+                (model,),
+            ).fetchall()
+        return [(str(row["text_hash"]), unpack_vector(row["embedding"])) for row in rows]
+
+    def nodes_for_texts(
         self,
-        model: str,
+        text_hashes: Sequence[str],
         *,
         filters: NodeFilter | None = None,
-    ) -> list[tuple[str, list[float]]]:
-        """返回 (node_id, 向量)。多个节点共用一条向量时各自返回一行。"""
+    ) -> dict[str, list[str]]:
+        """把胜出的正文映射回符合过滤条件的节点。"""
 
+        if not text_hashes:
+            return {}
         where, params = (filters or NodeFilter()).where()
+        placeholders = ",".join("?" * len(text_hashes))
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT n.id AS node_id, v.embedding AS embedding
-                FROM recall_vectors v
-                JOIN recall_nodes n ON n.text_hash = v.text_hash
-                WHERE v.model = ? AND {where}
+                SELECT n.id AS id, n.text_hash AS text_hash FROM recall_nodes n
+                WHERE n.text_hash IN ({placeholders}) AND {where}
+                ORDER BY n.occurred_at DESC
                 """,
-                [model, *params],
+                [*text_hashes, *params],
             ).fetchall()
-        return [(str(row["node_id"]), unpack_vector(row["embedding"])) for row in rows]
+        mapping: dict[str, list[str]] = {}
+        for row in rows:
+            mapping.setdefault(str(row["text_hash"]), []).append(str(row["id"]))
+        return mapping
 
     def vector_coverage(self, model: str) -> dict[str, int]:
         with self._connect() as connection:
@@ -536,6 +559,24 @@ class RecallIndex:
             )
             for row in rows
         ]
+
+    def want_summaries(self, node_ids: Iterable[str]) -> None:
+        """记下"模型问到过这一节但它没有摘要"。
+
+        全量生成不现实：这个库里 ≥1000t 的章节就有 15095 个，按限流要跑 8 小时，
+        而其中绝大多数永远不会被打开。所以按需——被展开地图问到过的才排队，
+        没人碰过的一分钱不花。
+        """
+
+        ids = [str(item) for item in node_ids if item]
+        if not ids:
+            return
+        with self._connect() as connection:
+            connection.executemany(
+                "UPDATE recall_nodes SET summary_wanted = summary_wanted + 1"
+                " WHERE id = ? AND summary = ''",
+                [(item,) for item in ids],
+            )
 
     def vacuum_vectors(self) -> int:
         """清掉没有任何节点再引用的向量。

@@ -120,13 +120,20 @@ def search(
     if deps.embedding is not None:
         try:
             query_vector = normalize(deps.embedding.embed([query])[0])
-            stored = index.vectors_for(deps.embedding.model, filters=filters)
-            scored = [
-                (node_id_value, cosine(query_vector, normalize(vector)))
-                for node_id_value, vector in stored
-            ]
-            scored.sort(key=lambda item: item[1], reverse=True)
-            dense = [node_id_value for node_id_value, _ in scored[:RECALL_CANDIDATES]]
+            # 在内容层打分，再映射回节点：向量按正文共享，节点层打分等于把同一条
+            # 向量算很多遍。多取一些正文，因为过滤之后可能有的正文一个节点都不剩。
+            stored = index.vectors_by_text(deps.embedding.model)
+            scored = sorted(
+                ((text_hash, cosine(query_vector, vector)) for text_hash, vector in stored),
+                key=lambda item: item[1],
+                reverse=True,
+            )[: RECALL_CANDIDATES * 3]
+            mapping = index.nodes_for_texts([text_hash for text_hash, _ in scored], filters=filters)
+            dense = []
+            for text_hash, _ in scored:
+                dense.extend(mapping.get(text_hash, [])[:1])
+                if len(dense) >= RECALL_CANDIDATES:
+                    break
         except RecallBackendError as error:
             degraded.append(f"向量召回不可用：{error}")
         except Exception as error:  # pragma: no cover - 后端异常形态不可穷举
@@ -168,7 +175,11 @@ def search(
             ]
             order = deps.rerank.rank(query, documents, top_n=min(len(documents), 20))
             keys = list(rows)
-            relevance = [keys[position] for position, _ in order]
+            relevance = [keys[position] for position, _ in order if 0 <= position < len(keys)]
+            # 精排只返回 top_n，没被返回的候选仍要有名次——否则后面按名次排序会漏掉它们。
+            # 排在精排结果之后，保留融合阶段的相对顺序。
+            ranked = set(relevance)
+            relevance.extend(key for key in keys if key not in ranked)
             reranked = True
         except RecallBackendError as error:
             degraded.append(f"精排不可用：{error}")
@@ -203,8 +214,23 @@ def search(
         row = rows[node_id_value]
         text_key = str(row["text_hash"] or "")
         if text_key and text_key in seen_text:
-            results[seen_text[text_key]]["duplicates"] += 1
+            kept = results[seen_text[text_key]]
+            kept["duplicates"] += 1
             duplicates += 1
+            # 同样的内容出现在多处时，摆出来的应当是**最新的那份**。
+            # 谁排名靠前是检索的偶然，谁更新是事实。
+            if int(row["occurred_at"] or 0) > kept["occurred_at"]:
+                kept["also_in"].append({"id": kept["id"], "path": kept["path"]})
+                kept["id"] = node_id_value
+                kept["path"] = split_path(str(row["path"]))
+                kept["source_id"] = str(row["source_id"])
+                kept["occurred_at"] = int(row["occurred_at"] or 0)
+                kept["expand"] = _expand_map(index, node_id_value)
+                kept["neighbors"] = index.neighbors(node_id_value)
+            else:
+                kept["also_in"].append(
+                    {"id": node_id_value, "path": split_path(str(row["path"]))}
+                )
             continue
         path_key = f"{row['source_id']}|{row['path']}"
         if path_key in seen_paths:
@@ -225,10 +251,19 @@ def search(
                 "expand": _expand_map(index, node_id_value),
                 "neighbors": index.neighbors(node_id_value),
                 "duplicates": 0,
+                "also_in": [],
             }
         )
         if len(results) >= top_k:
             break
+
+    # 展开地图里没有摘要的章节记一笔：被问到过才值得为它生成摘要。
+    index.want_summaries(
+        option["id"]
+        for item in results
+        for option in item["expand"].values()
+        if not option.get("summary")
+    )
 
     return {
         "ok": True,
