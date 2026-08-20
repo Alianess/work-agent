@@ -8932,9 +8932,23 @@ export default function App() {
           {meetingLiveSavedPath ? (
             <div className="realtime-saved">
               <strong>已保存</strong>
-              <button type="button" className="path-button" onClick={() => openLinkedFile(meetingLiveSavedPath)}>
-                {meetingLiveSavedPath}
-              </button>
+              {(() => {
+                const saved = attachmentDisplayFromPath(meetingLiveSavedPath);
+                return (
+                  <button
+                    type="button"
+                    className={`message-attachment message-attachment-${saved.kind}`}
+                    title={meetingLiveSavedPath}
+                    onClick={() => void openFileInLibrary(meetingLiveSavedPath)}
+                    aria-label={`打开实时转写稿：${saved.name}`}
+                  >
+                    <span className="message-attachment-file">
+                      {iconForAttachment(saved.kind)}
+                      <span>{saved.name}</span>
+                    </span>
+                  </button>
+                );
+              })()}
               <div>
                 <button type="button" className="text-button" onClick={() => copyPath(meetingLiveSavedPath)}>
                   <Copy aria-hidden="true" />
@@ -12797,6 +12811,18 @@ function iconForAttachment(kind: AttachmentItem["kind"]) {
   return <Paperclip aria-hidden="true" />;
 }
 
+/** 从路径推导附件卡片的展示项（图标 + 文件名）。
+ *
+ * 手打的路径仍按纯文本渲染，不解析；这里只服务「机器自己产出的文件」——
+ * 比如实时转写稿保存后的回显，它们理应和拖进来的附件长一个样。
+ */
+function attachmentDisplayFromPath(path: string): { kind: AttachmentItem["kind"]; name: string } {
+  const name = path.split("/").pop() || path;
+  const dot = name.lastIndexOf(".");
+  const extension = dot >= 0 ? name.slice(dot).toLowerCase() : "";
+  return { kind: attachmentKindFromExtension(extension), name };
+}
+
 function activityPhaseLabel(phase: AgentActivityEvent["phase"]) {
   if (phase === "thinking") return "准备";
   if (phase === "action") return "执行";
@@ -12980,10 +13006,8 @@ function librarySectionLabel(section: FileItem["library_section"]) {
   return "文件办公区";
 }
 
-function getLibraryKind(file: Pick<FileItem, "kind" | "extension">): AttachmentItem["kind"] {
-  if (file.kind) return file.kind;
-  const extension = file.extension.toLowerCase();
-  if ([".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus", ".wma", ".amr", ".aiff", ".aif", ".caf"].includes(extension)) {
+function attachmentKindFromExtension(extension: string): AttachmentItem["kind"] {
+  if ([".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus", ".wma", ".amr", ".aiff", ".aif", ".caf", ".webm"].includes(extension)) {
     return "audio";
   }
   if ([".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".tif", ".tiff"].includes(extension)) {
@@ -12993,6 +13017,11 @@ function getLibraryKind(file: Pick<FileItem, "kind" | "extension">): AttachmentI
     return "document";
   }
   return "file";
+}
+
+function getLibraryKind(file: Pick<FileItem, "kind" | "extension">): AttachmentItem["kind"] {
+  if (file.kind) return file.kind;
+  return attachmentKindFromExtension(file.extension.toLowerCase());
 }
 
 function isLibraryPreviewable(file: Pick<FileItem, "extension" | "previewable">) {
