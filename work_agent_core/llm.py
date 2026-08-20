@@ -236,6 +236,34 @@ class OpenAICompatibleClient:
             headers=profile.auth_headers(),
             method="POST",
         )
+        return self._send_with_retry(request, profile=profile)
+
+    def _send_with_retry(self, request: Any, *, profile: ModelProfile) -> LLMResponse:
+        """非流式请求也要退避重试。
+
+        重试原来只做在流式恢复路径上，而摘要生成、审批审查、标题生成这些都走
+        非流式——它们撞上 429 时直接失败，等于把一次可恢复的限流变成一次彻底
+        失败。同一套判据：连不上或服务端说"稍后再试"就重试，说"不行"就不重试。
+        """
+
+        last_error: Exception | None = None
+        for attempt in range(TRANSPORT_RETRIES + 1):
+            if attempt:
+                schedule = (
+                    RATE_LIMIT_BACKOFF_SECONDS
+                    if retryable_status(last_error) in {429, 503}
+                    else TRANSPORT_RETRY_BACKOFF_SECONDS
+                )
+                time.sleep(schedule[min(attempt - 1, len(schedule) - 1)])
+            try:
+                return self._send_once(request, profile=profile)
+            except Exception as error:
+                last_error = error
+                if not is_transport_failure(error):
+                    raise
+        raise last_error if last_error else RuntimeError("LLM request failed")
+
+    def _send_once(self, request: Any, *, profile: ModelProfile) -> LLMResponse:
         try:
             with self._open_request(request, profile=profile, timeout=profile.timeout_seconds) as response:
                 body = response.read().decode("utf-8")
