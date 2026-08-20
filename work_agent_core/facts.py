@@ -1,38 +1,38 @@
-"""Facts the assistant extracts from its own turns, and how they are kept.
+"""What the assistant keeps knowing after a turn ends, and how it is kept.
 
-Extraction runs per turn rather than as a periodic sweep, so a commitment made
-at 10am is known at 10am. Running a model on every turn would cost more than
-the sweep it replaces, so a deterministic gate decides which turns are worth
-reading: most turns carry nothing durable, and that is cheap to establish.
+Remembering is a tool the model calls, not a pipeline that runs behind it.
+The model has already read the conversation, the transcript or the document;
+asking a second pass to decide "was anything worth keeping" pays twice for one
+reading, and gating that second pass on a keyword table only guarantees the
+table will one day miss the thing that mattered.
 
-Extracted facts are appended to the session log like everything else. A fact
-that only lived in a side table could not be traced back to the turn that
-produced it, and replaying the log would not reproduce it.
+Deadlines are deliberately absent from this module. A commitment with a date
+belongs in Apple Reminders, where it syncs to the phone, rings on time, and is
+forgotten by being ticked off — none of which a fact store does well, and all
+of which it would have to reinvent. This module keeps only what has no better
+home: names, preferences, settings and decisions.
+
+Facts are appended to the session log like everything else. A fact that only
+lived in a side table could not be traced back to the turn that produced it,
+and replaying the log would not reproduce it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Iterable, Protocol
-import re
+from typing import Any, Iterable
 
-from .session_log import (
-    ASSISTANT_MESSAGE,
-    SessionEvent,
-    SessionLog,
-    TOOL_CALL,
-    USER_MESSAGE,
-)
+from .session_log import SessionEvent, SessionLog
 
 
 FACT_RECORDED = "memory/fact"
 
-COMMITMENT = "commitment"
 ENTITY = "entity"
 PREFERENCE = "preference"
+SETTING = "setting"
 DECISION = "decision"
-FACT_KINDS = frozenset({COMMITMENT, ENTITY, PREFERENCE, DECISION})
+# Commitments are not here on purpose: a dated promise goes to Apple Reminders.
+FACT_KINDS = frozenset({ENTITY, PREFERENCE, SETTING, DECISION})
 
 # Reconciliation outcomes, following mem0's vocabulary.
 ADD = "add"
@@ -47,7 +47,6 @@ class Fact:
     """What the fact is about — the anchor used to find it again."""
 
     statement: str
-    due_at: str = ""
     confidence: float = 0.6
     source_seqs: tuple[int, ...] = ()
 
@@ -56,7 +55,6 @@ class Fact:
             "kind": self.kind,
             "subject": self.subject,
             "statement": self.statement,
-            "due_at": self.due_at,
             "confidence": self.confidence,
         }
 
@@ -66,100 +64,9 @@ class Fact:
             kind=str(data.get("kind") or ENTITY),
             subject=str(data.get("subject") or "").strip(),
             statement=str(data.get("statement") or "").strip(),
-            due_at=str(data.get("due_at") or ""),
             confidence=float(data.get("confidence") or 0.6),
             source_seqs=source_seqs,
         )
-
-
-# --------------------------------------------------------------------------
-# The gate
-# --------------------------------------------------------------------------
-
-# Markers that a turn contains something worth keeping. Deliberately generous:
-# a false positive costs one cheap model call, a false negative loses a fact.
-_TIME_MARKERS = re.compile(
-    r"(今天|明天|后天|下周|本周|周[一二三四五六日天]|下个?月|月底|季度末|"
-    r"\d{1,2}\s*月\s*\d{1,2}\s*[日号]|\d{4}-\d{2}-\d{2}|"
-    r"截止|之前|前提交|前交|deadline)"
-)
-_COMMITMENT_MARKERS = re.compile(
-    r"(交|提交|给|出|写|做|发|报|定|办|安排|计划|负责|跟进|盯|约定|承诺|"
-    r"记一下|记住|别忘|提醒我|完成|开会|见面|汇报)"
-)
-_CORRECTION_MARKERS = re.compile(r"(不是|应该是|错了|其实是|叫做|更正|改成|就是)")
-# A standing obligation has no date but still needs following up: "定期报告
-# 进展" is exactly the kind of promise that quietly lapses.
-_RECURRING_MARKERS = re.compile(
-    r"(定期|每天|每周|每月|每两周|双周|按期|周期性|常态化|持续(报告|反馈|汇报|跟进))"
-)
-
-
-@dataclass(frozen=True)
-class GateDecision:
-    worth_reading: bool
-    reason: str
-
-
-def gate_turn(log: SessionLog, *, from_seq: int = 0) -> GateDecision:
-    """Decide whether this turn is worth spending a model call on.
-
-    Reads only what the user said and what the assistant produced. Most turns
-    are questions and answers that leave nothing durable behind.
-    """
-
-    user_text: list[str] = []
-    produced = False
-    for event in log.events:
-        if event.seq < from_seq:
-            continue
-        data = dict(event.data)
-        if event.type == USER_MESSAGE:
-            user_text.append(str(data.get("content") or ""))
-        elif event.type == TOOL_CALL:
-            if str(data.get("name") or "") in {
-                "write_text_file",
-                "create_docx_from_markdown",
-                "save_work_report",
-                "update_plan",
-            }:
-                produced = True
-    text = "\n".join(user_text)
-    if _TIME_MARKERS.search(text):
-        if _COMMITMENT_MARKERS.search(text):
-            return GateDecision(True, "用户提到了带时间的约定")
-        return GateDecision(True, "用户提到了具体时间点")
-    if _RECURRING_MARKERS.search(text):
-        return GateDecision(True, "用户提到了周期性义务")
-    if _CORRECTION_MARKERS.search(text) and len(text) < 400:
-        return GateDecision(True, "用户像是在更正一个说法")
-    if produced:
-        return GateDecision(True, "本轮产出了工作成果")
-    return GateDecision(False, "本轮没有需要长期记住的内容")
-
-
-# --------------------------------------------------------------------------
-# Extraction and reconciliation
-# --------------------------------------------------------------------------
-
-class FactExtractor(Protocol):
-    def extract(self, transcript: str, *, now: datetime) -> list[dict[str, Any]]: ...
-
-
-def turn_transcript(log: SessionLog, *, from_seq: int = 0, limit_chars: int = 6000) -> str:
-    """Render the turn for the extractor: what was asked and what was answered."""
-    lines: list[str] = []
-    for event in log.events:
-        if event.seq < from_seq:
-            continue
-        data = dict(event.data)
-        if event.type == USER_MESSAGE:
-            lines.append(f"用户：{str(data.get('content') or '').strip()}")
-        elif event.type == ASSISTANT_MESSAGE:
-            content = str(data.get("content") or "").strip()
-            if content:
-                lines.append(f"助手：{content}")
-    return "\n".join(lines)[-limit_chars:]
 
 
 def existing_facts(log: SessionLog) -> list[Fact]:
@@ -181,7 +88,7 @@ def reconcile(candidate: Fact, known: Iterable[Fact]) -> tuple[str, Fact | None]
     for fact in known:
         if fact.kind != candidate.kind or fact.subject != candidate.subject:
             continue
-        if fact.statement == candidate.statement and fact.due_at == candidate.due_at:
+        if fact.statement == candidate.statement:
             return NOOP, None
         return UPDATE, candidate
     return ADD, candidate

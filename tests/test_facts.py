@@ -1,84 +1,67 @@
+"""留在记忆库里的，是没有更好去处的东西。
+
+带日期的承诺不在这里——它去 Apple 提醒事项：会同步到手机、会到点响、
+勾掉就等于忘掉。这三件事记忆库都得自己重造一遍，且都做得更差。
+"""
+
 from __future__ import annotations
 
 import unittest
 
 from work_agent_core.facts import (
     ADD,
-    COMMITMENT,
+    DECISION,
+    ENTITY,
+    FACT_KINDS,
     Fact,
     NOOP,
+    PREFERENCE,
+    SETTING,
     UPDATE,
     existing_facts,
-    gate_turn,
     reconcile,
     record_facts,
-    turn_transcript,
 )
 from work_agent_core.session_log import SessionHeader, SessionLog
 from work_agent_core.session_runtime import ConversationRuntime
 
 
-def turn(text: str, tool: str = "") -> SessionLog:
-    log = SessionLog(SessionHeader(session_id="c"))
-    log.append("turn/start", {"turn_id": "t"})
-    log.append("step/start", {"step": 1})
-    log.append("user/message", {"content": text})
-    if tool:
-        log.append("tool/call", {"call_id": "c1", "name": tool, "arguments": "{}"})
-    return log
+class KindTests(unittest.TestCase):
+    def test_commitments_are_deliberately_not_a_fact_kind(self) -> None:
+        self.assertEqual(FACT_KINDS, {ENTITY, PREFERENCE, SETTING, DECISION})
+        self.assertNotIn("commitment", FACT_KINDS)
 
-
-class GateTests(unittest.TestCase):
-    """Most turns leave nothing durable, and that is cheap to establish."""
-
-    def test_turns_worth_a_model_call(self) -> None:
-        for text in (
-            "报市材料明天晚上出一稿，周三前提交",
-            "批示要求定期报告工作进展，定成双周报",
-            "不是柔性科天，是水性科天写错了",
-            "下周一之前把双周报发我",
-        ):
-            self.assertTrue(gate_turn(turn(text)).worth_reading, text)
-
-    def test_ordinary_turns_are_skipped(self) -> None:
-        for text in (
-            "帮我看看这个 PDF",
-            "你好",
-            "这个怎么弄",
-            "解释一下什么是具身智能",
-            "刚才那段再改改",
-        ):
-            self.assertFalse(gate_turn(turn(text)).worth_reading, text)
-
-    def test_producing_work_is_always_worth_reading(self) -> None:
-        self.assertTrue(gate_turn(turn("整理一下", tool="write_text_file")).worth_reading)
+    def test_a_fact_carries_no_deadline_field(self) -> None:
+        # A date here would be a second, worse calendar.
+        self.assertNotIn("due_at", Fact(kind=ENTITY, subject="x", statement="y").to_data())
 
 
 class ReconcileTests(unittest.TestCase):
-    """Appending a fresh copy every turn is how a memory store fills with noise."""
+    """每轮追加一份新副本，是记忆库变成噪音仓库的标准路径。"""
 
     def setUp(self) -> None:
         self.known = [
-            Fact(kind=COMMITMENT, subject="报市材料", statement="周三前提交", due_at="2026-08-19")
+            Fact(kind=ENTITY, subject="零次方", statement="正名零次方，曾被误写为燃气方"),
+            Fact(kind=PREFERENCE, subject="报市材料", statement="用业务员口吻，不要咨询稿腔"),
         ]
 
     def test_an_unseen_fact_is_added(self) -> None:
-        candidate = Fact(kind=COMMITMENT, subject="双周报", statement="每两周提交一次")
+        candidate = Fact(kind=ENTITY, subject="逐际动力", statement="正名逐际动力")
         self.assertEqual(reconcile(candidate, self.known)[0], ADD)
 
     def test_repeating_a_known_fact_changes_nothing(self) -> None:
-        candidate = Fact(
-            kind=COMMITMENT, subject="报市材料", statement="周三前提交", due_at="2026-08-19"
-        )
+        candidate = Fact(kind=ENTITY, subject="零次方", statement="正名零次方，曾被误写为燃气方")
         self.assertEqual(reconcile(candidate, self.known)[0], NOOP)
 
-    def test_a_changed_deadline_updates_rather_than_duplicates(self) -> None:
-        candidate = Fact(
-            kind=COMMITMENT, subject="报市材料", statement="周四前提交", due_at="2026-08-20"
-        )
+    def test_a_changed_statement_updates_rather_than_duplicates(self) -> None:
+        candidate = Fact(kind=PREFERENCE, subject="报市材料", statement="改用条目式，一条一句")
         operation, resolved = reconcile(candidate, self.known)
         self.assertEqual(operation, UPDATE)
-        self.assertEqual(resolved.due_at, "2026-08-20")
+        self.assertEqual(resolved.statement, "改用条目式，一条一句")
+
+    def test_the_same_subject_under_another_kind_is_a_different_fact(self) -> None:
+        candidate = Fact(kind=DECISION, subject="报市材料", statement="牵头单位定为工信局")
+        self.assertEqual(reconcile(candidate, self.known)[0], ADD)
 
 
 class RecordingTests(unittest.TestCase):
@@ -86,11 +69,11 @@ class RecordingTests(unittest.TestCase):
         runtime = ConversationRuntime(SessionLog(SessionHeader(session_id="c")))
         runtime.begin_turn("t1")
         runtime.begin_step(1)
-        runtime.record_user("报市材料周三前提交")
+        runtime.record_user("不是燃气方，是零次方")
 
         applied = record_facts(
             runtime,
-            [Fact(kind=COMMITMENT, subject="报市材料", statement="周三前提交", due_at="2026-08-19")],
+            [Fact(kind=ENTITY, subject="零次方", statement="正名零次方，曾被误写为燃气方")],
         )
         self.assertEqual([operation for operation, _ in applied], [ADD])
         self.assertEqual(len(existing_facts(runtime.log)), 1)
@@ -104,7 +87,7 @@ class RecordingTests(unittest.TestCase):
         runtime = ConversationRuntime(SessionLog(SessionHeader(session_id="c")))
         runtime.begin_turn("t1")
         runtime.begin_step(1)
-        fact = Fact(kind=COMMITMENT, subject="报市材料", statement="周三前提交")
+        fact = Fact(kind=PREFERENCE, subject="双周报", statement="动词开头，不写工作亮点")
         record_facts(runtime, [fact])
         record_facts(runtime, [fact])
         self.assertEqual(len(existing_facts(runtime.log)), 1)
@@ -116,26 +99,13 @@ class RecordingTests(unittest.TestCase):
         record_facts(
             runtime,
             [
-                Fact(kind=COMMITMENT, subject="", statement="没有主语"),
-                Fact(kind=COMMITMENT, subject="有主语", statement=""),
-                Fact(kind="不认识的种类", subject="x", statement="y"),
+                Fact(kind=ENTITY, subject="", statement="没有主语"),
+                Fact(kind=ENTITY, subject="有主语", statement=""),
+                Fact(kind="commitment", subject="报市材料", statement="周三前提交"),
             ],
         )
+        # The commitment is dropped too: it belongs in Reminders, not here.
         self.assertEqual(existing_facts(runtime.log), [])
-
-
-class TranscriptTests(unittest.TestCase):
-    def test_transcript_carries_what_was_asked_and_answered(self) -> None:
-        log = SessionLog(SessionHeader(session_id="c"))
-        log.append("turn/start", {"turn_id": "t"})
-        log.append("step/start", {"step": 1})
-        log.append("user/message", {"content": "周三前交"})
-        log.append("assistant/message", {"content": "记下了"})
-        log.append("tool/call", {"call_id": "x", "name": "read_text_file", "arguments": "{}"})
-        text = turn_transcript(log)
-        self.assertIn("用户：周三前交", text)
-        self.assertIn("助手：记下了", text)
-        self.assertNotIn("read_text_file", text)
 
 
 if __name__ == "__main__":
