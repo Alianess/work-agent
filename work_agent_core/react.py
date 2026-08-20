@@ -28,7 +28,12 @@ from .memory import (
 )
 from .session_log import ASSISTANT_MESSAGE, TURN_END_ABORTED, TURN_END_COMPLETED, TURN_END_FAILED
 from .session_runtime import ConversationRuntime
-from .progress import compact_preview_text, set_tool_cancel_check, set_tool_progress_sink
+from .progress import (
+    compact_preview_text,
+    set_tool_attachment_sink,
+    set_tool_cancel_check,
+    set_tool_progress_sink,
+)
 from .session_store import repair_runtime_message_sequence
 from .shell_tools import issue_internal_approval_grant
 from .tool_bus import ToolBus
@@ -189,6 +194,8 @@ class ReActAgent:
         # what makes an early wrap-up recoverable without restarting the turn.
         self.pending_messages = pending_messages
         self.hooks = hooks or LoopHooks()
+        # 工具在本轮交回来的多模态内容块，等着被注入成一条用户消息。
+        self._tool_attachments: list[dict[str, Any]] = []
         self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         self.auto_approve = bool(auto_approve)
         self.approval_reviewer = approval_reviewer or ApprovalReviewer(
@@ -784,6 +791,29 @@ class ReActAgent:
                 }
                 return
 
+            # 工具交回来的图片在这里进上下文。tool 消息只能是字符串，所以
+            # "看见"这件事只能由 harness 完成：作为一条用户消息注入，模型在
+            # 下一次调用时才真正看到它。
+            attachments = self._take_tool_attachments()
+            if attachments:
+                runtime.append_message(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "以下是刚才用 view_image 载入的图片。"},
+                            *attachments,
+                        ],
+                    }
+                )
+                yield {
+                    "event": "activity",
+                    "phase": "observation",
+                    "title": f"已载入 {len(attachments)} 张图片",
+                    "detail": "图片作为用户消息进入上下文，模型在下一步看到它。",
+                    "activity_type": "image_attached",
+                    "step": step,
+                }
+
             # Tools for this step are done. Anything the user typed while they
             # ran goes in before the next model call, so steering lands on the
             # next decision rather than after the turn is over.
@@ -1126,7 +1156,7 @@ class ReActAgent:
             "必须提示用户先在网页“技能”页启用并开始新对话。需要技能专用工具时，"
             "用 sys_skill 的 show 查看参数，再用 sys_skill 的 call 执行。"
             "不要猜测或直接调用未出现在顶层 tools 中的技能工具名。"
-            "read_text_file、write_text_file、edit_text_file、apply_unified_patch、list_workspace_files 和 shell_exec "
+            "read_file、write_text_file、edit_text_file、apply_unified_patch、list_workspace_files 和 shell_exec "
             "是常驻 core 能力，可以直接调用。外部 MCP 能力通过 mcporter 的 list/show/call 分层使用。\n\n"
             f"{self._workspace_context_block()}"
             f"{self._extra_system_context_block()}"
@@ -1208,6 +1238,11 @@ class ReActAgent:
         if self._cancel_requested():
             self._trace("agent_cancel_requested")
             raise AgentCancelled("用户停止了当前轮。")
+
+    def _take_tool_attachments(self) -> list[dict[str, Any]]:
+        blocks = list(self._tool_attachments)
+        self._tool_attachments.clear()
+        return blocks
 
     def _drain_pending_messages(self) -> list[str]:
         if self.pending_messages is None:
@@ -1339,6 +1374,7 @@ class ReActAgent:
         tool_call_id: str = "",
     ) -> str:
         previous_cancel_check = set_tool_cancel_check(self.cancel_check)
+        previous_attachment_sink = set_tool_attachment_sink(self._tool_attachments.append)
         try:
             if tool_name == "update_plan":
                 return self._apply_task_plan(tool_input)
@@ -1367,6 +1403,7 @@ class ReActAgent:
             return str(tool.handler(safe_input))
         finally:
             set_tool_cancel_check(previous_cancel_check)
+            set_tool_attachment_sink(previous_attachment_sink)
 
     def _review_approval(
         self,
@@ -1536,6 +1573,7 @@ class ReActAgent:
         def run_tool() -> None:
             previous_sink = set_tool_progress_sink(progress_queue.put)
             previous_cancel_check = set_tool_cancel_check(self.cancel_check)
+            previous_attachment_sink = set_tool_attachment_sink(self._tool_attachments.append)
             try:
                 observation = self._execute_model_tool(
                     tool_name,
@@ -1565,6 +1603,7 @@ class ReActAgent:
             finally:
                 set_tool_progress_sink(previous_sink)
                 set_tool_cancel_check(previous_cancel_check)
+                set_tool_attachment_sink(previous_attachment_sink)
             result_queue.put(str(observation))
 
         thread = threading.Thread(target=run_tool, name=f"work-agent-tool-{tool_name}", daemon=True)

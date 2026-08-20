@@ -155,10 +155,10 @@ class RecallArchiveTests(unittest.TestCase):
                     {
                         "id": "call-1",
                         "type": "function",
-                        "function": {"name": "read_text_file", "arguments": '{"path":"a.md"}'},
+                        "function": {"name": "read_file", "arguments": '{"path":"a.md"}'},
                     }
                 ]},
-                {"role": "tool", "tool_call_id": "call-1", "name": "read_text_file", "content": "正文"},
+                {"role": "tool", "tool_call_id": "call-1", "name": "read_file", "content": "正文"},
                 {"role": "assistant", "content": "附件已经处理完成。"},
             ]
         )

@@ -247,6 +247,53 @@ class ImagePayloadTests(unittest.TestCase):
         mime, encoded = web_server.encode_image_for_model(Path("/nope/missing.jpeg"), "image/jpeg")
         self.assertEqual((mime, encoded), ("", ""))
 
+    def test_read_file_hands_an_image_to_the_loop_not_to_the_tool_result(self) -> None:
+        """一个 read 吃下文本和图片——和 Claude、Pi 一致。
+
+        图片不能进 tool 结果（OpenAI 兼容的 tool 消息只能是字符串），所以它走
+        附件通道由 harness 注入。对模型来说仍然只有一个 read_file。
+        """
+
+        from work_agent_core.progress import set_tool_attachment_sink
+        from work_agent_core.tools import WorkspaceFiles
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._photo(root / "note.jpeg", size=(2400, 1800))
+            (root / "note.md").write_text("这是文本。", encoding="utf-8")
+            files = WorkspaceFiles(root)
+            blocks: list[dict] = []
+            previous = set_tool_attachment_sink(blocks.append)
+            try:
+                image_result = files.read_text({"path": "note.jpeg"})
+                text_result = files.read_text({"path": "note.md"})
+            finally:
+                set_tool_attachment_sink(previous)
+
+            self.assertEqual(text_result, "这是文本。")
+            self.assertEqual(len(blocks), 1)
+            self.assertEqual(blocks[0]["type"], "image_url")
+            self.assertTrue(blocks[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+            self.assertIn("下一步", image_result)
+
+    def test_reading_an_image_says_so_when_nothing_can_receive_it(self) -> None:
+        from work_agent_core.tools import WorkspaceFiles
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._photo(root / "note.jpeg", size=(600, 400))
+
+            result = WorkspaceFiles(root).read_text({"path": "note.jpeg"})
+
+            # 不静默丢弃：说清楚这张图没有进入本次请求
+            self.assertIn("未进入本次请求", result)
+
+    def test_reading_a_missing_file_reports_it(self) -> None:
+        from work_agent_core.tools import WorkspaceFiles
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIn("没有这个文件", WorkspaceFiles(Path(directory)).read_text({"path": "nope.md"}))
+
     def test_only_recent_user_turns_carry_their_images(self) -> None:
         self.assertGreaterEqual(web_server.IMAGE_ATTACH_RECENT_USER_TURNS, 1)
         self.assertLessEqual(web_server.IMAGE_ATTACH_RECENT_USER_TURNS, 3)

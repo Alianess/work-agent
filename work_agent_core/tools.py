@@ -78,6 +78,11 @@ class WorkspaceFiles:
 
     def read_text(self, args: dict[str, Any]) -> str:
         path = self.resolve(str(args["path"]))
+        if not path.is_file():
+            return f"没有这个文件：{args['path']}"
+        image_result = self._read_image(path)
+        if image_result is not None:
+            return image_result
         max_chars = int(args.get("max_chars") or 12000)
         offset = max(0, int(args.get("offset") or 0))
         text = path.read_text(encoding=args.get("encoding") or "utf-8")
@@ -93,6 +98,37 @@ class WorkspaceFiles:
             note += f"; {remaining} remaining — read again with offset={next_offset}"
         note += "]"
         return window + note
+
+    def _read_image(self, path: Path) -> str | None:
+        """图片走附件通道，不是这里的返回值。
+
+        OpenAI 兼容的 tool 消息只能是字符串，塞不下图片，所以"看见"这件事只能
+        由 harness 完成：内容块交给循环，循环把它作为一条用户消息注入，模型在
+        下一步才真正看到。对调用方来说仍然只有一个 read_file。
+        """
+
+        import mimetypes
+
+        from .images import encode_image_for_model
+        from .progress import offer_tool_attachment
+
+        mime_type = mimetypes.guess_type(path.name)[0] or ""
+        if not mime_type.startswith("image/"):
+            return None
+        encoded_mime, encoded = encode_image_for_model(path, mime_type)
+        if not encoded:
+            return f"读不了这张图：{path.name}"
+        delivered = offer_tool_attachment(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{encoded_mime};base64,{encoded}"},
+            }
+        )
+        if not delivered:
+            return (
+                f"[当前模型或运行环境不支持图片，{path.name} 未进入本次请求。]"
+            )
+        return f"已载入图片 {path.name}（{encoded_mime}），在下一步就能看到它。"
 
     def write_text(self, args: dict[str, Any]) -> str:
         path = self.resolve(str(args["path"]))
@@ -451,10 +487,13 @@ def register_file_tools(
     files = WorkspaceFiles(workspace_root, on_file_changed=on_file_changed)
     registry.register(
         Tool(
-            name="read_text_file",
+            name="read_file",
             description=(
-                "Read a UTF-8 text file from the workspace. Returns at most max_chars from offset; "
-                "when more remains, the result says how much and which offset to read next. "
+                "Read a file from the workspace. Text files come back as text; images (jpg, png, "
+                "gif, webp, bmp) are attached to the conversation and become visible on the next "
+                "step, with the tool result only confirming they loaded. "
+                "For text, returns at most max_chars from offset; when more remains, the result "
+                "says how much and which offset to read next. "
                 "When the user message, an attachment, earlier conversation, or a previous tool result already "
                 "names an exact path, read that path directly instead of scanning the workspace to confirm it. "
                 "Reading, joining, tidying or rewriting plain text and Markdown always goes through the workspace "

@@ -969,7 +969,7 @@ def register_work_report_tools(registry: ToolRegistry, account_root: str | Path)
             name="read_saved_work_report",
             description=(
                 "Read and verify a saved work report from the account-local report store. "
-                "Use this instead of read_text_file: work_reports are intentionally separate from the general file workspace."
+                "Use this instead of read_file: work_reports are intentionally separate from the general file workspace."
             ),
             parameters={
                 "type": "object",

@@ -123,7 +123,7 @@ class SkillGateway:
         ]
         payload["execution_guidance"] = (
             "需要技能工具时，先用 sys_skill(op='show') 查看参数，再用 sys_skill(op='call') 执行。"
-            "read_text_file、write_text_file、edit_text_file、apply_unified_patch、list_workspace_files、shell_exec "
+            "read_file、write_text_file、edit_text_file、apply_unified_patch、list_workspace_files、shell_exec "
             "属于常驻 core 工具，可直接调用。"
         )
         return json.dumps(payload, ensure_ascii=False, indent=2)

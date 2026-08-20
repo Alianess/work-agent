@@ -66,7 +66,7 @@ dates still missing a daily report.
    successful result includes `verified=true`, a byte count, and a content hash;
    only treat that as a confirmed saved report. Work reports intentionally live
    in the account-local report store, so do **not** pass `content_path` to
-   `read_text_file`. If a second read is genuinely needed, call
+   `read_file`. If a second read is genuinely needed, call
    `read_saved_work_report` through this skill instead. Use
    `source_coverage=external_gap` and `needs_user_input=true` when offline work
    is missing; otherwise use `partial` or `full` according to the evidence.
@@ -94,7 +94,7 @@ dates still missing a daily report.
   current-chat compressed miss as an account-wide miss.
 - Prefer Markdown/text artifacts returned by the evidence collector. Never pass
   `.docx`, `.xlsx`, `.pptx`, `.pdf`, audio, or other binary files to
-  `read_text_file`; open those through their document/media skill only when the
+  `read_file`; open those through their document/media skill only when the
   projected evidence and text companion are insufficient.
 
 ## Evidence rules

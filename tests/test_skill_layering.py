@@ -28,7 +28,7 @@ CORE_MODEL_TOOLS = {
     "edit_text_file",
     "list_workspace_files",
     "mcporter",
-    "read_text_file",
+    "read_file",
     "recall",
     "recall_expand",
     "shell_exec",

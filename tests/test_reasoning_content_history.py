@@ -440,7 +440,7 @@ class ReasoningContentHistoryTests(unittest.TestCase):
             b'data: {"choices":[{"delta":{"reasoning_content":"files"}}]}\n',
             (
                 b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
-                b'"id":"call_1","type":"function","function":{"name":"read_text_file",'
+                b'"id":"call_1","type":"function","function":{"name":"read_file",'
                 b'"arguments":"{\\"path\\":\\"notes.md\\"}"}}]},"finish_reason":"tool_calls"}]}\n'
             ),
             b"data: [DONE]\n",
@@ -455,7 +455,7 @@ class ReasoningContentHistoryTests(unittest.TestCase):
                 response = OpenAICompatibleClient().chat_tools_stream(
                     [{"role": "user", "content": "read it"}],
                     profile=profile,
-                    tools=[{"type": "function", "function": {"name": "read_text_file"}}],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
                 )
         finally:
             if previous_key is None:
@@ -502,7 +502,7 @@ class ReasoningContentHistoryTests(unittest.TestCase):
                     {
                         "id": "call_1",
                         "type": "function",
-                        "function": {"name": "read_text_file", "arguments": "{}"},
+                        "function": {"name": "read_file", "arguments": "{}"},
                     }
                 ],
             }

@@ -91,7 +91,7 @@ class CompactionTests(unittest.TestCase):
         runtime.begin_step(1)
         runtime.record_user("写材料")
         runtime.record_assistant("读取了底稿")
-        runtime.record_tool_result("call_a", "read_text_file", "很长的正文" * 100)
+        runtime.record_tool_result("call_a", "read_file", "很长的正文" * 100)
 
         folded = runtime.active_turn_surface_seqs()
         self.assertEqual(len(folded), 2)
@@ -142,9 +142,9 @@ class MigrationTests(unittest.TestCase):
             {"role": "user", "content": "整理纪要"},
             {"role": "assistant", "content": "", "tool_calls": [
                 {"id": "call_1", "type": "function",
-                 "function": {"name": "read_text_file", "arguments": "{\"path\": \"a.md\"}"}}
+                 "function": {"name": "read_file", "arguments": "{\"path\": \"a.md\"}"}}
             ]},
-            {"role": "tool", "tool_call_id": "call_1", "name": "read_text_file", "content": "正文"},
+            {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": "正文"},
             {"role": "assistant", "content": "整理好了"},
             {"role": "user", "content": "再改一版"},
             {"role": "assistant", "content": "改好了"},

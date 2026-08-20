@@ -846,7 +846,7 @@ def snapshot_isolation_note(command_text: str, cwd: Path) -> str:
         return ""
     return (
         f"命令引用了 {', '.join(hidden)}，但这些目录不会同步进隔离执行副本，"
-        "在沙箱内表现为“文件不存在”。读写用户数据请改用 read_text_file、write_text_file、"
+        "在沙箱内表现为“文件不存在”。读写用户数据请改用 read_file、write_text_file、"
         "list_workspace_files 或对应技能工具。"
     )
 

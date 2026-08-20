@@ -27,7 +27,7 @@ class ConversationRewindTests(unittest.TestCase):
                             {
                                 "id": "call-1",
                                 "type": "function",
-                                "function": {"name": "read_text_file", "arguments": "{}"},
+                                "function": {"name": "read_file", "arguments": "{}"},
                             }
                         ],
                     },

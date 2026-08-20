@@ -34,6 +34,32 @@ def set_tool_cancel_check(check: CancelCheck | None) -> CancelCheck | None:
     return previous
 
 
+def set_tool_attachment_sink(sink: Any | None) -> Any | None:
+    """工具把多模态内容交回循环的通道。
+
+    OpenAI 兼容的 tool 结果只能是字符串，塞不进图片。所以"读一张图"这件事
+    只能由 harness 完成：工具把内容块交到这里，循环在下一次模型调用之前
+    把它作为一条用户消息注入。
+    """
+
+    previous = getattr(_thread_state, "attachment_sink", None)
+    _thread_state.attachment_sink = sink
+    return previous
+
+
+def offer_tool_attachment(block: dict[str, Any]) -> bool:
+    """交出一个内容块。没有循环在收（比如单测直接调工具）时返回 False。"""
+
+    sink = getattr(_thread_state, "attachment_sink", None)
+    if sink is None:
+        return False
+    try:
+        sink(block)
+    except Exception:
+        return False
+    return True
+
+
 def current_tool_cancel_check() -> CancelCheck | None:
     return getattr(_thread_state, "cancel_check", None)
 

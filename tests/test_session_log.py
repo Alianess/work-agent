@@ -43,10 +43,10 @@ class SessionLogProjectionTests(unittest.TestCase):
         open_turn(log)
         log.append(USER_MESSAGE, {"content": "整理会议纪要"})
         log.append(ASSISTANT_MESSAGE, {"content": "", "tool_calls": [
-            {"id": "call_1", "type": "function", "function": {"name": "read_text_file", "arguments": "{}"}}
+            {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
         ]})
-        log.append(TOOL_CALL, {"call_id": "call_1", "name": "read_text_file", "arguments": {}})
-        log.append(TOOL_RESULT, {"call_id": "call_1", "name": "read_text_file", "content": "纪要正文"})
+        log.append(TOOL_CALL, {"call_id": "call_1", "name": "read_file", "arguments": {}})
+        log.append(TOOL_RESULT, {"call_id": "call_1", "name": "read_file", "content": "纪要正文"})
         log.append(ASSISTANT_MESSAGE, {"content": "已整理完成"})
 
         messages = log.derive_messages()

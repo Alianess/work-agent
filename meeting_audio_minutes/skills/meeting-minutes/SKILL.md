@@ -80,7 +80,7 @@ Prefer this composable workflow:
 2. If the input is an audio file and no complete transcript already exists, call `transcribe_meeting_audio`. Treat its returned `artifacts` array and exact `path` values as authoritative; never reconstruct an ASR path from the recording filename, model name, or guessed directory. Continue only when `status` is `complete` and `artifacts_verified` is true.
    Treat attachment/audio filenames only as file identifiers and possible weak location labels. Do **not** infer the meeting counterpart, attendees, organizer, or cooperation relationship from names such as `客户现场 4.m4a`; wait for the transcript or explicit user confirmation.
    Read the `recording_metadata` returned by the tool. Use `recording_started_at` only when `recording_time_validation` is `plausible_file_timeline`. Some imported M4A files use `creation_time` for export or container creation; when validation reports a conflict, preserve `media_created_at` for audit but do not treat it as a recording or meeting start. Never substitute file upload time, filename prefix, filesystem mtime, or browser `lastModified` for the recording time.
-3. If the input is an existing `.md` / `.txt` transcript, read it directly with `read_text_file`.
+3. If the input is an existing `.md` / `.txt` transcript, read it directly with `read_file`.
 4. For supplemental `.docx` files, open the `docx` skill and use its extraction capability. For `.pdf` / `.pptx` / `.xlsx` / `.csv`, open the corresponding format skill before extracting a preview.
 5. Draft the internal archive as Markdown and write it with `write_text_file`.
 6. Draft the work-submission version as conservative Markdown content and write it with `write_text_file`. This is an intermediate artifact, not completion.

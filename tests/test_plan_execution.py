@@ -103,9 +103,9 @@ class PlanExecutionTests(unittest.TestCase):
             {"role": "assistant", "content": "我先核对代码", "tool_calls": [{
                 "id": "call-1",
                 "type": "function",
-                "function": {"name": "read_text_file", "arguments": '{"path":"/tmp/demo.py"}'},
+                "function": {"name": "read_file", "arguments": '{"path":"/tmp/demo.py"}'},
             }]},
-            {"role": "tool", "tool_call_id": "call-1", "name": "read_text_file", "content": "x = 1"},
+            {"role": "tool", "tool_call_id": "call-1", "name": "read_file", "content": "x = 1"},
         ])
         messages = agent._request_messages(runtime)
 
