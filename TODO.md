@@ -1,6 +1,9 @@
 # Friday 项目经理助理：自下而上建设 TODO
 
 > 状态：方案已进入底座验证阶段。本文件记录已确认的建设顺序和验收边界；不代表已经接入 Plane、微信或图数据库。
+>
+> **总纲见 [docs/target-architecture.zh-CN.md](docs/target-architecture.zh-CN.md)**——第一性原则、三个面、
+> 提醒模型、harness 分层，以及本文件三条并行线（A Harness / B 记忆 / C 产品面）的依赖关系。
 
 ## 开发原则
 
@@ -290,3 +293,297 @@
 - 不把全局关系图作为默认界面。
 - 不将 AI 推测混入工商事实或已确认项目事实。
 - 不让上层 AI 绕过 Adapter 直接读取 Plane 数据库或关系中心内部表。
+
+---
+
+# 2026-08-19 会话沉淀：架构重建与待办
+
+> 本节独立于上文的 Friday 建设计划，记录 8/19 这轮重构完成的部分、留下的欠账，以及为什么这么排。
+> 阻塞项：事实抽取需要本地模型，等新机器和显卡到位后再启动。
+
+## 一、本轮已完成（有测试，348 项全绿）
+
+### 会话事件日志（替换原有 messages 数组）
+
+- [x] `session_log.py`：append-only 事件日志、surface 投影、压缩以遮蔽而非删除、崩溃恢复合成、三条结构不变量
+- [x] `session_log_store.py`：SQLite 一事件一行、seq 连续性强制、写后批处理 + flush 屏障、`DurableTurnMirror` 跨轮镜像
+- [x] `session_migration.py`：47 个历史会话回灌，4314 条消息 → 8026 事件，结构问题 0、派生逐条一致
+- [x] `session_runtime.py`：循环门面。请求装配与原 `_model_messages` 在 188 组真实对比中零差异
+- [x] `react.py`：删掉 281 行重复循环，`run_messages` 变成流式循环的投影
+- [x] 取消/失败/正常三条出口全部落库（原来取消直接丢弃整轮）
+- [x] `request/header` 每步落盘，模型看到什么可事后复原
+
+### 运行时 profile 注册表
+
+- [x] `runtime_profiles.py`：干掉散落 10 处的 `"friday-main"` 魔法字符串
+- [x] 记忆写入和提醒能力从 persona 解绑，任何对话都可用
+- [x] 加新人格 = 注册一条，不改调用点
+
+### 注意力层
+
+- [x] `attention.py`：观察器注册表、显著度门槛、一次最多三条、说过的记账（含静默期）
+- [x] `observers.py`：材料版本堆积（读台账）、未处理录音（扫外部输入）、实体拼写不一致
+- [x] `work_ledger.py`：从事件日志派生"它自己做过什么"，真实历史里派生出 49 件产出物
+- [x] 接进后台循环，15 分钟节流
+
+### 执行与终端
+
+- [x] 就地执行：命令跑在真实工作区，不再是看不见 `meet_files` 的快照副本
+- [x] 沙箱即权限：能被沙箱装下的直接放行（对齐 Claude Code auto-allow）
+- [x] 真 shell：管道、重定向、`&&`/`;`、glob 可用，逐段过策略
+- [x] `python -c` AST 只读分析，只读片段免审批
+- [x] 只读命令白名单从 11 个扩到 47 个
+
+### 其他
+
+- [x] `pdf_convert_to_images` 改用 pypdfium2（原来 import pdf2image 直接崩）
+- [x] 技能健康检查增加"脚本依赖能否 import"探测
+- [x] `sys_skill` 接受嵌套信封，少一次模型往返
+- [x] `shell_exec` 提示快照不可见目录
+- [x] 报告周期改为配置（`REPORT_PERIODS`），周报标记为不启用
+- [x] 双周报文体规范 `references/biweekly-style.md`（依据第 15 期实稿）
+- [x] Apple 提醒与智能体铃铛提醒互通（`agent_reminder_source`）
+- [x] 纯聊天轮活动栏不再空白
+
+## 二、下一步：事实抽取（等本地模型）
+
+> 骨架已就位：`facts.py` 有闸门、事实模型、调和逻辑和日志写入，缺的是真正调模型的抽取器。
+> 闸门已用典型对话验过：该抓的 4 条全中、该跳的 6 条全跳，9 轮里只需 3 轮调模型。
+
+- [ ] 实现 `FactExtractor` 的 LLM 版本
+  - [ ] 输入 `turn_transcript()`，输出 `{kind, subject, statement, due_at, confidence}` 列表
+  - [ ] 用本地小模型跑，不占主链路 profile
+  - [ ] 抽不出来时返回空列表，不允许编造
+- [ ] 在 turn 结束时接入：`gate_turn()` 通过才调用，结果经 `record_facts()` 落库
+  - [ ] 必须异步，不阻塞回复
+  - [ ] 失败只记 `agent/error`，不影响本轮
+- [ ] 新增"承诺到期"观察器：从 `existing_facts()` 读 `commitment`，`due_at` 临近时开口
+  - [ ] 这是最能改变体感的一条：说完"明晚出一稿"，明天它自己提醒
+- [ ] 周期性义务（`定期报告进展`）需要单独的复发模型，不能只有单个 `due_at`
+
+> 完整设计见 [docs/memory-layer-design.md](docs/memory-layer-design.md)：
+> 记（闸门→抽取→调和）与回忆（常驻层→检索层→ASR 热词旁路）两条链路，各自的量控上限。
+
+### 验收标准
+
+- 对话里说"报市材料周三前提交"，当天日志里出现一条 `memory/fact`，`kind=commitment`
+- 同一件事重复说，库里仍只有一条（调和已有测试）
+- 周三前一天，Friday 主动提到这件事，且只提一次
+
+## 三、欠账：该是注册表却仍是常量表
+
+> 本轮修的每个用户可见故障，追到底都是一张硬编码列表。已处理三张，还剩这些。
+
+- [ ] `ATTENTION_ALIAS_GROUPS`（`web_server.py:580`）：硬编码 5 组别名，是本轮为了跑通临时塞的
+  - [ ] **不要建实体表。** 换张表只是把常量表改个名字，病没治。用户说过"就是零次方"，
+        那次纠正本身就是日志里的事件；抽取器写成 `memory/fact, kind=entity`（`ENTITY` 已在
+        `FACT_KINDS` 里），别名是 fact 的一个字段，不是新表的一行
+  - [ ] 消费侧是**投影**，跟 `build_work_ledger` 从日志投出 49 个产物同一个机制：
+        `build_entity_view(log)` 扫 `memory/fact` 事件，合并成 `{正名: [别名...]}`，注意力层直接用
+  - [ ] 判据：删掉 `ATTENTION_ALIAS_GROUPS` 这个字面量后，别名归并仍然工作——因为那 5 组
+        本来就在历史对话里说过。如果删了就不工作，说明还是在靠表
+- [ ] `DEFAULT_ASR_HOTWORDS`（`skills/meeting_minutes.py:49`）：16 个通用词写死；
+      `extract_hotword_terms` 正则抓所有 2–24 字串再取前 180，噪音占满名额
+  - [ ] 同一个投影的第二个消费者：热词 = `build_entity_view(log)` 里出现过的专名，按最近提及排序
+  - [ ] 归档里几百个专名一个都没进热词表，不是因为缺一张表，是因为没人去读日志
+- [ ] 前端可点文件目录白名单（`App.tsx:10836`）：11 个目录写死，漏了 `work_reports/`、`outputs/`、`scratch/`、`docs/`
+  - [ ] 这就是"文件链接时而能点时而不能"的原因，应改为工作区内任意路径
+- [ ] `shouldHideActivityEvent`（`App.tsx`）：按标题字符串匹配决定显示，已打补丁但规则本身应可配置
+- [ ] `SKILL_TOOL_ALIASES` / `COMMON_SKILL_TOOLS`（`skill_gateway.py`）：技能工具可见性手写映射
+
+## 四、欠账：产品面
+
+- [ ] **文件版本控制**：同一份材料多个版本应是一个 artifact 的多个 revision，不是多个独立文件
+  - [ ] `work_ledger.py` 的 `Artifact`/`Revision` 已经是这个模型，缺的是写入侧
+  - [ ] 现状：8/17 一份材料生成了 5 个版本 × (md+docx) = 10 个文件
+  - [ ] 顺带清理文件库现有重复
+- [ ] 侧边栏文件预览：发出去的文件不能点开、预览质量一般（本轮未验证具体原因）
+- [ ] 日报降级为素材，不作为可提交产物暴露
+
+## 五、欠账：可靠性
+
+- [ ] **S5 重试策略**：`llm.py` 恢复时仍用同一 profile 和 endpoint 重试
+  - [ ] 8/17 三次 `gpt-5.6-terra` 空闲超时，恢复走同一死端点必然陪葬
+  - [ ] 应支持 fallback 路由链，策略作为 profile 上的数据
+- [ ] `turn_store.append_event` 每追加一个事件读写整个 JSON：252 事件的 turn 等于把文件读写 252 遍（O(n²)）
+  - [ ] 事件日志已有正确实现，turn_store 应改为其投影或直接退役
+- [ ] `web_server.py` 8419 行，框架关注点与应用关注点焊在一起
+  - [ ] 收益慢风险高，等上面几项稳定后再动
+
+## 六、已知但暂不处理
+
+- [ ] 修复提示（文本工具调用畸形时注入的两条）现在会进 transcript 并永久留在历史里；老行为是模型可见但不入库。噪音，不致命
+- [ ] `active_turn_surface_seqs` 的折叠边界未在真实长对话上验证过，第一次触发压缩时留意
+- [ ] 就地执行后写入立即生效，不再有"验证后回写"。项目代码有 git 兜底，`meet_files` 没有；`rm` 和装包仍保留在审批中
+- [ ] 本轮所有验证都是单元测试 + 真实历史离线比对，UI 层、SSE、多账户路径未实际走过
+
+## 七、不建议做
+
+- 接入 DeepSeek Harness 或 Codex CLI 作为子代理：会引入第二套记忆、审批和日志，与刚统一的事件日志分叉；且通用编码 agent 不解决本项目的领域问题
+
+---
+
+# 线 A：Harness 归位
+
+> 依据 [docs/harness-comparison-pi.md](docs/harness-comparison-pi.md)（对 `badlogic/pi-mono` 的源码实测对比）。
+> **本线不依赖任何外部条件，应先做完**——线 B 的记忆注入和线 C 的通道适配都要挂在它的钩子上。
+> 目标：每轮固定开销从 6000+ token 降到 1500 以内，且降的全是限制模型的部分。
+
+## A1. 规则归位 ✅
+
+> 系统提示词 **3625 → 657 字符**（harness 自撰部分，降 82%）。
+> 大部分内容不是删掉了，是搬到了离它约束的东西更近的地方。
+
+- [x] 段 5（309 字，计划规则）→ `update_plan` 的 tool description
+- [x] 段 6（496 字，终端与审批规则）→ `shell_exec` 的 description
+      - [x] 顺带修掉一处矛盾：提示词说"shell_exec 是 argv，不支持管道重定向"，
+            但实现早就支持了，description 里也写着支持。规则离实现太远就会这样烂掉
+- [x] 段 8（686 字，文件工具选择）→ `read_text_file` / `write_text_file` /
+      `list_workspace_files` 各自的 description
+- [x] 段 7（434 字，`.venv` 环境约定）→ **`AGENTS.md` 项目上下文文件**
+      - [x] `read_workspace_context()`：按 mtime 缓存，4000 字符封顶
+      - [x] 换个工作区就不再带着上一个项目的 Python 布局走
+- [x] 段 9（374 字，Apple 待办语义）→ 删除。它在 apple-schedule 的 SKILL.md
+      **和常驻技能索引里各有一份**，提示词是第三份抄写
+- [x] `tests/test_prompt_termination_contract.py` 重写成 7 条"归位验证"：
+      每条规则都断言**不在提示词里**且**在新家里**
+
+## A2. 删掉关键词预判路由 ✅
+
+- [x] 删除 `looks_like_office_request` / `looks_like_official_document_request`
+- [x] 两处上下文装配（`build_chat_session_system_context`、`format_chat_goal`）不再猜技能，
+      只传达用户在界面上的显式选择
+- [x] 348 测试通过
+- [ ] 遗留：`looks_like_meeting_minutes_request` 仍用于**会话标题推断**（`web_server.py:7686`）。
+      它不注入模型上下文，危害小，但仍是一张关键词表——实体层建好后一并处理
+
+## A3. 技能索引瘦身 ✅
+
+- [x] `render_chat_skill_catalog` 改为一技能一行，去掉 `label` / `mention` / `enabled`
+      三个只给前端用的字段，并去掉 `indent=2` 的 JSON 脚手架
+- [x] **4252 → 2131 字符，省 50%**（原来 57% 是脚手架，真正的描述文本只有 1818）
+- [x] 未启用的技能压成一行列出，避免"明明有这个能力却说做不了"
+- [x] 测试：`tests/test_output_spill.py::SkillCatalogTests`
+
+## A4. 工具输出落盘 + 给路径 ✅
+
+- [x] `spill_output()`（`shell_tools.py`）：stdout 超 20000 / stderr 超 12000 时，
+      **全文写进 `tmp/shell_output/<execution_id>.<stream>.txt`**，截断标记里带上路径
+- [x] 结果 JSON 增加 `stdout_full_path` / `stderr_full_path`
+- [x] 落盘失败（磁盘满、路径被占）不影响命令结果返回
+- [x] 规则写进 `shell_exec` 的 description，模型知道有这条回头路
+- [x] **同一个病也修了 `read_text_file`**：加 `offset` 参数，截断时报告
+      "chars 0-12000 of 30000; 18000 remaining — read again with offset=12000"。
+      原先截到 12000 就没了，且没有任何办法往后读
+- [x] 测试：`tests/test_output_spill.py`（7 项，含分页覆盖全文、落盘失败降级）
+
+## A5. 删对话风格约束 ✅
+
+- [x] 删段 4（216 字"展示规则"）：不要逐条播报、不要输出思维链、最终答复不要复述过程
+- [x] **保留了其中一句**——"先写一小段自然语言工作说明"。它不是文风偏好，
+      是 UI"实施路径"面板的唯一数据来源，删了会静默少一个功能
+- [x] 产出物风格一个字没动：周报句式、纪要格式、公文文种仍在
+      `work-reports` / `official-document` / `biweekly-style.md`，按需加载
+
+## A6. 循环钩子化 + steering / follow-up 队列 ✅（部分，见下方遗留）
+
+### 已完成
+
+- [x] **steering 队列**：一批工具跑完、下一次模型调用之前注入用户中途说的话，
+      所以指令落在"下一个决定"上，而不是等本轮结束
+- [x] **follow-up 队列**：模型不再调工具、本该收尾时先看队列；有排队消息就继续本轮，
+      并把模型已经说的话并进最终答复，不丢内容
+- [x] `TurnStore.enqueue_message` / `drain_messages`：turn 级收件箱，
+      恰好一次投递（drain 两次不重复），终态 turn 不再收
+- [x] `POST /api/agent/turns/:id/message` 投递入口
+- [x] 收件箱抛异常不影响本轮（inbox 坏了不能把 turn 带走）
+- [x] **`LoopHooks` 挂载点**：`transform_context`（模型请求前，压缩之后——
+      **记忆常驻层将来挂这里**）、`should_stop_after_turn`（优雅停）。
+      钩子本身是生成器，可以直接 yield 活动事件；钩子抛异常按"没有这个钩子"处理
+- [x] **删掉终止语义 501 字**：系统提示词 3625 → 3124
+- [x] 保留"不得用未来时计划冒充交付"——那是诚实性约束，循环判断不了一句话是否谎报交付
+- [x] `tests/test_prompt_termination_contract.py` 反转成三条断言：
+      终止语义**不得**再出现在提示词里 / 结构管不了的规则仍须保留 / 提示词长度上限 3200
+- [x] 测试：`tests/test_turn_steering.py`（9 项）+ 全套 366 项
+
+### 遗留
+
+- [x] **`before_tool_call` / `after_tool_call` 接缝已建**：钩子可拦下工具调用并替它给出
+      观测、或改写工具结果；钩子抛异常按"没有这个钩子"处理，绝不会让本来能跑的工具失败
+- [x] **前端已接**：普通文字消息在 turn 运行时直接投递给正在跑的这一轮
+      （`api.queueTurnMessage`）；带附件或显式选了技能的仍按老路排队等新一轮，
+      投递失败自动退回排队，消息不会丢
+- [ ] **审批仍焊在循环里，没有搬进 `before_tool_call`**。这条是我主动没做：
+      那 150 行与事件发射和"挂起等审批即终止本轮"的续跑状态交织，而它把守的是
+      真实 shell 执行。接缝已经建好了，搬迁应当单独排一次并配审批专项回归，
+      不该缀在别的改动尾巴上
+- [ ] 验收未做实测：需要在真实会话里确认"模型提前收尾 → 补一句 → 接上"
+
+## A7. 技能工具归位 ✅（与原计划不同，见下）
+
+> **原计划是"技能改成读文件、干掉 sys_skill"。查过 Pi 源码和我们自己的实现后改了方向。**
+>
+> Pi 能纯用 read 是因为**它的技能只有说明文字，没有工具**。我们的技能带原生工具
+> （`transcribe_meeting_audio`、`process_office_document`……），`sys_skill.open`
+> 返回的是说明**加工具 schema**——改成裸读文件会丢掉 schema。这是 Pi 的边界，不是它的骨架。
+>
+> 而 `SKILL_TOOL_ALIASES` 这张表的真正问题也不是"因为有协议"，是**它记的事实放错了地方**：
+> "docx 技能可以调 create_docx_from_markdown"属于 docx 技能，不属于 harness。
+
+- [x] `work_agent.json` 新增 `runtime_tools` 字段，10 个技能各自声明自己用的 Python 工具
+- [x] **删除 `SKILL_TOOL_ALIASES`**（38 行中央字典）
+- [x] 保留 `COMMON_SKILL_TOOLS`——`run_skill_script` / `precheck_skill_environment`
+      对所有技能都成立，这是技能的共性，不是逐技能的表
+- [x] 效果：**新增一个技能不再需要回头改 harness 代码**
+- [x] 测试：`tests/test_skill_layering.py::SkillOwnsItsToolListTests`（映射钉住 + 断言表已消失）
+
+## 不做
+
+- **审批二次模型调用保留。** Pi 是单任务、用户全程盯着终端；我们长期运行、有副作用、
+  人常不在跟前。风险模型不同，一次 500 token 的轻量审查划算。
+  只把它从焊死改成 `before_tool_call` 钩子（见 A6）。
+
+---
+
+# 线 B / 线 C 的位置
+
+- **线 B（记忆层）**：设计见 [docs/memory-layer-design.md](docs/memory-layer-design.md)，
+  实现阻塞于本地模型。骨架（闸门、调和、事实模型）已在 `work_agent_core/facts.py`。
+  详见上文「二、下一步：事实抽取」。
+- **线 C（Friday 产品面）**：即本文件 Phase 0–8。其中 **Phase 8（消息通道）依赖 A6 的会话服务端化**——
+  没有 attach/detach，每接一个通道都要复制一遍运行逻辑。
+
+## 线 C 新增：主动消息与提醒（并入 Phase 7）
+
+> 模型见 [docs/target-architecture.zh-CN.md §三](docs/target-architecture.zh-CN.md)。
+
+- [ ] 定义通知类消息事件：落在会话时间线，**不进模型上下文**
+      （`derive_transcript` 收，`derive_messages` 不收）
+- [ ] 未读是**消息的属性**，不是通知的属性
+- [ ] 通知是消息的摘要投影，作用是把用户从"新聊天"拉回 Friday
+- [ ] 微信 / 桌面提醒 / 前端小红点是同一条消息的三条投递通道，不是三个功能
+- [ ] 用户点开 Friday → 消息已读 → 未投递的通知作废
+- [ ] 红线：主动消息与提醒**不得各存一份内容**
+
+---
+
+# 线 A 之外：本轮顺带修的可靠性问题
+
+## LLM 传输故障重试 ✅
+
+> 触发：实际使用中报 `<urlopen error [Errno 8] nodename nor servname provided>`，
+> 主流和流式恢复同时倒下。
+
+- [x] 病根：`_recover_tools_response` 用 `replace(profile, timeout_seconds=...)` 恢复，
+      **base_url 完全相同**。所以"连不上主机"这类故障必然连累恢复，还白烧一次调用
+- [x] **明确不做换端点回退**：换端点等于悄悄换模型，同一份材料换个 endpoint
+      写出来不是同一份东西，而用户不会知道换过
+- [x] `is_transport_failure()`：DNS / 连接 / 超时算传输故障；HTTP 500 不算（主机答了）；
+      逐层追 `__cause__` / `__context__`
+- [x] 传输故障 → **同端点重试 3 次**，退避 0.5s / 1.5s / 3.0s；非传输故障不重试
+- [x] 错误信息改成"连不上 api.deepseek.com（DNS 或网络故障），已重试 3 次仍未恢复"，
+      不再抛裸 urlopen 文本
+- [x] 前端提示走现有那套：新增 `network_retry` 流状态 →
+      活动栏"网络未就绪，正在重试同一端点"+ toast，并明说**不会更换模型**
+- [x] `stream_status` 作为字段下发，前端不靠匹配提示文字判断状态
+- [x] 测试：`tests/test_llm_transport_retry.py`

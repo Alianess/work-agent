@@ -152,6 +152,8 @@ scripts/work_agent_service_ctl.sh logs
 scripts/work_agent_service_ctl.sh errors
 ```
 
+服务启动检查不仅验证 8787 端口，还会验证原生 Seatbelt 隔离执行可用；如果服务从不允许嵌套沙箱的父级环境启动，安装/重启会明确失败，而不会等到 `shell_exec` 时才暴露问题。
+
 ## 数据与安全边界
 
 | 内容 | 默认位置 | 是否应提交 |
