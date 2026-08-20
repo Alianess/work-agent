@@ -2,7 +2,7 @@
 
 > 状态：架构已定。RAG 部分现有实现见 `work_agent_core/history_recall.py`（1509 行，
 > FTS5/BM25 + MLX 向量 + RRF，默认关闭向量）；写入侧骨架见 `work_agent_core/facts.py`
-> （闸门与调和已实现，抽取器未写）；聚合侧见 `work_agent_core/work_ledger.py`。
+> （事实模型与调和已实现，`remember` 工具未接）；聚合侧见 `work_agent_core/work_ledger.py`。
 >
 > **阻塞条件已解除**：原以为要等本地模型，但 V5_dev 走的是硅基流动云端
 > （`Pro/BAAI/bge-m3` + `BAAI/bge-reranker-v2-m3`），embedding 和 rerank 都不需要显卡。
@@ -95,13 +95,16 @@ L2 旁路    永不进上下文       0 token         ASR 热词、别名归并�
 
 | 来源 | 从哪来 | 例子 | 怎么处理 |
 |---|---|---|---|
-| `user` 用户说的 | user / assistant 消息 | "是零次方不是燃气方" | 逐轮闸门 → 抽取 |
+| `user` 用户说的 | user / assistant 消息 | "是零次方不是燃气方" | 模型当场调 `remember` |
 | `observed` 智能体读到的 | 工具结果：ASR 转录、docx 正文、网页 | 转录里的"工信张传涛局长" | **入档时抽一次**，不逐轮 |
 | `derived` 智能体做过的 | 工具调用本身 | 写了报市稿第 6 版 | **纯规则投影，零模型调用** |
 
-- `user` 短、频繁 → 逐轮跑，靠闸门筛
-- `observed` 长（一份转录几万字）、频次低 → 按文档抽一次，内容哈希去重
-- `derived` 完全确定 → `build_work_ledger` 已经在干
+- `user` 短、频繁 → 模型正在读它，顺手调 `remember`，不额外花钱
+- `observed` 长（一份转录几万字）、频次低 → 模型读完那份文档时调一次，内容哈希去重
+- `derived` 完全确定 → `build_work_ledger` 已经在干，一次模型调用都不用
+
+**三条通道共用一个入口。** 不管是你说的、它读到的还是它做过的，
+值得记的东西都从 `remember` 进来，只是 `source` 字段不同。
 
 **优先级：`user` 说的压过 `observed` 读到的。** ASR 把名字听错记下了，你后来纠正，永远听你的。
 `observed` 出来的事实 confidence ≤ 0.7；其中的承诺类（"工信请我们牵头写材料"）标为**待确认**，
@@ -143,7 +146,7 @@ L2 旁路    永不进上下文       0 token         ASR 热词、别名归并�
 
 **硬约束：每轮 ≤ 5 条，confidence < 0.5 丢弃。** 超了说明模型在凑数。
 
-### 3.4 量控主力是调和，不是闸门
+### 3.4 量控主力是调和
 
 同一件事说十遍，库里还是一条：新东西 ADD，改口径 UPDATE（**覆盖，不是新增**），重复 NOOP。
 
