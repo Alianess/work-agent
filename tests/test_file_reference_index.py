@@ -212,5 +212,45 @@ class HistoricalVisionContextTests(unittest.TestCase):
         self.assertEqual(prepared.messages, messages)
 
 
+class ImagePayloadTests(unittest.TestCase):
+    """图片是请求里最贵的部分，两处浪费都实测撞过 TPM 上限。"""
+
+    @staticmethod
+    def _photo(path, size=(4000, 3000)):
+        from PIL import Image
+
+        Image.new("RGB", size, (120, 140, 160)).save(path, format="JPEG", quality=95)
+        return path
+
+    def test_a_large_photo_is_downscaled_before_encoding(self) -> None:
+        import base64
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._photo(Path(directory) / "photo.jpeg")
+            raw = len(base64.b64encode(path.read_bytes()))
+
+            mime, encoded = web_server.encode_image_for_model(path, "image/jpeg")
+
+            self.assertEqual(mime, "image/jpeg")
+            self.assertTrue(encoded)
+            # 模型端用不到 4000px，多出来的分辨率只是账单
+            self.assertLess(len(encoded), raw / 2)
+
+    def test_a_small_image_is_sent_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._photo(Path(directory) / "small.jpeg", size=(320, 240))
+            mime, encoded = web_server.encode_image_for_model(path, "image/jpeg")
+            self.assertEqual(mime, "image/jpeg")
+            self.assertTrue(encoded)
+
+    def test_an_unreadable_file_yields_nothing_rather_than_raising(self) -> None:
+        mime, encoded = web_server.encode_image_for_model(Path("/nope/missing.jpeg"), "image/jpeg")
+        self.assertEqual((mime, encoded), ("", ""))
+
+    def test_only_recent_user_turns_carry_their_images(self) -> None:
+        self.assertGreaterEqual(web_server.IMAGE_ATTACH_RECENT_USER_TURNS, 1)
+        self.assertLessEqual(web_server.IMAGE_ATTACH_RECENT_USER_TURNS, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

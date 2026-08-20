@@ -132,6 +132,12 @@ class ModelProfile:
     auth_scheme: str = "Bearer"
     """认证值前缀。为空时直接放裸 key。"""
 
+    stream_idle_timeout_seconds: int = 0
+    """流开始前允许的静默时长；0 表示用全局默认。
+
+    思考型模型带附件时首 token 可能几十秒才出来，全局默认会把正常请求判成超时。
+    """
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelProfile":
         return cls(
@@ -145,6 +151,7 @@ class ModelProfile:
             timeout_seconds=int(data.get("timeout_seconds", 120)),
             auth_header=str(data.get("auth_header") or "Authorization"),
             auth_scheme=str(data.get("auth_scheme", "Bearer")),
+            stream_idle_timeout_seconds=int(data.get("stream_idle_timeout_seconds") or 0),
             supports_vision=(
                 bool(data["supports_vision"])
                 if isinstance(data.get("supports_vision"), bool)

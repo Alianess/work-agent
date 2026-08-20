@@ -16,6 +16,11 @@ from .config import ModelProfile
 Message = dict[str, Any]
 REASONING_EFFORTS = {"light", "medium", "high", "very_high"}
 STREAM_IDLE_TIMEOUT_SECONDS = 45
+"""流开始返回之前允许的静默时长。
+
+对纯文本够用，对"深度思考 + 附件"远远不够：模型在出第一个 token 之前要先读完
+几张图和一份文档。实测 45 秒把 4 轮正常请求判成了超时。profile 可以调高它。
+"""
 RECOVERY_REQUEST_TIMEOUT_SECONDS = 60
 
 
@@ -118,14 +123,41 @@ TRANSPORT_RETRIES = 3
 """How many extra attempts a transport failure gets. Not counting the first."""
 
 TRANSPORT_RETRY_BACKOFF_SECONDS = (0.5, 1.5, 3.0)
+RATE_LIMIT_BACKOFF_SECONDS = (5.0, 15.0, 30.0)
+"""限流要等的是配额窗口，不是网络抖动。半秒后重试只会再撞一次。"""
+
+
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+"""服务端明说"稍后再试"的状态码。
+
+429 的报文里写的就是 Please try again later——把它当成永久失败，等于把一次
+可恢复的限流变成一轮彻底失败。实测一次会话 6 轮全废，其中 2 轮就是 429。
+"""
+
+
+def retryable_status(error: BaseException | None) -> int:
+    """错误链里第一个可重试的 HTTP 状态码，没有则返回 0。"""
+
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        code = getattr(error, "code", None)
+        if isinstance(error, urllib.error.HTTPError) and code in RETRYABLE_STATUS_CODES:
+            return int(code)
+        text = str(error)
+        for status in RETRYABLE_STATUS_CODES:
+            if f"HTTP {status}" in text:
+                return status
+        error = error.__cause__ or error.__context__
+    return 0
 
 
 def is_transport_failure(error: BaseException | None) -> bool:
-    """Did the request fail before the endpoint ever answered?
+    """这次失败值不值得原样再试一次？
 
-    A stream that broke mid-response can be recovered by asking the same
-    endpoint again. A host that could not be reached cannot: retrying the same
-    route just spends the one recovery attempt on the same DNS or TCP failure.
+    分两类：一类是根本没连上（DNS、TCP、超时），另一类是服务端答了但说"稍后
+    再试"（429/5xx）。两者都该退避后重试同一个端点——而"服务端答了但拒绝了你"
+    （401、400）不该重试，再试一百次也一样。
     """
 
     seen: set[int] = set()
@@ -133,12 +165,12 @@ def is_transport_failure(error: BaseException | None) -> bool:
         seen.add(id(error))
         if isinstance(error, (socket.gaierror, ConnectionError, TimeoutError)):
             return True
-        if isinstance(error, urllib.error.URLError) and not isinstance(
-            error, urllib.error.HTTPError
-        ):
+        if isinstance(error, urllib.error.HTTPError):
+            return int(getattr(error, "code", 0)) in RETRYABLE_STATUS_CODES
+        if isinstance(error, urllib.error.URLError):
             return True
         error = error.__cause__ or error.__context__
-    return False
+    return bool(retryable_status(error))
 
 
 class OpenAICompatibleClient:
@@ -313,7 +345,10 @@ class OpenAICompatibleClient:
         finish_reason = None
         usage: dict[str, Any] = {}
         stream_error: RuntimeError | None = None
-        idle_timeout_seconds = min(profile.timeout_seconds, STREAM_IDLE_TIMEOUT_SECONDS)
+        idle_timeout_seconds = min(
+            profile.timeout_seconds,
+            int(getattr(profile, "stream_idle_timeout_seconds", 0) or STREAM_IDLE_TIMEOUT_SECONDS),
+        )
         response_finished = threading.Event()
         try:
             with self._open_request(request, profile=profile, timeout=idle_timeout_seconds) as response:
@@ -610,9 +645,12 @@ class OpenAICompatibleClient:
         recovery_error: Exception | None = None
         for attempt in range(retries + 1):
             if attempt > 0:
-                delay = TRANSPORT_RETRY_BACKOFF_SECONDS[
-                    min(attempt - 1, len(TRANSPORT_RETRY_BACKOFF_SECONDS) - 1)
-                ]
+                schedule = (
+                    RATE_LIMIT_BACKOFF_SECONDS
+                    if retryable_status(cause) in {429, 503}
+                    else TRANSPORT_RETRY_BACKOFF_SECONDS
+                )
+                delay = schedule[min(attempt - 1, len(schedule) - 1)]
                 if cancel_event is not None:
                     if cancel_event.wait(delay):
                         break

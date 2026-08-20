@@ -7288,6 +7288,41 @@ def refresh_conversation_image_paths(
     return image_paths
 
 
+IMAGE_ATTACH_RECENT_USER_TURNS = 2
+IMAGE_MAX_EDGE_PIXELS = 1568
+"""模型端用不到更高的分辨率，多出来的像素只是账单。"""
+
+IMAGE_MAX_ENCODED_BYTES = 900 * 1024
+
+
+def encode_image_for_model(path: Path, mime_type: str) -> tuple[str, str]:
+    """把图片压到模型真正用得上的尺寸，再编码。
+
+    一张 iPhone 原图 2.7MB / 4000×3000，base64 之后 3.7MB；两张就是 7MB。
+    而模型最多用到长边 1568px——多出来的分辨率一点用没有，纯烧 token，
+    实测直接把请求顶到 TPM 上限。
+    """
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return "", ""
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as image:
+            image.load()
+            if max(image.size) > IMAGE_MAX_EDGE_PIXELS or len(raw) > IMAGE_MAX_ENCODED_BYTES:
+                image.thumbnail((IMAGE_MAX_EDGE_PIXELS, IMAGE_MAX_EDGE_PIXELS))
+                buffer = io.BytesIO()
+                image.convert("RGB").save(buffer, format="JPEG", quality=85, optimize=True)
+                return "image/jpeg", base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:
+        # 压不动就按原样发：宁可贵一点，也不要让附件消失。
+        pass
+    return mime_type, base64.b64encode(raw).decode("ascii")
+
+
 def enrich_image_attachments_for_model(
     messages: list[dict[str, Any]],
     profile: ModelProfile,
@@ -7309,6 +7344,14 @@ def enrich_image_attachments_for_model(
     seen_paths: set[str] = set()
     attached_count = 0
     skipped_count = 0
+    # 只给最近几条用户消息附图。以前每一轮都把历史里所有图重新编码上传一遍，
+    # 第五轮会再传一次第三轮的图——两张手机照片就是 7MB，几轮下来必然撞限流。
+    user_positions = [
+        position
+        for position, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    attachable = set(user_positions[-IMAGE_ATTACH_RECENT_USER_TURNS:])
     candidate_names = {
         name
         for message in messages
@@ -7322,8 +7365,12 @@ def enrich_image_attachments_for_model(
             workspace_root=root,
             index_path=index_path,
         )
-    for message in messages:
+    for position, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") != "user":
+            enriched.append(message)
+            continue
+        if position not in attachable:
+            # 早先的图不再重传，正文里的文件名仍在，模型要看可以自己去读。
             enriched.append(message)
             continue
         text = str(message.get("content") or "")
@@ -7347,13 +7394,12 @@ def enrich_image_attachments_for_model(
             if not profile.supports_vision:
                 skipped_count += 1
                 continue
-            try:
-                encoded = base64.b64encode(candidate.read_bytes()).decode("ascii")
-            except OSError:
+            encoded_mime, encoded = encode_image_for_model(candidate, mime_type)
+            if not encoded:
                 continue
             parts.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+                "image_url": {"url": f"data:{encoded_mime};base64,{encoded}"},
             })
             attached_count += 1
         if len(parts) > 1:

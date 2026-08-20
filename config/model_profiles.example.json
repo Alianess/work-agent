@@ -23,7 +23,8 @@
       "temperature": 0.6,
       "max_tokens": 32768,
       "timeout_seconds": 300,
-      "supports_vision": true
+      "supports_vision": true,
+      "stream_idle_timeout_seconds": 180
     }
   ]
 }
