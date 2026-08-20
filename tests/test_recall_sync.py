@@ -159,5 +159,94 @@ class FileSyncTests(unittest.TestCase):
             self.assertTrue(sync.index_file(path).skipped)
 
 
+class AutoIndexTests(unittest.TestCase):
+    """新内容要自己进索引，不靠谁记得去调。"""
+
+    def test_a_finished_turn_indexes_itself(self) -> None:
+        from work_agent_core.recall.tools import index_conversation_async, recall_index_for
+
+        root = Path(tempfile.mkdtemp())
+        log = SessionLog(SessionHeader(session_id="c-new"))
+        log.append("turn/start", {"turn_id": "t1"})
+        log.append("step/start", {"step": 1})
+        log.append("user/message", {"content": "罍街展厅的施工延期会影响十月对接会吗？"})
+        log.append("assistant/message", {"content": "会，展厅施工延期约两个月。"})
+        log.append("turn/end", {"reason": "completed"})
+
+        index_conversation_async(root, "c-new", log, title="罍街展厅").join(timeout=10)
+
+        index = recall_index_for(root)
+        hits = index.lexical_candidates("罍街 施工 延期")
+        self.assertTrue(hits)
+        self.assertEqual(index.node(hits[0])["source_kind"], "chat")
+
+    def test_any_workspace_write_notifies_even_without_an_explicit_handler(self) -> None:
+        """十五处地方各自构造 WorkspaceFiles，靠"记得传"必然漏。
+
+        实测会议纪要技能就漏了——它写的 ASR 转写稿和纪要从来没进过索引。
+        """
+
+        from work_agent_core.tools import WorkspaceFiles, set_default_file_change_handler
+
+        seen: list[Path] = []
+        set_default_file_change_handler(seen.append)
+        self.addCleanup(set_default_file_change_handler, None)
+        root = Path(tempfile.mkdtemp())
+
+        WorkspaceFiles(root).write_text({"path": "asr_full/x/transcript.md", "content": "转写内容。"})
+
+        self.assertEqual([path.name for path in seen], ["transcript.md"])
+
+    def test_an_explicit_handler_still_wins(self) -> None:
+        from work_agent_core.tools import WorkspaceFiles, set_default_file_change_handler
+
+        fallback: list[Path] = []
+        explicit: list[Path] = []
+        set_default_file_change_handler(fallback.append)
+        self.addCleanup(set_default_file_change_handler, None)
+
+        WorkspaceFiles(
+            Path(tempfile.mkdtemp()), on_file_changed=explicit.append
+        ).write_text({"path": "a.md", "content": "x"})
+
+        self.assertEqual([path.name for path in explicit], ["a.md"])
+        self.assertEqual(fallback, [])
+
+
+class TranscriptClassificationTests(unittest.TestCase):
+    def test_our_own_transcript_output_is_not_filed_as_a_document(self) -> None:
+        from work_agent_core.recall.chunking import classify_source
+
+        for path in (
+            "meet_files/asr_full/x/transcript.txt",
+            "meet_files/文字稿/20260731-新录音_会议沟通内容整理_ASR转写稿_Qwen3.md",
+            "meet_files/asr_outputs/b.txt",
+        ):
+            self.assertEqual(classify_source(Path(path), Path(".")), "transcript", path)
+
+    def test_real_materials_stay_documents(self) -> None:
+        from work_agent_core.recall.chunking import classify_source
+
+        for path in ("meet_files/材料/报市稿.docx", "meet_files/材料/0707会议纪要.docx"):
+            self.assertEqual(classify_source(Path(path), Path(".")), "document", path)
+
+
+class PoisonedLogTests(unittest.TestCase):
+    def test_base64_never_reaches_the_index(self) -> None:
+        """写入侧修好了，读取侧仍要扛得住历史数据。"""
+
+        from work_agent_core.recall.sync import readable_content
+
+        blocks = [
+            {"type": "text", "text": "我记的笔记"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQSkZJRg"}},
+        ]
+        self.assertEqual(readable_content(blocks), "我记的笔记")
+        self.assertEqual(
+            readable_content("看这个 data:image/png;base64,iVBORw0KGgo 就是它"),
+            "看这个 [图片] 就是它",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

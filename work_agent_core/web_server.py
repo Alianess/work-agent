@@ -112,7 +112,7 @@ from .runtime_env import (
 from .session_store import SessionStore, repair_runtime_message_sequence, sanitize_conversation_id
 from .skills.meeting_minutes import MeetingMinutesSkill
 from .skill_runtime import load_skill_manifests
-from .tools import WorkspaceFiles
+from .tools import set_default_file_change_handler, WorkspaceFiles
 from .turn_runtime import TurnCancelled, TurnRuntime
 from .turn_store import TERMINAL_STATUSES, TurnStore, sanitize_turn_id
 from .weixin_channel import WeixinGatewayManager
@@ -8318,6 +8318,10 @@ def update_file_reference_index(path: Path) -> None:
 
     account_file_reference_index().upsert(path)
     index_file_async(user_data_dir(), path, workspace_root=account_workspace_root())
+
+
+# 任何 WorkspaceFiles 写入都走这里，不管是谁构造的它。
+set_default_file_change_handler(update_file_reference_index)
 
 
 def remove_from_file_reference_index(path: Path) -> None:

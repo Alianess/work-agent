@@ -57,6 +57,21 @@ class ToolRegistry:
         return "\n".join(tool.render_for_prompt() for tool in self.list())
 
 
+_DEFAULT_FILE_CHANGE_HANDLER: Callable[[Path], None] | None = None
+
+
+def set_default_file_change_handler(handler: Callable[[Path], None] | None) -> None:
+    """所有 WorkspaceFiles 写入的默认通知目标。
+
+    十五处地方各自构造 WorkspaceFiles，靠"记得传 on_file_changed"必然漏——
+    实测会议纪要技能就漏了，它写出来的 ASR 转写稿和纪要从来没进过检索索引。
+    默认值放在这里，新增技能不必知道索引的存在也不会漏。
+    """
+
+    global _DEFAULT_FILE_CHANGE_HANDLER
+    _DEFAULT_FILE_CHANGE_HANDLER = handler
+
+
 class WorkspaceFiles:
     def __init__(
         self,
@@ -345,10 +360,11 @@ class WorkspaceFiles:
         return path
 
     def _notify_file_changed(self, path: Path) -> None:
-        if self.on_file_changed is None:
+        handler = self.on_file_changed or _DEFAULT_FILE_CHANGE_HANDLER
+        if handler is None:
             return
         try:
-            self.on_file_changed(path)
+            handler(path)
         except Exception:
             # File writes are authoritative. Index maintenance must never turn
             # a successful user edit into a failed tool call.
