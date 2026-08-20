@@ -804,7 +804,7 @@ class ReActAgent:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "以下是刚才用 view_image 载入的图片。"},
+                            {"type": "text", "text": "以下是刚才用 read_file 载入的图片。"},
                             *attachments,
                         ],
                     }
