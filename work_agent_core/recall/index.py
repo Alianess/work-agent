@@ -134,8 +134,11 @@ class RecallIndex:
                 is_leaf INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0,
                 ordinal INTEGER NOT NULL DEFAULT 0,
-                node_hash TEXT NOT NULL DEFAULT ''
+                node_hash TEXT NOT NULL DEFAULT '',
+                text_hash TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT ''
             );
+            CREATE INDEX IF NOT EXISTS recall_nodes_text_idx ON recall_nodes(text_hash);
             CREATE INDEX IF NOT EXISTS recall_nodes_source_idx ON recall_nodes(source_id);
             CREATE INDEX IF NOT EXISTS recall_nodes_parent_idx ON recall_nodes(parent_id);
             CREATE INDEX IF NOT EXISTS recall_nodes_time_idx ON recall_nodes(occurred_at);
@@ -146,12 +149,15 @@ class RecallIndex:
                 tokenize='unicode61 remove_diacritics 2'
             );
 
+            -- 向量按**正文哈希**存，不按节点存：同一份材料的 docx/md/pdf 三种渲染、
+            -- 散在多个归档目录里的同一个文件，正文一样就共用一条向量。
+            -- 实测 186480 个叶子去重后只剩 14458 条不同正文，省掉 92% 的 embedding 调用。
             CREATE TABLE IF NOT EXISTS recall_vectors (
-                node_id TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
                 model TEXT NOT NULL,
                 dim INTEGER NOT NULL,
                 embedding BLOB NOT NULL,
-                PRIMARY KEY (node_id, model)
+                PRIMARY KEY (text_hash, model)
             );
 
             -- 知识图谱接缝：节点与实体的关联。图还没建，表先在这里，
@@ -167,6 +173,16 @@ class RecallIndex:
                 ON recall_node_entities(entity_id);
             """
         )
+        # 老库补列：索引是投影，删了能重建，但没必要为一列强迫重建。
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(recall_nodes)").fetchall()
+        }
+        for name in ("node_hash", "text_hash", "summary"):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE recall_nodes ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                )
 
     # ------------------------------------------------------------------
     # 写入
@@ -234,14 +250,18 @@ class RecallIndex:
                 row = node.to_row()
                 row["ordinal"] = ordinal
                 row["node_hash"] = node_hash
+                # 正文哈希单独存：同一份材料的 docx/md/pdf 三种渲染、以及散在多个
+                # 归档目录里的同一个文件，内容一样但路径不同，只能靠它去重。
+                row["text_hash"] = content_hash(node.searchable_body())
                 connection.execute(
                     """
                     INSERT INTO recall_nodes
                         (id, source_id, source_kind, parent_id, title, path, text,
-                         header, occurred_at, is_leaf, tokens, ordinal, node_hash)
+                         header, occurred_at, is_leaf, tokens, ordinal, node_hash,
+                         text_hash)
                     VALUES (:id, :source_id, :source_kind, :parent_id, :title, :path,
                             :text, :header, :occurred_at, :is_leaf, :tokens, :ordinal,
-                            :node_hash)
+                            :node_hash, :text_hash)
                     """,
                     row,
                 )
@@ -289,7 +309,7 @@ class RecallIndex:
     @staticmethod
     def _delete_node(connection: sqlite3.Connection, node_id_value: str) -> None:
         connection.execute("DELETE FROM recall_fts WHERE node_id = ?", (node_id_value,))
-        connection.execute("DELETE FROM recall_vectors WHERE node_id = ?", (node_id_value,))
+        # 不删向量：它按正文哈希共享，别的节点可能还在用。孤儿向量由 vacuum 清理。
         connection.execute("DELETE FROM recall_node_entities WHERE node_id = ?", (node_id_value,))
         connection.execute("DELETE FROM recall_nodes WHERE id = ?", (node_id_value,))
 
@@ -308,11 +328,6 @@ class RecallIndex:
     def _delete_source(connection: sqlite3.Connection, source_id: str) -> None:
         connection.execute(
             "DELETE FROM recall_fts WHERE node_id IN"
-            " (SELECT id FROM recall_nodes WHERE source_id = ?)",
-            (source_id,),
-        )
-        connection.execute(
-            "DELETE FROM recall_vectors WHERE node_id IN"
             " (SELECT id FROM recall_nodes WHERE source_id = ?)",
             (source_id,),
         )
@@ -339,6 +354,21 @@ class RecallIndex:
             ).fetchone()
         return dict(row) if row else None
 
+    def display_node(self, node_id_value: str) -> dict[str, Any] | None:
+        """匹配到窗口，返回包住它的展示单元。
+
+        窗口只为命中准而存在，本身读起来是半截的；它的父节点才是完整的一段。
+        没有父节点（整节就是一块）时返回它自己。
+        """
+
+        node = self.node(node_id_value)
+        if node is None:
+            return None
+        if not node["is_leaf"] or not node["parent_id"]:
+            return node
+        parent = self.node(str(node["parent_id"]))
+        return parent if parent is not None else node
+
     def ancestors(self, node_id_value: str) -> list[dict[str, Any]]:
         chain: list[dict[str, Any]] = []
         current = self.node(node_id_value)
@@ -351,19 +381,25 @@ class RecallIndex:
         return chain
 
     def neighbors(self, node_id_value: str) -> dict[str, str]:
-        current = self.node(node_id_value)
+        """前一段与后一段——都在**展示单元**这一层。
+
+        往后看是"这件事后来怎么样了"，往前看是"为什么会有这一段"。兄弟窗口是
+        半句挨半句，回答不了这两个问题；兄弟展示单元才可以。
+        """
+
+        current = self.display_node(node_id_value)
         if current is None:
             return {}
+        current_id = str(current["id"])
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, ordinal FROM recall_nodes"
-                " WHERE parent_id = ? AND is_leaf = 1 ORDER BY ordinal",
+                "SELECT id FROM recall_nodes WHERE parent_id = ? ORDER BY ordinal",
                 (current["parent_id"],),
             ).fetchall()
         ids = [str(row["id"]) for row in rows]
-        if node_id_value not in ids:
+        if current_id not in ids:
             return {}
-        position = ids.index(node_id_value)
+        position = ids.index(current_id)
         found: dict[str, str] = {}
         if position > 0:
             found["prev"] = ids[position - 1]
@@ -398,13 +434,17 @@ class RecallIndex:
         return [str(row["id"]) for row in rows]
 
     def leaves_without_vectors(self, model: str, *, limit: int = 256) -> list[dict[str, Any]]:
+        """每种不同正文只返回一个代表。重复内容不该重复付费。"""
+
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT n.* FROM recall_nodes n
-                LEFT JOIN recall_vectors v ON v.node_id = n.id AND v.model = ?
-                WHERE n.is_leaf = 1 AND v.node_id IS NULL
-                ORDER BY n.occurred_at DESC
+                SELECT n.id, n.path, n.text, n.header, n.text_hash, MAX(n.occurred_at) AS occurred_at
+                FROM recall_nodes n
+                LEFT JOIN recall_vectors v ON v.text_hash = n.text_hash AND v.model = ?
+                WHERE n.is_leaf = 1 AND n.text_hash != '' AND v.text_hash IS NULL
+                GROUP BY n.text_hash
+                ORDER BY occurred_at DESC
                 LIMIT ?
                 """,
                 (model, int(limit)),
@@ -412,15 +452,17 @@ class RecallIndex:
         return [dict(row) for row in rows]
 
     def store_vectors(self, model: str, vectors: Iterable[tuple[str, Sequence[float]]]) -> int:
+        """按正文哈希写入。传入的第一项是 text_hash，不是 node_id。"""
+
         written = 0
         with self._connect() as connection:
-            for node_id_value, values in vectors:
-                if not values:
+            for text_hash, values in vectors:
+                if not values or not text_hash:
                     continue
                 connection.execute(
-                    "INSERT OR REPLACE INTO recall_vectors (node_id, model, dim, embedding)"
+                    "INSERT OR REPLACE INTO recall_vectors (text_hash, model, dim, embedding)"
                     " VALUES (?, ?, ?, ?)",
-                    (node_id_value, model, len(values), pack_vector(values)),
+                    (text_hash, model, len(values), pack_vector(values)),
                 )
                 written += 1
         return written
@@ -431,18 +473,35 @@ class RecallIndex:
         *,
         filters: NodeFilter | None = None,
     ) -> list[tuple[str, list[float]]]:
+        """返回 (node_id, 向量)。多个节点共用一条向量时各自返回一行。"""
+
         where, params = (filters or NodeFilter()).where()
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT v.node_id AS node_id, v.embedding AS embedding
+                SELECT n.id AS node_id, v.embedding AS embedding
                 FROM recall_vectors v
-                JOIN recall_nodes n ON n.id = v.node_id
+                JOIN recall_nodes n ON n.text_hash = v.text_hash
                 WHERE v.model = ? AND {where}
                 """,
                 [model, *params],
             ).fetchall()
         return [(str(row["node_id"]), unpack_vector(row["embedding"])) for row in rows]
+
+    def vector_coverage(self, model: str) -> dict[str, int]:
+        with self._connect() as connection:
+            distinct = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT text_hash) AS c FROM recall_nodes"
+                    " WHERE is_leaf = 1 AND text_hash != ''"
+                ).fetchone()["c"]
+            )
+            done = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM recall_vectors WHERE model = ?", (model,)
+                ).fetchone()["c"]
+            )
+        return {"distinct_texts": distinct, "embedded": done, "remaining": max(0, distinct - done)}
 
     # ------------------------------------------------------------------
     # 知识图谱接缝
@@ -477,6 +536,20 @@ class RecallIndex:
             )
             for row in rows
         ]
+
+    def vacuum_vectors(self) -> int:
+        """清掉没有任何节点再引用的向量。
+
+        向量按正文共享，所以删节点时不能顺手删它。孤儿在这里统一回收，
+        代价是一次全表扫描，所以不放在写入路径上。
+        """
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM recall_vectors WHERE text_hash NOT IN"
+                " (SELECT DISTINCT text_hash FROM recall_nodes WHERE is_leaf = 1)"
+            )
+            return int(cursor.rowcount or 0)
 
     def stats(self) -> dict[str, int]:
         with self._connect() as connection:

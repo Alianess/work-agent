@@ -12,6 +12,7 @@ from .llm import OpenAICompatibleClient
 from .mcp_provider import build_mcp_tool_provider
 from .mcp_gateway import MCPGateway
 from .react import DEFAULT_MAX_STEPS, ReActAgent
+from .recall.tools import register_recall_tools
 from .shell_tools import register_shell_tools
 from .skills.meeting_minutes import MeetingMinutesSkill, register_meeting_minutes_skill
 from .skill_runtime import register_skill_runtime_tools
@@ -153,6 +154,8 @@ def build_default_tools(
             conversation_id,
             project_id=str(project_id or ""),
         )
+    # 统一检索：材料、纪要、聊天走同一个索引，命中最小片段并给出标价的展开地图。
+    register_recall_tools(core_tools.registry, Path(private_workspace))
     if friday_notification_handler is not None:
         core_tools.registry.register(
             Tool(

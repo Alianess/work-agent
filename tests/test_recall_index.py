@@ -78,9 +78,11 @@ class IncrementalIndexTests(unittest.TestCase):
 
         index.forget_source("doc:报市稿")
 
-        self.assertEqual(index.stats(), {
-            "sources": 0, "nodes": 0, "leaves": 0, "vectors": 0, "entity_links": 0
-        })
+        stats = index.stats()
+        self.assertEqual(
+            {key: stats[key] for key in ("sources", "nodes", "leaves", "entity_links")},
+            {"sources": 0, "nodes": 0, "leaves": 0, "entity_links": 0},
+        )
 
 
 class LexicalTests(unittest.TestCase):
@@ -109,11 +111,41 @@ class VectorStoreTests(unittest.TestCase):
         pending = index.leaves_without_vectors("m1")
         self.assertTrue(pending)
 
-        index.store_vectors("m1", [(pending[0]["id"], [0.1, 0.2, 0.3])])
+        index.store_vectors("m1", [(pending[0]["text_hash"], [0.1, 0.2, 0.3])])
 
         stored = dict(index.vectors_for("m1"))
         self.assertEqual([round(value, 3) for value in stored[pending[0]["id"]]], [0.1, 0.2, 0.3])
         self.assertLess(len(index.leaves_without_vectors("m1")), len(pending))
+
+    def test_identical_text_in_two_files_shares_one_vector(self) -> None:
+        """同一份材料的 docx/md/pdf 三种渲染只该付一次 embedding 的钱。"""
+
+        index = fresh_index()
+        body = "一、结论\n\n中试基地的选址已经确定，由工信局牵头推进。\n"
+        for name in ("doc:a", "doc:b", "doc:c"):
+            index.upsert_tree(build_document_tree(source_id=name, title=name, text=f"# {name}\n\n{body}"))
+
+        pending = index.leaves_without_vectors("m1", limit=100)
+
+        self.assertEqual(len(pending), 1)
+        index.store_vectors("m1", [(pending[0]["text_hash"], [0.5, 0.5])])
+        # 一条向量，三个节点都能用上
+        self.assertEqual(len(index.vectors_for("m1")), 3)
+        self.assertEqual(index.vector_coverage("m1"), {
+            "distinct_texts": 1, "embedded": 1, "remaining": 0
+        })
+
+    def test_orphan_vectors_are_reclaimed_only_on_vacuum(self) -> None:
+        index, _ = indexed()
+        pending = index.leaves_without_vectors("m1")
+        index.store_vectors("m1", [(row["text_hash"], [0.1, 0.2]) for row in pending])
+
+        index.forget_source("doc:报市稿")
+
+        # 删来源不顺手删向量：它按正文共享，别的节点可能还在用
+        self.assertGreater(index.stats()["vectors"], 0)
+        self.assertGreater(index.vacuum_vectors(), 0)
+        self.assertEqual(index.stats()["vectors"], 0)
 
 
 class ExpandMapTests(unittest.TestCase):
@@ -263,7 +295,10 @@ class GraphSeamTests(unittest.TestCase):
             RecallDeps(index=index, graph=_Graph()), "基地", entity_names=["中试基地"], now_ms=now
         )
 
-        self.assertEqual([item["id"] for item in out["results"]], [target])
+        # 命中的是那个窗口，返回的是包住它的展示单元
+        self.assertEqual(
+            [item["id"] for item in out["results"]], [index.display_node(target)["id"]]
+        )
 
     def test_neighbour_expansion_only_runs_when_asked(self) -> None:
         class _Graph(NullGraphStore):

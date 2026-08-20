@@ -86,6 +86,13 @@ from .session_log_store import DurableTurnMirror, SessionLogStore
 from .attention import ObserverContext, SpokenLedger, compose_message, select_observations
 from .observers import build_default_registry
 from .work_ledger import build_work_ledger, merge_ledgers
+from .recall.tools import (
+    backfill_vectors_once,
+    index_file_async,
+    index_conversation_async,
+    recall_status,
+    sync_for,
+)
 from .runtime_profiles import resolve_profile
 from .session_runtime import ConversationRuntime
 from .react import (
@@ -561,6 +568,7 @@ def friday_scheduler_loop() -> None:
                     append_friday_proactive_message(str(item.get("body") or ""))
                     notification_store.mark_delivered(str(item.get("id") or ""))
                 run_attention_pass(user)
+                run_recall_maintenance(user)
             except Exception as error:
                 print(f"[friday-scheduler] user={user.id}: {type(error).__name__}: {error}")
             finally:
@@ -569,6 +577,26 @@ def friday_scheduler_loop() -> None:
                 elif hasattr(REQUEST_AUTH, "user"):
                     delattr(REQUEST_AUTH, "user")
         FRIDAY_SCHEDULER_STOP.wait(5)
+
+
+RECALL_MAINTENANCE_INTERVAL_SECONDS = 60
+RECALL_LAST_MAINTENANCE: dict[int, float] = {}
+
+
+def run_recall_maintenance(user: AuthUser) -> None:
+    """补算向量。走网络，所以永远是后台的第二步。
+
+    词法索引在轮末已经同步做完，新内容立刻能被找到；这里只是让稠密召回追上。
+    补不上也不影响检索可用，所以失败只记一行，不抛。
+    """
+
+    now = time.time()
+    if now - RECALL_LAST_MAINTENANCE.get(user.id, 0.0) < RECALL_MAINTENANCE_INTERVAL_SECONDS:
+        return
+    RECALL_LAST_MAINTENANCE[user.id] = now
+    outcome = backfill_vectors_once(user_data_dir(user))
+    if outcome.get("error"):
+        print(f"[recall] user={user.id}: 向量补算未完成：{outcome['error']}")
 
 
 ATTENTION_INTERVAL_SECONDS = 15 * 60
@@ -6700,6 +6728,13 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         session.summary = prepared_context.summary
         session.summary_message_count = prepared_context.summary_message_count
         store.save(session)
+        # 让检索索引跟上这一轮。后台线程：索引写入不许挡住回复。
+        index_conversation_async(
+            account_workspace_root(),
+            conversation_id,
+            conversation_runtime.log,
+            title=str(session.title or conversation_id),
+        )
 
     session_saved_after_run = False
     if image_preparation.notice:
@@ -8196,6 +8231,7 @@ def update_file_reference_index(path: Path) -> None:
     """Immediately register a file created through a known Work Agent route."""
 
     account_file_reference_index().upsert(path)
+    index_file_async(account_workspace_root(), path)
 
 
 def remove_from_file_reference_index(path: Path) -> None:

@@ -62,17 +62,25 @@ def snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
 
 
 def _expand_map(index: RecallIndex, node_id_value: str) -> dict[str, dict[str, Any]]:
-    """祖先链转成标价的展开选项：up1 / up2 / … / file。"""
+    """祖先链转成标价的展开选项：up1 / up2 / … / file。
+
+    每项带 tokens（要花多少）和 summary（里面是什么）。只有价格没有货物，
+    选择仍然是盲的——摘要补的正是这一半。
+    """
 
     chain = index.ancestors(node_id_value)
     options: dict[str, dict[str, Any]] = {}
     for depth, ancestor in enumerate(chain, start=1):
         key = "file" if depth == len(chain) else f"up{depth}"
-        options[key] = {
+        option = {
             "id": str(ancestor["id"]),
             "title": str(ancestor["title"] or ""),
             "tokens": int(ancestor["tokens"]),
         }
+        summary = str(ancestor["summary"] or "")
+        if summary:
+            option["summary"] = summary
+        options[key] = option
     return options
 
 
@@ -142,8 +150,13 @@ def search(
             "note": "没有命中。换用当时出现过的专名、文件名或另一种说法再试。",
         }
 
-    rows = {node_id_value: index.node(node_id_value) for node_id_value in candidates}
-    rows = {key: value for key, value in rows.items() if value}
+    # 命中发生在窗口上，返回的是包住它的展示单元。窗口切小是为了匹配准，
+    # 给模型看的却该是一段读得完整的正文——两件事分开，谁也不必迁就谁。
+    rows: dict[str, Any] = {}
+    for node_id_value in candidates:
+        row = index.display_node(node_id_value)
+        if row is not None:
+            rows.setdefault(str(row["id"]), row)
 
     relevance: list[str]
     reranked = False
@@ -182,12 +195,23 @@ def search(
 
     results: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
+    # 同一份材料常常同时存在 docx / md / pdf 三种渲染，还会散在多个归档目录里。
+    # 按正文哈希去重，只给模型看一份，其余折算成一个计数——重复不该占预算。
+    seen_text: dict[str, int] = {}
+    duplicates = 0
     for node_id_value in final:
         row = rows[node_id_value]
+        text_key = str(row["text_hash"] or "")
+        if text_key and text_key in seen_text:
+            results[seen_text[text_key]]["duplicates"] += 1
+            duplicates += 1
+            continue
         path_key = f"{row['source_id']}|{row['path']}"
         if path_key in seen_paths:
             continue
         seen_paths.add(path_key)
+        if text_key:
+            seen_text[text_key] = len(results)
         results.append(
             {
                 "id": node_id_value,
@@ -200,6 +224,7 @@ def search(
                 "occurred_at": int(row["occurred_at"] or 0),
                 "expand": _expand_map(index, node_id_value),
                 "neighbors": index.neighbors(node_id_value),
+                "duplicates": 0,
             }
         )
         if len(results) >= top_k:
@@ -214,6 +239,7 @@ def search(
             "dense": len(dense),
             "reranked": reranked,
             "recency_weight": recency_weight,
+            "duplicates_folded": duplicates,
             "degraded": degraded,
         },
         "note": (
@@ -279,6 +305,7 @@ def expand(
                 "id": str(row["id"]),
                 "title": str(row["title"] or snippet(str(row["text"]), 40)),
                 "tokens": int(row["tokens"]),
+                **({"summary": str(row["summary"])} if row["summary"] else {}),
             }
             for row in _children(index, str(target["id"]))
         ]
@@ -308,7 +335,7 @@ def expand(
 def _children(index: RecallIndex, node_id_value: str) -> list[dict[str, Any]]:
     with index._connect() as connection:  # noqa: SLF001 - 同包内部读取
         rows = connection.execute(
-            "SELECT id, title, text, tokens FROM recall_nodes"
+            "SELECT id, title, text, tokens, summary FROM recall_nodes"
             " WHERE parent_id = ? ORDER BY ordinal",
             (node_id_value,),
         ).fetchall()

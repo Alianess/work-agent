@@ -44,7 +44,10 @@ def turns_from_log(log: SessionLog) -> list[dict[str, Any]]:
     for event in log.events:
         if event.type == TURN_START:
             current = {
-                "title": str(dict(event.data).get("turn_id") or f"第 {len(turns) + 1} 轮"),
+                # 标题先留空，等第一条用户消息到了再取它的开头当标题。
+                # turn id 当标题等于没有标题：一串 turn-1787123863871-cff1671e
+                # 排在一起，目录就退化成一列看不懂的编号。
+                "title": "",
                 "occurred_at": int(event.ts_ms or 0),
                 "messages": [],
             }
@@ -56,14 +59,29 @@ def turns_from_log(log: SessionLog) -> list[dict[str, Any]]:
             current = {"title": "第 1 轮", "occurred_at": int(event.ts_ms or 0), "messages": []}
             turns.append(current)
         content = str(dict(event.data).get("content") or "").strip()
-        if content:
-            current["messages"].append(
-                {
-                    "role": "user" if event.type == USER_MESSAGE else "assistant",
-                    "content": content,
-                }
-            )
-    return [turn for turn in turns if turn["messages"]]
+        if not content:
+            continue
+        role = "user" if event.type == USER_MESSAGE else "assistant"
+        if role == "user" and not current["title"]:
+            current["title"] = turn_title(content)
+        current["messages"].append({"role": role, "content": content})
+    kept = [turn for turn in turns if turn["messages"]]
+    for position, turn in enumerate(kept, start=1):
+        if not turn["title"]:
+            turn["title"] = f"第 {position} 轮"
+    return kept
+
+
+def turn_title(content: str) -> str:
+    """用用户那句话的开头当轮标题。
+
+    目录要一眼看得懂才叫目录。用户说的第一句话是这一轮最短、最准的概括，
+    比任何自动生成的标题都便宜。
+    """
+
+    text = " ".join(str(content or "").split())
+    text = text.split("【附件】")[0].strip()
+    return text[:24] + ("…" if len(text) > 24 else "")
 
 
 @dataclass
@@ -90,9 +108,17 @@ class SyncReport:
 class RecallSync:
     """索引维护：会话、文件、向量补算。"""
 
-    def __init__(self, index: RecallIndex, *, aliases_for: Any | None = None) -> None:
+    def __init__(
+        self,
+        index: RecallIndex,
+        *,
+        aliases_for: Any | None = None,
+        workspace_root: str | Path | None = None,
+    ) -> None:
         self.index = index
         self.aliases_for = aliases_for
+        # 来源标识相对它计算，这样同名文件不会互相覆盖，路径也保持可读。
+        self.workspace_root = Path(workspace_root) if workspace_root else None
 
     # ------------------------------------------------------------------
     # 会话
@@ -136,7 +162,7 @@ class RecallSync:
                 return UpsertReport(skipped=True)
         except OSError:
             return UpsertReport(skipped=True)
-        tree = build_file_tree(resolved, source_id=source_id)
+        tree = build_file_tree(resolved, source_id=source_id, relative_to=self.workspace_root)
         return self.index.upsert_tree(
             tree, uri=resolved.as_posix(), aliases_for=self.aliases_for
         )
@@ -153,6 +179,8 @@ class RecallSync:
         report = SyncReport()
         skip = set(skip_directories)
         base = Path(root)
+        if self.workspace_root is None:
+            self.workspace_root = base
         seen = 0
         for path in sorted(base.rglob("*")):
             if limit and seen >= limit:
@@ -192,7 +220,7 @@ class RecallSync:
         written = self.index.store_vectors(
             embedding.model,
             [
-                (str(row["id"]), normalize(vector))
+                (str(row["text_hash"]), normalize(vector))
                 for row, vector in zip(pending, vectors)
             ],
         )
@@ -200,9 +228,9 @@ class RecallSync:
         return {"pending": len(pending), "written": written, "more": bool(remaining)}
 
     def vector_debt(self, model: str) -> int:
-        """还有多少叶子没有向量。用来判断补算是否跟得上。"""
+        """还有多少种不同正文没有向量。用来判断补算是否跟得上。"""
 
-        return len(self.index.leaves_without_vectors(model, limit=100_000))
+        return self.index.vector_coverage(model)["remaining"]
 
 
 def _leaf_text(row: dict[str, Any]) -> str:

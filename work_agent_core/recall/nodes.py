@@ -169,7 +169,9 @@ class MemoryTree:
             return "\n\n".join(parts)
 
         for node in self.nodes:
-            if not node.is_leaf:
+            # 已经自带正文的内部节点（展示单元 passage）不覆盖：它的子窗口彼此
+            # 重叠，拼起来会把同一句话重复两遍。
+            if not node.is_leaf and not node.text.strip():
                 node.text = compose(node)
 
     def iter_depth_first(self) -> Iterator[MemoryNode]:

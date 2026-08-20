@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 import re
@@ -25,10 +26,42 @@ from .nodes import (
 )
 
 
-LEAF_TARGET_TOKENS = 260
-LEAF_MAX_TOKENS = 420
-LEAF_MIN_TOKENS = 60
-TABLE_ROWS_PER_LEAF = 12
+# 三层，各管各的事：
+#
+#   章节 section   跟着标题走，可能上万 token —— 用来定位"在文件的哪一部分"
+#   展示段 passage 约 500t，不重叠     —— 命中后返回给模型的就是它
+#   匹配窗口 window 约 200t，15% 重叠  —— 只进索引，从不直接返回
+#
+# 窗口切小是为了命中准，展示段切大是为了读得完整。两件事分开，谁也不必迁就谁。
+# 参数对齐 V5_dev 的实战值（其检索拿过研点赛全国第一），单位换成 token：
+# 目标 160 units ≈ 中文 160 字，实测子块中位 223 字符。
+WINDOW_TARGET_TOKENS = 200
+WINDOW_OVERLAP_TOKENS = 30
+"""相邻叶子重叠约 15%。
+
+不重叠的代价很具体：答案跨在两段之间时会被切成两半，命中哪一半都不完整。
+有重叠则至少有一块完整包含它。这是滑动窗口存在的唯一理由，也是它值得付出的
+索引膨胀（约 15%）。
+"""
+
+WINDOW_MIN_TOKENS = 70
+"""短尾并入前一块。一个二十字的窗口命中了也说明不了什么。"""
+
+WINDOW_MAX_TOKENS = 300
+WINDOW_WHOLE_MAX_TOKENS = 200
+"""整段不超过目标就整块保留，不为了切而切。"""
+
+PASSAGE_TARGET_TOKENS = 500
+PASSAGE_MAX_TOKENS = 700
+"""展示单元的大小。
+
+匹配和展示是两件事：窗口切小是为了命中准，返回给模型的却该是一段读得完整的
+正文。所以命中发生在窗口上，返回的是包住它的这一段——V5_dev 的
+RETURN_PARENT_SECTION 就是这个意思。
+"""
+
+TABLE_TOKENS_PER_WINDOW = 260
+"""表格按 token 预算切，不按行数。一行长短差几十倍，按行数切必然爆块。"""
 
 _MD_HEADING = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 # 中文公文的层级编号。顺序即层级。
@@ -57,43 +90,173 @@ def detect_heading(line: str) -> tuple[int, str] | None:
     return None
 
 
-def split_paragraphs(text: str) -> list[str]:
-    """按空行分段，再把过长的段按句号切开，但绝不切在句子中间。"""
+# 切分点的优先级：先在语义最强的边界上切，退无可退才动子句。
+# 空行 > 句末标点 > 冒号 > 单换行 > 逗号（只有超长无标点句才用到最后一档）。
+_BOUNDARIES = (
+    re.compile(r"\n\s*\n"),
+    re.compile(r"(?<=[。！？!?；;])\s*"),
+    re.compile(r"(?<=[：:])\s+"),
+    re.compile(r"\n"),
+)
+_CLAUSE_BOUNDARY = re.compile(r"(?<=[，,、])\s*")
 
-    blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
-    parts: list[str] = []
-    for block in blocks:
-        if estimate_tokens(block) <= LEAF_MAX_TOKENS:
-            parts.append(block)
+
+def _spans(text: str) -> list[tuple[int, int]]:
+    """把文本切成"最小不可分单元"的区间。
+
+    保留下标而不是切成字符串：叶子要记住自己在原文的位置，邻居、高亮和以后的
+    引用定位都要用它。
+    """
+
+    units: list[tuple[int, int]] = [(0, len(text))]
+    for pattern in _BOUNDARIES:
+        nxt: list[tuple[int, int]] = []
+        for start, end in units:
+            if estimate_tokens(text[start:end]) <= WINDOW_MAX_TOKENS:
+                nxt.append((start, end))
+                continue
+            cursor = start
+            for match in pattern.finditer(text, start, end):
+                if match.end() <= cursor:
+                    continue
+                nxt.append((cursor, match.end()))
+                cursor = match.end()
+            if cursor < end:
+                nxt.append((cursor, end))
+        units = nxt
+
+    # 仍然超长的（没有标点的长句）按子句切，再不行按字符硬切——但这已是最后一档。
+    final: list[tuple[int, int]] = []
+    for start, end in units:
+        if estimate_tokens(text[start:end]) <= WINDOW_MAX_TOKENS:
+            final.append((start, end))
             continue
-        sentences = re.split(r"(?<=[。！？；!?;])\s*", block)
-        buffer = ""
-        for sentence in sentences:
-            if not sentence.strip():
-                continue
-            candidate = f"{buffer}{sentence}"
-            if buffer and estimate_tokens(candidate) > LEAF_TARGET_TOKENS:
-                parts.append(buffer.strip())
-                buffer = sentence
-            else:
-                buffer = candidate
-        if buffer.strip():
-            parts.append(buffer.strip())
-    return parts
+        cursor = start
+        for match in _CLAUSE_BOUNDARY.finditer(text, start, end):
+            if match.end() > cursor:
+                final.append((cursor, match.end()))
+                cursor = match.end()
+        while end - cursor > WINDOW_MAX_TOKENS:
+            final.append((cursor, cursor + WINDOW_MAX_TOKENS))
+            cursor += WINDOW_MAX_TOKENS
+        if cursor < end:
+            final.append((cursor, end))
+    return [(start, end) for start, end in final if text[start:end].strip()]
 
 
-def _merge_small(parts: Sequence[str]) -> list[str]:
-    """把过短的相邻段合并。一个二十字的叶子命中了也说明不了什么。"""
+@dataclass(frozen=True)
+class Window:
+    start: int
+    end: int
+    text: str
 
-    merged: list[str] = []
-    for part in parts:
-        if merged and estimate_tokens(merged[-1]) < LEAF_MIN_TOKENS:
-            candidate = f"{merged[-1]}\n\n{part}"
-            if estimate_tokens(candidate) <= LEAF_MAX_TOKENS:
-                merged[-1] = candidate
-                continue
-        merged.append(part)
-    return merged
+
+def _table_groups(rows: list[str]) -> list[list[str]]:
+    """按 token 预算分组表格行，不按行数。
+
+    一行的长短能差几十倍：按固定行数切，遇到宽表必然切出几百 token 的巨块。
+    单行本身超预算时独占一组——表格的行是不可分的最小语义单位。
+    """
+
+    groups: list[list[str]] = []
+    current: list[str] = []
+    used = 0
+    for row in rows:
+        size = estimate_tokens(row)
+        if current and used + size > TABLE_TOKENS_PER_WINDOW:
+            groups.append(current)
+            current, used = [], 0
+        current.append(row)
+        used += size
+    if current:
+        groups.append(current)
+    return groups
+
+
+def split_passages(text: str) -> list[Window]:
+    """把一段正文切成**展示单元**：不重叠、边界对齐、约 500 token。
+
+    这一层是返回给模型的东西，所以要求是"读得完整"而不是"匹配得准"。
+    不重叠，否则展开时会重复。
+    """
+
+    body = text.strip()
+    if not body:
+        return []
+    if estimate_tokens(body) <= PASSAGE_MAX_TOKENS:
+        offset = text.index(body)
+        return [Window(offset, offset + len(body), body)]
+
+    spans = _spans(text)
+    passages: list[Window] = []
+    index = 0
+    total = len(spans)
+    sizes = [estimate_tokens(text[start:end]) for start, end in spans]
+    while index < total:
+        used = 0
+        cursor = index
+        while cursor < total and (used < PASSAGE_TARGET_TOKENS or cursor == index):
+            used += sizes[cursor]
+            cursor += 1
+        if 0 < sum(sizes[cursor:]) < WINDOW_MIN_TOKENS:
+            cursor = total
+        start, end = spans[index][0], spans[cursor - 1][1]
+        chunk = text[start:end].strip()
+        if chunk:
+            offset = start + (len(text[start:end]) - len(text[start:end].lstrip()))
+            passages.append(Window(offset, offset + len(chunk), chunk))
+        index = cursor
+    return passages
+
+
+def sliding_windows(text: str) -> list[Window]:
+    """句子感知的滑动窗口：组装到目标大小，相邻窗口重叠，切点只落在边界上。
+
+    和"按段落切"的区别是主动性：段落多长块就多长，块大小完全随原文摆布；
+    滑动窗口把大小控制在目标附近，稠密召回的向量质量才稳定。
+    """
+
+    body = text.strip()
+    if not body:
+        return []
+    if estimate_tokens(body) <= WINDOW_WHOLE_MAX_TOKENS:
+        # 整节不超目标就不切。为了切而切只会让每一块都读不完整。
+        offset = text.index(body)
+        return [Window(offset, offset + len(body), body)]
+
+    spans = _spans(text)
+    if not spans:
+        return []
+    sizes = [estimate_tokens(text[start:end]) for start, end in spans]
+
+    windows: list[Window] = []
+    index = 0
+    total = len(spans)
+    while index < total:
+        used = 0
+        cursor = index
+        while cursor < total and (used < WINDOW_TARGET_TOKENS or cursor == index):
+            used += sizes[cursor]
+            cursor += 1
+        # 防短尾：剩下的凑不满一个最小块就并进来，不留孤立短句。
+        if 0 < sum(sizes[cursor:]) < WINDOW_MIN_TOKENS:
+            cursor = total
+        start = spans[index][0]
+        end = spans[cursor - 1][1]
+        chunk = text[start:end].strip()
+        if chunk:
+            offset = start + (len(text[start:end]) - len(text[start:end].lstrip()))
+            windows.append(Window(offset, offset + len(chunk), chunk))
+        if cursor >= total:
+            break
+        # 从块尾回退 overlap 个 token 作为下一块起点。
+        back = 0
+        step = cursor
+        while step - 1 > index and back < WINDOW_OVERLAP_TOKENS:
+            step -= 1
+            back += sizes[step]
+        index = step
+    return windows
 
 
 def split_segments(text: str) -> list[tuple[str, str, str]]:
@@ -174,8 +337,7 @@ def build_document_tree(
         parent = stack[-1][1]
         for kind, header, segment in split_segments(body):
             if kind == "table":
-                rows = segment.split("\n")
-                for start in range(0, len(rows), TABLE_ROWS_PER_LEAF):
+                for group in _table_groups(segment.split("\n")):
                     ordinal += 1
                     tree.add(
                         MemoryNode(
@@ -184,27 +346,46 @@ def build_document_tree(
                             source_kind=SOURCE_DOCUMENT,
                             parent_id=parent.id,
                             path=parent.path,
-                            text="\n".join(rows[start : start + TABLE_ROWS_PER_LEAF]),
+                            text="\n".join(group),
                             header=header,
                             occurred_at=occurred_at,
                             is_leaf=True,
                         )
                     )
                 continue
-            for part in _merge_small(split_paragraphs(segment)):
+            for passage in split_passages(segment):
                 ordinal += 1
-                tree.add(
+                passage_node = tree.add(
                     MemoryNode(
                         id=node_id(source_id, parent.path, ordinal),
                         source_id=source_id,
                         source_kind=SOURCE_DOCUMENT,
                         parent_id=parent.id,
                         path=parent.path,
-                        text=part,
+                        text=passage.text,
                         occurred_at=occurred_at,
-                        is_leaf=True,
+                        is_leaf=False,
+                        meta={"char_start": passage.start, "char_end": passage.end},
                     )
                 )
+                for window in sliding_windows(passage.text):
+                    ordinal += 1
+                    tree.add(
+                        MemoryNode(
+                            id=node_id(source_id, parent.path, ordinal),
+                            source_id=source_id,
+                            source_kind=SOURCE_DOCUMENT,
+                            parent_id=passage_node.id,
+                            path=parent.path,
+                            text=window.text,
+                            occurred_at=occurred_at,
+                            is_leaf=True,
+                            meta={
+                                "char_start": passage.start + window.start,
+                                "char_end": passage.start + window.end,
+                            },
+                        )
+                    )
 
     for line in text.split("\n"):
         heading = detect_heading(line)
@@ -286,21 +467,37 @@ def build_chat_tree(
             if not content:
                 continue
             speaker = {"user": "用户", "assistant": "助手"}.get(role, role or "系统")
-            for part in _merge_small(split_paragraphs(content)):
+            for passage in split_passages(content):
                 ordinal += 1
-                tree.add(
+                passage_node = tree.add(
                     MemoryNode(
                         id=node_id(source_id, path, ordinal),
                         source_id=source_id,
                         source_kind=source_kind,
                         parent_id=turn_node.id,
                         path=path,
-                        text=f"{speaker}：{part}",
+                        title=f"{speaker}发言",
+                        text=f"{speaker}：{passage.text}",
                         occurred_at=occurred_at,
-                        is_leaf=True,
+                        is_leaf=False,
                         meta={"role": role},
                     )
                 )
+                for window in sliding_windows(passage.text):
+                    ordinal += 1
+                    tree.add(
+                        MemoryNode(
+                            id=node_id(source_id, path, ordinal),
+                            source_id=source_id,
+                            source_kind=source_kind,
+                            parent_id=passage_node.id,
+                            path=path,
+                            text=f"{speaker}：{window.text}",
+                            occurred_at=occurred_at,
+                            is_leaf=True,
+                            meta={"role": role},
+                        )
+                    )
     tree.fill_internal_text()
     return tree
 
@@ -310,21 +507,53 @@ OFFICE_SUFFIXES = {".docx", ".xlsx", ".xlsm", ".csv", ".tsv", ".pptx", ".pdf"}
 INDEXABLE_SUFFIXES = TEXT_SUFFIXES | OFFICE_SUFFIXES
 
 
+def file_source_key(path: Path, relative_to: Path | None = None) -> str:
+    """来源标识用**路径**，不是文件名。
+
+    一个工作区里同名文件遍地都是（"会议纪要.docx" 每个目录一份）。用文件名当
+    来源，它们会互相覆盖：实测 5002 份材料入库后只剩 559 份。
+    """
+
+    resolved = Path(path)
+    if relative_to is not None:
+        try:
+            return resolved.resolve().relative_to(Path(relative_to).resolve()).as_posix()
+        except ValueError:
+            pass
+    return resolved.resolve().as_posix()
+
+
 def file_to_text(path: Path) -> str:
-    """把一份文件读成 Markdown。Office 与 PDF 复用既有的抽取器。"""
+    """把一份文件读成 Markdown。Office 与 PDF 复用既有的抽取器。
+
+    不走 `build_markdown`：它会在正文前加一段"文件类型/处理方式/paragraphs/tables"
+    的元信息，那是给人看转换结果用的。索引进去会变成一个纯噪音的叶子，还会在
+    检索里跟真正的内容抢名次。
+    """
 
     suffix = path.suffix.lower()
     if suffix in TEXT_SUFFIXES:
         return path.read_text(encoding="utf-8", errors="replace")
-    from ..office_processor import build_markdown, extract_document
+    from ..office_processor import extract_document
 
     result = extract_document(path)
-    return build_markdown(path, result, "index")
+    sections = [
+        str(section).strip()
+        for section in (result.get("sections") or [])
+        if str(section).strip()
+    ]
+    return "\n\n".join(sections)
 
 
-def build_file_tree(path: Path, *, source_id: str = "", occurred_at: int = 0) -> MemoryTree:
+def build_file_tree(
+    path: Path,
+    *,
+    source_id: str = "",
+    occurred_at: int = 0,
+    relative_to: Path | None = None,
+) -> MemoryTree:
     resolved = Path(path)
-    identifier = source_id or f"doc:{resolved.name}"
+    identifier = source_id or f"doc:{file_source_key(resolved, relative_to)}"
     stamp = occurred_at
     if not stamp:
         try:

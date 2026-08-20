@@ -93,11 +93,23 @@ class DocumentTreeTests(unittest.TestCase):
         # 表头必须进入可检索正文，否则 "责任单位" 这种词永远命中不到行
         self.assertIn("责任单位", table_leaves[0].searchable_body())
 
-    def test_ancestors_go_from_parent_up_to_the_file(self) -> None:
+    def test_ancestors_go_from_the_display_unit_up_to_the_file(self) -> None:
+        """窗口 → 展示段 → 章节 → 文件。
+
+        中间那层是展示单元：命中在窗口上，返回的是包住它的这一段。
+        """
+
         leaf = next(leaf for leaf in self.tree.leaves() if "中试基地" in leaf.text)
         chain = [node.title for node in self.tree.ancestors_of(leaf.id)]
-        self.assertEqual(chain[0], "1. 建设中试基地")
+        self.assertIn("1. 建设中试基地", chain)
         self.assertEqual(chain[-1], "关于我市具身智能产业发展的思考和建议")
+
+    def test_a_matched_window_is_never_what_gets_shown(self) -> None:
+        leaf = next(leaf for leaf in self.tree.leaves() if "中试基地" in leaf.text)
+        parent = self.tree.by_id()[leaf.parent_id]
+        # 展示单元自带完整正文，不是把重叠的窗口拼回去
+        self.assertTrue(parent.text.strip())
+        self.assertNotIn(leaf.text * 2, parent.text)
 
     def test_a_parent_reads_as_the_original_order(self) -> None:
         section = next(
@@ -139,12 +151,13 @@ class ChatTreeTests(unittest.TestCase):
         )
         leaves = tree.leaves()
         self.assertEqual(len(leaves), 2)
-        # 聊天块不自足（"那个材料"），所以父必须是完整一轮
-        parent = tree.by_id()[leaves[0].parent_id]
-        self.assertEqual(parent.title, "第 1 轮")
-        self.assertIn("业务员口吻", parent.text)
-        self.assertIn("路径在", parent.text)
         self.assertTrue(leaves[0].text.startswith("用户："))
+        # 聊天块不自足（"那个材料"），所以往上两层要能拿回完整一轮
+        index = tree.by_id()
+        turn = index[index[leaves[0].parent_id].parent_id]
+        self.assertEqual(turn.title, "第 1 轮")
+        self.assertIn("业务员口吻", turn.text)
+        self.assertIn("路径在", turn.text)
 
 
 class StableIdTests(unittest.TestCase):

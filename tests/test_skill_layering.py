@@ -29,10 +29,18 @@ CORE_MODEL_TOOLS = {
     "list_workspace_files",
     "mcporter",
     "read_text_file",
+    "recall",
+    "recall_expand",
     "shell_exec",
     "sys_skill",
     "write_text_file",
 }
+"""模型每轮都看得见的工具面。
+
+每加一个都是每轮固定成本，所以这张表是有意锁住的：改动它要先想清楚这项能力
+是否非常驻不可。recall / recall_expand 常驻，因为"要不要去找"只有模型判断得了；
+技能工具不常驻，因为它们经 sys_skill 按需展开。
+"""
 
 
 class SkillLayeringTests(unittest.TestCase):
