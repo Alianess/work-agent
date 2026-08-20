@@ -169,6 +169,7 @@ class ReActAgent:
         debug_trace: Any | None = None,
         cancel_check: Callable[[], bool] | None = None,
         pending_messages: Callable[[], list[str]] | None = None,
+        request_transform: Callable[[list[Message]], list[Message]] | None = None,
         hooks: LoopHooks | None = None,
         workspace_root: str | Path | None = None,
         reasoning_effort: str = "medium",
@@ -193,6 +194,9 @@ class ReActAgent:
         # a queue lets the user add to the work instead of killing it, which is
         # what makes an early wrap-up recoverable without restarting the turn.
         self.pending_messages = pending_messages
+        # 只在装配请求那一刻改写消息，改写结果不回写日志。图片附件走这条路：
+        # 日志里留人可读的路径，base64 只活在这一次请求里。
+        self.request_transform = request_transform
         self.hooks = hooks or LoopHooks()
         # 工具在本轮交回来的多模态内容块，等着被注入成一条用户消息。
         self._tool_attachments: list[dict[str, Any]] = []
@@ -1212,9 +1216,20 @@ class ReActAgent:
         was never recorded.
         """
 
-        return runtime.build_request_messages(
+        messages = runtime.build_request_messages(
             self.system_prompt, self._late_system_blocks(system_context)
         )
+        if self.request_transform is None:
+            return messages
+        try:
+            return self.request_transform(messages)
+        except Exception:
+            # 富化失败就发原样的消息：宁可这次看不到图，也不要整轮失败。
+            self._trace(
+                "request_transform_failed",
+                traceback=traceback.format_exc().splitlines()[-8:],
+            )
+            return messages
 
     def _trace(self, event: str, **payload: Any) -> None:
         tracer = self.debug_trace

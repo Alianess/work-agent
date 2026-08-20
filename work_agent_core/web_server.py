@@ -6195,7 +6195,20 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         index_path=file_index_path,
         conversation_image_paths=conversation_image_paths,
     )
-    runtime_messages = image_preparation.messages
+    # 日志与归档只存人可读的路径，base64 绝不落盘：它会把事件日志撑到几十兆，
+    # 还会把检索索引污染成一个几百万 token 的怪节点。图片在装配请求那一刻才附上。
+    runtime_messages = dehydrate_model_messages(image_preparation.messages)
+
+    def attach_images_at_request_time(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return enrich_image_attachments_for_model(
+            messages,
+            profile,
+            workspace_root=storage_root,
+            visible_files=visible_files,
+            index_path=file_index_path,
+            conversation_image_paths=conversation_image_paths,
+        ).messages
+
     runtime_system_context = (
         prepared_context.system_context
         + image_fallback_system_context(image_preparation.notice)
@@ -6661,7 +6674,20 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         index_path=file_index_path,
         conversation_image_paths=conversation_image_paths,
     )
-    runtime_messages = image_preparation.messages
+    # 日志与归档只存人可读的路径，base64 绝不落盘：它会把事件日志撑到几十兆，
+    # 还会把检索索引污染成一个几百万 token 的怪节点。图片在装配请求那一刻才附上。
+    runtime_messages = dehydrate_model_messages(image_preparation.messages)
+
+    def attach_images_at_request_time(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return enrich_image_attachments_for_model(
+            messages,
+            profile,
+            workspace_root=storage_root,
+            visible_files=visible_files,
+            index_path=file_index_path,
+            conversation_image_paths=conversation_image_paths,
+        ).messages
+
     runtime_system_context = (
         prepared_context.system_context
         + image_fallback_system_context(image_preparation.notice)
@@ -6699,6 +6725,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         debug_trace=debug_trace,
         cancel_check=turn_runtime.cancelled,
         pending_messages=turn_runtime.drain_messages,
+        request_transform=attach_images_at_request_time,
         reasoning_effort=reasoning_effort,
         auto_approve=auto_approve,
         plan_update_callback=persist_stream_task_plan,
@@ -6958,6 +6985,9 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         debug_trace=debug_trace,
         cancel_check=turn_runtime.cancelled,
         pending_messages=turn_runtime.drain_messages,
+        request_transform=lambda items: enrich_image_attachments_for_model(
+            items, profile, workspace_root=account_workspace_root()
+        ).messages,
         extra_system_context=extra_system_context,
         reasoning_effort=normalize_reasoning_effort(pending_approval.get("reasoning_effort")),
         auto_approve=pending_approval.get("auto_approve") is True,
