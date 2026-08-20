@@ -8066,21 +8066,50 @@ def render_chat_skill_catalog() -> str:
     return block + "\n\n"
 
 
-def extract_workspace_paths(text: str) -> list[str]:
-    workspace_prefix = f"{WORKSPACE_ROOT.as_posix()}/"
+PATH_TRAILING_PUNCTUATION = "，。；;、,.!?！？:：)]}"
+
+
+def trim_reference_to_existing_file(raw: str, root: Path) -> str:
+    """把可能过度捕获的一段文本收敛成真实存在的路径。
+
+    文件名里带空格是常态——macOS 截屏就叫「截屏2026-08-20 19.29.13.png」——
+    而路径又是从散文里认出来的，正则没法知道空格后面是文件名的一部分还是下一句话。
+    存在性是唯一靠得住的分界：从最长开始逐段回退，取第一个真在盘上的。
+    都不存在时退回第一段，行为和以前一致。
+    """
+
+    tokens = raw.split(" ")
+    for count in range(len(tokens), 0, -1):
+        candidate = " ".join(tokens[:count]).strip().rstrip(PATH_TRAILING_PUNCTUATION)
+        if candidate and (root / candidate).exists():
+            return candidate
+    return tokens[0].strip().rstrip(PATH_TRAILING_PUNCTUATION)
+
+
+def extract_workspace_paths(text: str, *, workspace_root: Path | None = None) -> list[str]:
+    root = (workspace_root or WORKSPACE_ROOT).resolve()
+    workspace_prefix = f"{root.as_posix()}/"
     pattern = re.compile(
         rf"(?:{re.escape(workspace_prefix)})?"
         r"(?:meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|产出材料|分析材料|学习笔记)"
-        r"/[^\s`'\"<>|\\\x00-\x1f]+",
+        # 空格允许进入匹配，随后靠存在性裁掉多余的部分；换行和引号仍然是硬边界。
+        r"/[^\n\r`'\"<>|\\\x00-\x1f]+",
         re.IGNORECASE,
     )
     seen: set[str] = set()
     paths: list[str] = []
-    for match in pattern.finditer(text):
-        path = match.group(0).strip().rstrip("，。；;、,.!?！？:：)]}")
-        if path.startswith(workspace_prefix):
-            path = path[len(workspace_prefix) :]
-        if path in seen:
+    position = 0
+    while True:
+        match = pattern.search(text, position)
+        if match is None:
+            break
+        raw = match.group(0)
+        prefix_length = len(workspace_prefix) if raw.startswith(workspace_prefix) else 0
+        path = trim_reference_to_existing_file(raw[prefix_length:], root)
+        # 从**裁掉之后**的终点继续扫。允许空格意味着一次匹配可能横跨两条路径
+        # （「a.png 和 config/x.json」），从整段匹配的末尾接着扫会把后一条漏掉。
+        position = max(match.start() + prefix_length + len(path), match.start() + 1)
+        if not path or path in seen:
             continue
         seen.add(path)
         paths.append(path)
@@ -8109,7 +8138,7 @@ def extract_workspace_file_references(
             seen_paths.add(normalized)
             refs.append({"path": normalized, "source": "context"})
 
-    for path in extract_workspace_paths(text):
+    for path in extract_workspace_paths(text, workspace_root=workspace_root):
         normalized = normalize_workspace_reference_path(
             path,
             workspace_root=workspace_root,

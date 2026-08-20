@@ -132,5 +132,96 @@ class WorkspaceFileReferenceTests(unittest.TestCase):
         self.assertEqual(sanitize_context_file_paths([overlong]), [])
 
 
+class SpacedFileNameTests(unittest.TestCase):
+    """文件名里带空格的附件，图不许被静默丢掉。
+
+    macOS 截屏永远叫「截屏2026-08-20 19.29.13.png」。路径正则原来以空格为硬边界，
+    于是它被截成「…/20260820-192915-截屏2026-08-20」，不是文件，图就没了——
+    模型只好去读文件属性，答出「86% 是白色像素」这种话。
+    """
+
+    @staticmethod
+    def profile(*, supports_vision: bool) -> ModelProfile:
+        return ModelProfile(
+            name="spaced-name-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+            supports_vision=supports_vision,
+        )
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self._temporary.name)
+        (self.root / "meet_files" / "attachments").mkdir(parents=True)
+        self.image = self.root / "meet_files" / "attachments" / "截屏2026-08-20 19.29.13.png"
+        # 一个真的能被 Pillow 打开的最小 PNG
+        from PIL import Image
+
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(self.image, "PNG")
+        (self.root / "config").mkdir()
+        (self.root / "config" / "model_profiles.json").write_text("{}", encoding="utf-8")
+        self.addCleanup(self._temporary.cleanup)
+
+    @property
+    def reference(self) -> str:
+        return "meet_files/attachments/截屏2026-08-20 19.29.13.png"
+
+    def test_a_space_in_the_name_no_longer_truncates_the_path(self) -> None:
+        text = f"这是什么页面 参考附件： - [图片] {self.reference}"
+
+        self.assertEqual(
+            extract_workspace_paths(text, workspace_root=self.root), [self.reference]
+        )
+
+    def test_prose_after_the_path_is_not_swallowed(self) -> None:
+        text = f"{self.reference} 你看看这是什么"
+
+        self.assertEqual(
+            extract_workspace_paths(text, workspace_root=self.root), [self.reference]
+        )
+
+    def test_a_second_path_after_a_spaced_one_is_still_found(self) -> None:
+        # 允许空格后，一次匹配可能横跨两条路径；扫描必须从裁剪后的终点继续。
+        text = f"两个：{self.reference} 和 config/model_profiles.json"
+
+        self.assertEqual(
+            extract_workspace_paths(text, workspace_root=self.root),
+            [self.reference, "config/model_profiles.json"],
+        )
+
+    def test_a_path_that_does_not_exist_still_resolves_to_its_first_segment(self) -> None:
+        # 盘上没有的路径无从裁剪，行为必须和以前一致，不能把后面的话吞进来。
+        text = "看一下 meet_files/不存在的文件.md 这个"
+
+        self.assertEqual(
+            extract_workspace_paths(text, workspace_root=self.root),
+            ["meet_files/不存在的文件.md"],
+        )
+
+    def test_the_image_actually_reaches_a_vision_model(self) -> None:
+        messages = [{"role": "user", "content": f"这是什么页面 参考附件： {self.reference}"}]
+
+        prepared = enrich_image_attachments_for_model(
+            messages, self.profile(supports_vision=True), workspace_root=self.root
+        )
+
+        self.assertEqual(prepared.attached_count, 1)
+        parts = prepared.messages[0]["content"]
+        self.assertEqual([part["type"] for part in parts], ["text", "image_url"])
+        self.assertTrue(parts[1]["image_url"]["url"].startswith("data:image/"))
+
+    def test_a_text_only_model_reports_the_image_as_skipped(self) -> None:
+        messages = [{"role": "user", "content": f"这是什么页面 参考附件： {self.reference}"}]
+
+        prepared = enrich_image_attachments_for_model(
+            messages, self.profile(supports_vision=False), workspace_root=self.root
+        )
+
+        self.assertEqual(prepared.attached_count, 0)
+        self.assertEqual(prepared.skipped_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
