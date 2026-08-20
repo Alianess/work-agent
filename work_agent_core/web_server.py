@@ -6244,16 +6244,12 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     conversation_image_paths = refresh_conversation_image_paths(
         session,
         workspace_root=storage_root,
-        visible_files=visible_files,
-        index_path=file_index_path,
     )
     store.save(session)
     image_preparation = enrich_image_attachments_for_model(
         list(prepared_context.messages),
         profile,
         workspace_root=storage_root,
-        visible_files=visible_files,
-        index_path=file_index_path,
         conversation_image_paths=conversation_image_paths,
     )
     # 日志与归档只存人可读的路径，base64 绝不落盘：它会把事件日志撑到几十兆，
@@ -6265,8 +6261,6 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             messages,
             profile,
             workspace_root=storage_root,
-            visible_files=visible_files,
-            index_path=file_index_path,
             conversation_image_paths=conversation_image_paths,
         ).messages
 
@@ -6724,16 +6718,12 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     conversation_image_paths = refresh_conversation_image_paths(
         session,
         workspace_root=storage_root,
-        visible_files=visible_files,
-        index_path=file_index_path,
     )
     store.save(session)
     image_preparation = enrich_image_attachments_for_model(
         list(prepared_context.messages),
         profile,
         workspace_root=storage_root,
-        visible_files=visible_files,
-        index_path=file_index_path,
         conversation_image_paths=conversation_image_paths,
     )
     # 日志与归档只存人可读的路径，base64 绝不落盘：它会把事件日志撑到几十兆，
@@ -6745,8 +6735,6 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             messages,
             profile,
             workspace_root=storage_root,
-            visible_files=visible_files,
-            index_path=file_index_path,
             conversation_image_paths=conversation_image_paths,
         ).messages
 
@@ -7339,19 +7327,45 @@ def user_file_reference_text(messages: list[dict[str, Any]]) -> str:
     )
 
 
+ATTACHMENT_REFERENCE_LINE_RE = re.compile(r"^-\s*\[[^\]]+\]\s*(.+?):\s*(\S.*)$")
+
+
+def attachment_block_paths(text: str) -> list[str]:
+    """只认「参考附件：」块里的路径——那是用户真正拖入/上传的附件。
+
+    用户在正文里手打的路径、随口提到的文件名，都只是文本：智能体要看图，
+    应该自己调 read_file。把这两类混在一起自动附图，模型就会宣称"给我路径
+    我就能看到"，而用户以为的契约是"附件才算给我"。
+    """
+
+    marker = str(text or "").rfind("参考附件：")
+    if marker < 0:
+        return []
+    paths: list[str] = []
+    for line in str(text)[marker + len("参考附件："):].split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = ATTACHMENT_REFERENCE_LINE_RE.match(stripped)
+        if not match:
+            # 块里出现了解析不了的行，当作没有附件块处理：宁可不附图。
+            return []
+        paths.append(match.group(2).strip())
+    return paths
+
+
 def refresh_conversation_image_paths(
     session: ConversationSession,
     *,
     workspace_root: Path,
-    visible_files: dict[str, list[str]],
-    index_path: Path | None = None,
 ) -> list[str]:
     """Persist the original image paths independently from the LLM text window.
 
     Conversation compaction intentionally drops most old messages from the next
     model request. Keeping this small path list lets a later visual question
     rehydrate the original pixels without persisting Base64 or replacing the
-    image with lossy OCR text.
+    image with lossy OCR text. Only real attachments (the「参考附件：」block)
+    qualify; typed paths are the agent's business, via read_file.
     """
 
     root = workspace_root.resolve()
@@ -7363,15 +7377,7 @@ def refresh_conversation_image_paths(
     for message in session.messages:
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
-        candidates.extend(
-            str(ref.get("path") or "")
-            for ref in extract_workspace_file_references(
-                str(message.get("content") or ""),
-                workspace_root=root,
-                visible_files=visible_files,
-                index_path=index_path,
-            )
-        )
+        candidates.extend(attachment_block_paths(str(message.get("content") or "")))
 
     image_paths: list[str] = []
     seen: set[str] = set()
@@ -7397,16 +7403,17 @@ def enrich_image_attachments_for_model(
     profile: ModelProfile,
     *,
     workspace_root: Path | None = None,
-    visible_files: dict[str, list[str]] | None = None,
-    index_path: Path | None = None,
     conversation_image_paths: list[str] | None = None,
 ) -> ImageAttachmentPreparation:
-    """Turn image paths embedded in chat messages into multimodal inputs.
+    """Turn attachment-block image paths into multimodal inputs.
 
     The browser/archive keeps the human-readable path, not a large base64 blob.
     Immediately before the LLM call we resolve safe workspace paths and attach
     data URLs to user messages.  This preserves compact history while giving
     vision-capable OpenAI-compatible models the actual image bytes.
+
+    只有「参考附件：」块（用户拖入/上传的真附件）自动附图；正文里手打的
+    路径和提到的文件名保持纯文本，模型要看就自己调 read_file。
     """
     root = (workspace_root or WORKSPACE_ROOT).resolve()
     enriched: list[dict[str, Any]] = []
@@ -7421,19 +7428,6 @@ def enrich_image_attachments_for_model(
         if isinstance(message, dict) and message.get("role") == "user"
     ]
     attachable = set(user_positions[-IMAGE_ATTACH_RECENT_USER_TURNS:])
-    candidate_names = {
-        name
-        for message in messages
-        if isinstance(message, dict) and message.get("role") == "user"
-        for name in extract_file_names(str(message.get("content") or ""))
-    }
-    if candidate_names and visible_files is None:
-        # Build/load the account index once for the whole turn. The old path
-        # rebuilt it once per historical user message.
-        visible_files = visible_file_reference_index(
-            workspace_root=root,
-            index_path=index_path,
-        )
     for position, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") != "user":
             enriched.append(message)
@@ -7444,13 +7438,7 @@ def enrich_image_attachments_for_model(
             continue
         text = str(message.get("content") or "")
         parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
-        for ref in extract_workspace_file_references(
-            text,
-            workspace_root=root,
-            visible_files=visible_files,
-            index_path=index_path,
-        ):
-            path = str(ref.get("path") or "")
+        for path in attachment_block_paths(text):
             candidate = (root / path).resolve()
             if root not in (candidate, *candidate.parents):
                 continue

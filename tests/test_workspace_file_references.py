@@ -35,11 +35,11 @@ class WorkspaceFileReferenceTests(unittest.TestCase):
             image_path = root / "tmp" / "history.jpg"
             image_path.parent.mkdir(parents=True)
             image_path.write_bytes(b"not-a-real-jpeg")
+            attachment_block = "参考附件：\n- [图片] history.jpg: tmp/history.jpg"
             messages = [
-                {"role": "user", "content": "请看 tmp/history.jpg"},
-                {"role": "assistant", "content": "好的"},
                 {"role": "user", "content": "继续，只处理文字"},
-                {"role": "user", "content": "重复引用 tmp/history.jpg"},
+                {"role": "assistant", "content": "好的"},
+                {"role": "user", "content": f"请看\n\n{attachment_block}"},
             ]
 
             with patch.object(web_server, "WORKSPACE_ROOT", root):
@@ -53,7 +53,7 @@ class WorkspaceFileReferenceTests(unittest.TestCase):
             self.assertEqual(prepared.attached_count, 0)
             self.assertIn("不支持图片识别", prepared.notice)
             self.assertEqual(prepared.messages, messages)
-            self.assertEqual(prepared.messages[0]["content"], "请看 tmp/history.jpg")
+            self.assertEqual(prepared.messages[2]["content"], f"请看\n\n{attachment_block}")
 
     def test_vision_model_attaches_each_historical_image_only_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -62,7 +62,7 @@ class WorkspaceFileReferenceTests(unittest.TestCase):
             image_path.parent.mkdir(parents=True)
             image_path.write_bytes(b"png-bytes")
             messages = [
-                {"role": "user", "content": "图片 tmp/history.png"},
+                {"role": "user", "content": "图片\n\n参考附件：\n- [图片] history.png: tmp/history.png"},
                 {"role": "user", "content": "还是 tmp/history.png"},
             ]
 
@@ -81,6 +81,29 @@ class WorkspaceFileReferenceTests(unittest.TestCase):
             self.assertEqual(first_content[1]["type"], "image_url")
             self.assertTrue(first_content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
             self.assertEqual(prepared.messages[1], messages[1])
+
+    def test_typed_path_stays_text_and_never_attaches(self) -> None:
+        # 用户只给路径，智能体就只能看到路径；要看图得自己调 read_file。
+        # 把路径自动附图，模型就会宣称「给我路径我就能看到」——契约就错了。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            image_path = root / "tmp" / "typed.png"
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(b"png-bytes")
+            messages = [
+                {"role": "user", "content": "帮我看看 tmp/typed.png 这张图"},
+            ]
+
+            with patch.object(web_server, "WORKSPACE_ROOT", root):
+                prepared = enrich_image_attachments_for_model(
+                    messages,
+                    self.profile(supports_vision=True),
+                    workspace_root=root,
+                )
+
+            self.assertEqual(prepared.attached_count, 0)
+            self.assertEqual(prepared.skipped_count, 0)
+            self.assertEqual(prepared.messages, messages)
 
     def test_image_fallback_notice_is_visible_in_final_reply(self) -> None:
         content = image_fallback_final_content("继续处理文字。", "当前模型不支持图片识别。")
@@ -201,7 +224,15 @@ class SpacedFileNameTests(unittest.TestCase):
         )
 
     def test_the_image_actually_reaches_a_vision_model(self) -> None:
-        messages = [{"role": "user", "content": f"这是什么页面 参考附件： {self.reference}"}]
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "这是什么页面\n\n参考附件：\n"
+                    f"- [图片] 截屏2026-08-20 19.29.13.png: {self.reference}"
+                ),
+            }
+        ]
 
         prepared = enrich_image_attachments_for_model(
             messages, self.profile(supports_vision=True), workspace_root=self.root
@@ -213,7 +244,15 @@ class SpacedFileNameTests(unittest.TestCase):
         self.assertTrue(parts[1]["image_url"]["url"].startswith("data:image/"))
 
     def test_a_text_only_model_reports_the_image_as_skipped(self) -> None:
-        messages = [{"role": "user", "content": f"这是什么页面 参考附件： {self.reference}"}]
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "这是什么页面\n\n参考附件：\n"
+                    f"- [图片] 截屏2026-08-20 19.29.13.png: {self.reference}"
+                ),
+            }
+        ]
 
         prepared = enrich_image_attachments_for_model(
             messages, self.profile(supports_vision=False), workspace_root=self.root

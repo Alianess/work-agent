@@ -105,7 +105,8 @@ class HistoricalVisionContextTests(unittest.TestCase):
             supports_vision=supports_vision,
         )
 
-    def test_filename_index_is_loaded_once_for_all_historical_messages(self) -> None:
+    def test_a_typed_filename_is_text_and_never_loads_the_file_index(self) -> None:
+        # 光提文件名不是附件：不附图，也不碰文件索引。
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             image = root / "meet_files" / "attachments" / "history.png"
@@ -113,23 +114,23 @@ class HistoricalVisionContextTests(unittest.TestCase):
             image.write_bytes(b"png")
             messages = [
                 {"role": "user", "content": "请看 history.png"},
-                {"role": "assistant", "content": "我看到了。"},
+                {"role": "assistant", "content": "我看不到它。"},
                 {"role": "user", "content": "继续看 history.png 的右下角"},
             ]
 
             with patch.object(
                 web_server,
                 "visible_file_reference_index",
-                return_value={"history.png": ["meet_files/attachments/history.png"]},
-            ) as load_index:
+                side_effect=AssertionError("filename mentions should not load the file index"),
+            ):
                 prepared = web_server.enrich_image_attachments_for_model(
                     messages,
                     self.profile(),
                     workspace_root=root,
                 )
 
-            self.assertEqual(load_index.call_count, 1)
-            self.assertEqual(prepared.attached_count, 1)
+            self.assertEqual(prepared.attached_count, 0)
+            self.assertEqual(prepared.messages, messages)
 
     def test_later_question_keeps_original_image_pixels_in_model_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -138,7 +139,10 @@ class HistoricalVisionContextTests(unittest.TestCase):
             image.parent.mkdir(parents=True)
             image.write_bytes(b"png")
             messages = [
-                {"role": "user", "content": "图片 meet_files/attachments/history.png"},
+                {
+                    "role": "user",
+                    "content": "图片\n\n参考附件：\n- [图片] history.png: meet_files/attachments/history.png",
+                },
                 {"role": "assistant", "content": "已经看到了。"},
                 {"role": "user", "content": "右下角那个很小的图标是什么？"},
             ]
@@ -147,7 +151,6 @@ class HistoricalVisionContextTests(unittest.TestCase):
                 messages,
                 self.profile(),
                 workspace_root=root,
-                visible_files={},
             )
 
             first_content = prepared.messages[0]["content"]
@@ -164,7 +167,10 @@ class HistoricalVisionContextTests(unittest.TestCase):
             session = ConversationSession(
                 id="vision-context",
                 messages=[
-                    {"role": "user", "content": "图片 meet_files/attachments/history.png"},
+                    {
+                        "role": "user",
+                        "content": "图片\n\n参考附件：\n- [图片] history.png: meet_files/attachments/history.png",
+                    },
                     {"role": "assistant", "content": "已经看到了。"},
                 ],
             )
@@ -172,13 +178,11 @@ class HistoricalVisionContextTests(unittest.TestCase):
             retained = web_server.refresh_conversation_image_paths(
                 session,
                 workspace_root=root,
-                visible_files={},
             )
             prepared = web_server.enrich_image_attachments_for_model(
                 [{"role": "user", "content": "右下角的小图标是什么？"}],
                 self.profile(),
                 workspace_root=root,
-                visible_files={},
                 conversation_image_paths=retained,
             )
 
@@ -191,6 +195,28 @@ class HistoricalVisionContextTests(unittest.TestCase):
             self.assertIn("持续视觉上下文", current_content[1]["text"])
             self.assertTrue(current_content[2]["image_url"]["url"].startswith("data:image/png;base64,"))
             self.assertEqual(prepared.attached_count, 1)
+
+    def test_a_typed_path_does_not_become_persistent_visual_context(self) -> None:
+        # 手打的路径不进「持续视觉上下文」——那是附件才有的待遇。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            image = root / "meet_files" / "attachments" / "typed.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            session = ConversationSession(
+                id="typed-path",
+                messages=[
+                    {"role": "user", "content": "看看 meet_files/attachments/typed.png"},
+                ],
+            )
+
+            retained = web_server.refresh_conversation_image_paths(
+                session,
+                workspace_root=root,
+            )
+
+            self.assertEqual(retained, [])
+            self.assertEqual(session.metadata[web_server.CONVERSATION_IMAGE_PATHS_KEY], [])
 
     def test_plain_text_history_does_not_touch_the_file_index(self) -> None:
         messages = [
