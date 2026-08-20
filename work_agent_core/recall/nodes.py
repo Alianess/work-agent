@@ -22,6 +22,17 @@ SOURCE_CHAT = "chat"
 SOURCE_TRANSCRIPT = "transcript"
 SOURCE_KINDS = frozenset({SOURCE_DOCUMENT, SOURCE_CHAT, SOURCE_TRANSCRIPT})
 
+# 路径在库里用单元分隔符拼接：标题里可以有空格、斜杠、竖线，不能有它。
+PATH_SEPARATOR = "\x1f"
+
+
+def join_path(path: "Iterable[str]") -> str:
+    return PATH_SEPARATOR.join(str(item) for item in path)
+
+
+def split_path(value: str) -> list[str]:
+    return [part for part in str(value or "").split(PATH_SEPARATOR) if part]
+
 _CJK = re.compile("[　-〿㐀-䶿一-鿿＀-￯]")
 
 
@@ -82,7 +93,7 @@ class MemoryNode:
             "source_kind": self.source_kind,
             "parent_id": self.parent_id,
             "title": self.title,
-            "path": " ".join(self.path),
+            "path": join_path(self.path),
             "text": self.text,
             "header": self.header,
             "occurred_at": self.occurred_at,
