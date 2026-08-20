@@ -123,7 +123,7 @@ class ModelProfile:
     model: str
     api_key_env: str
     temperature: float = 0.6
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     timeout_seconds: int = 120
     supports_vision: bool = False
 
@@ -136,7 +136,7 @@ class ModelProfile:
             model=str(data["model"]),
             api_key_env=str(data.get("api_key_env") or "OPENAI_API_KEY"),
             temperature=float(data.get("temperature", 0.6)),
-            max_tokens=int(data.get("max_tokens", 8192)),
+            max_tokens=int(data.get("max_tokens", 16384)),
             timeout_seconds=int(data.get("timeout_seconds", 120)),
             supports_vision=(
                 bool(data["supports_vision"])

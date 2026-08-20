@@ -14,7 +14,27 @@ from .recall_archive import extract_completed_turns
 from .memory import estimate_context_tokens
 
 
-REPORT_TYPES = {"daily", "weekly", "biweekly"}
+# Report periods are data, not a fixed set: an organisation that only files a
+# biweekly report should not be offered a weekly one, and one that files
+# monthly should not need a code change. ``days`` is the window the collector
+# looks back over.
+REPORT_PERIODS: dict[str, dict[str, Any]] = {
+    "daily": {"label": "日报", "days": 1, "enabled": True, "audience": "internal"},
+    "weekly": {"label": "周报", "days": 7, "enabled": False, "audience": "submitted"},
+    "biweekly": {"label": "双周报", "days": 14, "enabled": True, "audience": "submitted"},
+}
+
+
+def enabled_report_types() -> set[str]:
+    return {key for key, spec in REPORT_PERIODS.items() if spec.get("enabled")}
+
+
+def report_period_days(period_type: str) -> int:
+    spec = REPORT_PERIODS.get(period_type) or {}
+    return int(spec.get("days") or 1)
+
+
+REPORT_TYPES = set(REPORT_PERIODS)
 DEFAULT_AUDIT_INTERVAL_SECONDS = 30 * 60
 AUTOMATIC_DAILY_REPORT_AUDIT_VERSION = 1
 DEFAULT_DAILY_CUTOFF_HOUR = 18
@@ -702,7 +722,7 @@ def resolve_report_period(
         start = parse_date(start_date or end_date)
     else:
         end = parse_date(target_date) if target_date else date.today()
-        days = 1 if period_type == "daily" else 7 if period_type == "weekly" else 14
+        days = report_period_days(period_type)
         start = end - timedelta(days=days - 1)
     if period_type == "daily":
         start = end

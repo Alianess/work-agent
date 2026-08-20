@@ -55,7 +55,12 @@ from .config import (
 from .debug_trace import DebugTrace, list_debug_traces
 from .execution.store import ExecutionRecord, ExecutionStore
 from .execution.workspace import WorkspaceManager
+from .execution.backends import SeatbeltBackend
 from .cross_chat_memory import CrossChatMemoryStore
+from .file_reference_index import (
+    PersistentFileReferenceIndex,
+    get_persistent_file_reference_index,
+)
 from .llm import OpenAICompatibleClient, chat_completions_endpoint, normalize_reasoning_effort
 from .memory import (
     CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
@@ -76,6 +81,13 @@ from .history_recall import delete_conversation_index, render_history_recall_sys
 from .host_services.apple_pim import ApplePimService
 from .office_preview import OFFICE_TO_PDF_EXTENSIONS, convert_office_to_pdf
 from .office_workspace import merge_pdfs, relative_workspace_path, save_pdf_input
+from .session_log import TURN_END_ABORTED, TURN_END_COMPLETED, TURN_END_FAILED
+from .session_log_store import DurableTurnMirror, SessionLogStore
+from .attention import ObserverContext, SpokenLedger, compose_message, select_observations
+from .observers import build_default_registry
+from .work_ledger import build_work_ledger, merge_ledgers
+from .runtime_profiles import resolve_profile
+from .session_runtime import ConversationRuntime
 from .react import (
     DEFAULT_MAX_STEPS,
     AgentCancelled,
@@ -226,6 +238,10 @@ def user_notification_path(user: AuthUser | None = None) -> Path:
     return user_data_dir(user) / "notifications.json"
 
 
+def user_file_reference_index_path(user: AuthUser | None = None) -> Path:
+    return user_data_dir(user) / "file_reference_index.json"
+
+
 def user_conversation_history_path(user: AuthUser | None = None) -> Path:
     return user_conversation_dir(user) / "conversations.json"
 
@@ -261,6 +277,32 @@ def migrate_legacy_admin_data(admin: AuthUser) -> None:
     if legacy_agent_settings.is_file() and not target_agent_settings.exists():
         shutil.copy2(legacy_agent_settings, target_agent_settings)
     marker.write_text(str(int(time.time())), encoding="utf-8")
+
+
+USER_LOG_STORES: dict[Any, SessionLogStore] = {}
+
+
+def latest_user_message_content(runtime: ConversationRuntime) -> str:
+    for message in reversed(runtime.log.derive_transcript()):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def get_session_log_store() -> SessionLogStore:
+    """Durable append-only event log for the current account.
+
+    Separate from SessionStore: that one holds the working message history the
+    context pipeline rewrites, this one holds what actually happened and is
+    never rewritten.
+    """
+
+    user = current_auth_user()
+    with USER_STORES_LOCK:
+        return USER_LOG_STORES.setdefault(
+            user.id,
+            SessionLogStore(user_conversation_dir(user) / "session_log.sqlite3"),
+        )
 
 
 def get_session_store() -> SessionStore:
@@ -379,6 +421,53 @@ def delete_notification_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return store.payload()
 
 
+def pending_agent_reminders() -> list[dict[str, Any]]:
+    """Reminders the assistant set itself, for its own schedule view.
+
+    Creating a reminder the agent then cannot see is what made both reminder
+    surfaces look inert: each one only ever showed half the picture.
+    """
+
+    payload = NotificationStore(user_notification_path()).payload()
+    items = payload.get("items") if isinstance(payload, dict) else None
+    return [
+        {
+            "id": item.get("id"),
+            "title": item.get("title") or "",
+            "body": item.get("body") or "",
+            "deliver_at": item.get("deliver_at"),
+            "source": "assistant",
+        }
+        for item in (items or [])
+        if isinstance(item, dict) and str(item.get("kind") or "") == "reminder"
+    ]
+
+
+def notification_handler_for(conversation_id: str) -> Callable[[dict[str, Any]], str]:
+    """Bind the delivery interface to what this runtime is allowed to send.
+
+    A bell reminder is an ordinary capability: any chat may set one, and gating
+    it behind a persona is why the feature looked inert everywhere else. Pushing
+    an unprompted message into the persistent conversation is not ordinary, so
+    that one stays with the runtime that owns that conversation.
+    """
+
+    profile = runtime_profile_for(conversation_id)
+
+    def handler(args: dict[str, Any]) -> str:
+        kind = str(args.get("kind") or "").strip()
+        if kind == "reminder" and not profile.reminders_enabled:
+            raise PermissionError(f"当前运行时（{profile.label}）不提供提醒能力。")
+        if kind == "conversation" and not profile.proactive_messages:
+            raise PermissionError(
+                f"当前运行时（{profile.label}）不能主动发起会话消息；"
+                "如果只是要提醒用户，请改用 kind=reminder。"
+            )
+        return friday_notification_handler(args)
+
+    return handler
+
+
 def friday_notification_handler(args: dict[str, Any]) -> str:
     kind = str(args.get("kind") or "").strip()
     title = str(args.get("title") or "").strip()
@@ -471,6 +560,7 @@ def friday_scheduler_loop() -> None:
                 for item in notification_store.due_conversations():
                     append_friday_proactive_message(str(item.get("body") or ""))
                     notification_store.mark_delivered(str(item.get("id") or ""))
+                run_attention_pass(user)
             except Exception as error:
                 print(f"[friday-scheduler] user={user.id}: {type(error).__name__}: {error}")
             finally:
@@ -479,6 +569,67 @@ def friday_scheduler_loop() -> None:
                 elif hasattr(REQUEST_AUTH, "user"):
                     delattr(REQUEST_AUTH, "user")
         FRIDAY_SCHEDULER_STOP.wait(5)
+
+
+ATTENTION_INTERVAL_SECONDS = 15 * 60
+ATTENTION_LAST_RUN: dict[int, float] = {}
+# Names the user has already corrected once. Each entry is a promise that the
+# correction outlives the conversation it was made in — which is the whole
+# reason to record it here rather than re-deciding every time.
+# This is a seed: the entity layer should own it once that exists.
+ATTENTION_ALIAS_GROUPS: dict[str, list[str]] = {
+    "零次方": ["燃气方", "云智方", "平次方"],
+    "逐际动力": ["足力动力", "徐东岭"],
+    "罍街": ["雷街"],
+    "国先中心": ["国平中心", "中国平中心"],
+    "柔性科天": ["水性科天"],
+}
+
+
+def account_work_ledger(user: AuthUser):
+    """Project everything this account's assistant produced, from the log."""
+    store = get_session_log_store()
+    return merge_ledgers(
+        build_work_ledger(store.load(conversation_id))
+        for conversation_id in store.list_sessions()
+    )
+
+
+def run_attention_pass(user: AuthUser) -> None:
+    """Look at the work and speak only when something is worth saying.
+
+    The scheduler already delivered what was queued. This is the other half:
+    forming an opinion about the current state instead of waiting to be asked.
+    """
+
+    now = time.time()
+    last = ATTENTION_LAST_RUN.get(int(user.id), 0.0)
+    if now - last < ATTENTION_INTERVAL_SECONDS:
+        return
+    ATTENTION_LAST_RUN[int(user.id)] = now
+    if not runtime_profile_for(FRIDAY_CONVERSATION_ID).proactive_messages:
+        return
+    data_root = account_workspace_root(user)
+    # What the assistant handled comes from its own record; what it has not
+    # handled comes from the world. Mixing the two made it re-derive its own
+    # work by scanning for the files it had just written.
+    context = ObserverContext(
+        workspace_root=WORKSPACE_ROOT,
+        data_root=data_root,
+        now=datetime.now().astimezone(),
+        ledger=account_work_ledger(user),
+    )
+    registry = build_default_registry(alias_groups=ATTENTION_ALIAS_GROUPS)
+    ledger = SpokenLedger(user_data_dir(user) / "meet_files" / "attention_spoken.json")
+    unsaid = ledger.filter_unsaid(registry.run(context))
+    selected = select_observations(unsaid)
+    if not selected:
+        return
+    message = compose_message(selected)
+    if not message:
+        return
+    append_friday_proactive_message(message)
+    ledger.mark_spoken(selected)
 
 
 def schedule_automatic_daily_reports(user: AuthUser, audit: dict[str, Any]) -> None:
@@ -548,6 +699,11 @@ def automatic_daily_report_worker(user: AuthUser, target_date: str) -> None:
                 "content": (
                     "你是 Friday 的自动日报整理器。只能使用提供的日期范围和本地工作证据，"
                     "不得补写未发生的工作，不得把计划、失败尝试或工具调用写成完成结果。"
+                    "默认按向部门领导提交的口径，提炼本人推进的业务事项、阶段结果和下一步；"
+                    "智能体或模型、ASR/OCR、录音分块、Markdown/Word/PDF、文件转换、归档目录、"
+                    "manifest、OOXML或格式校验等仅是取证和生产过程，不得写入日报。"
+                    "会议类事项优先写接待或参会对象、沟通主题、明确事项和后续安排；"
+                    "研究材料写研究对象、核心结论、应用去向及审议报送状态。"
                     "按业务或项目合并重复事项，输出简洁中文 Markdown，不要代码围栏。结构为："
                     f"# {target_date} 工作简报；## 今日完成；必要时 ## 推进中；## 下一步。"
                     "没有内容的章节直接省略，不要写‘无’或占位符。"
@@ -620,6 +776,30 @@ def strip_markdown_code_fence(value: str) -> str:
     text = str(value or "").strip()
     match = re.fullmatch(r"```(?:markdown|md)?\s*\n([\s\S]*?)\n```", text, re.IGNORECASE)
     return match.group(1).strip() if match else text
+
+
+def service_health_payload(*, require_execution: bool = False) -> dict[str, Any]:
+    """Report service health and optionally require isolated execution readiness.
+
+    The ordinary endpoint remains useful while document/model-only features are
+    available. Service lifecycle checks pass ``require_execution=1`` so a
+    launchd job that inherited a parent sandbox is never reported as ready.
+    """
+    health = SeatbeltBackend(runtime_workspace_root=WORKSPACE_ROOT).health()
+    execution = {
+        "backend": "macos_seatbelt",
+        "ready": health.available,
+        "detail": health.detail,
+        "version": health.version,
+    }
+    return {
+        "ok": bool(health.available or not require_execution),
+        "auth_enabled": True,
+        "workspace": str(WORKSPACE_ROOT),
+        "config": str((WORKSPACE_ROOT / CONFIG_PATH).resolve()),
+        "runtime": runtime_contract_status(WORKSPACE_ROOT),
+        "execution": execution,
+    }
 
 
 def automatic_report_model_response(
@@ -1150,15 +1330,9 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/api/health":
-                self._send_json(
-                    {
-                        "ok": True,
-                        "auth_enabled": True,
-                        "workspace": str(WORKSPACE_ROOT),
-                        "config": str((WORKSPACE_ROOT / CONFIG_PATH).resolve()),
-                        "runtime": runtime_contract_status(WORKSPACE_ROOT),
-                    }
-                )
+                require_execution = parse_qs(parsed.query).get("require_execution") == ["1"]
+                payload = service_health_payload(require_execution=require_execution)
+                self._send_json(payload, status=200 if payload["ok"] else 503)
                 return
             if parsed.path == "/api/auth/me":
                 user = self._authenticated_user()
@@ -1570,6 +1744,9 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 if suffix == "cancel":
                     self._send_json(cancel_turn_payload(turn_id))
                     return
+                if suffix == "message":
+                    self._send_json(queue_turn_message_payload(turn_id, payload))
+                    return
                 if suffix == "approve":
                     self._send_sse(approve_turn_events(turn_id, payload))
                     return
@@ -1941,7 +2118,7 @@ def parse_turn_route(path: str) -> tuple[str, str] | None:
     suffix = str(match.group(2) or "")
     if not turn_id:
         return None
-    if suffix not in {"", "events", "cancel", "approve"}:
+    if suffix not in {"", "events", "cancel", "approve", "message"}:
         return None
     return turn_id, suffix
 
@@ -1962,6 +2139,12 @@ def parse_execution_route(path: str) -> tuple[str, str] | None:
 def friendly_error_message(error: Exception) -> str:
     text = str(error) or type(error).__name__
     lower = text.lower()
+    if "llm" in lower and ("http 404" in lower or "edge route not found" in lower):
+        return (
+            f"{text}\n\n当前模型接口没有找到可用路由。"
+            "请在模型设置中核对接口地址和模型名称，并先运行连接测试；"
+            "系统不会自动改用其他模型。"
+        )
     if "llm" in lower and "timed out" in lower:
         return (
             f"{text}\n\n建议：先检查当前模型的网络连接后重试。"
@@ -2565,6 +2748,8 @@ def tools_payload() -> dict[str, Any]:
         include_shared_tools=current_auth_user().role == "admin",
         execution_account_id=str(current_auth_user().id),
         enabled_skill_ids=enabled_skill_ids(),
+        file_change_handler=update_file_reference_index,
+        agent_reminder_source=pending_agent_reminders,
     )
     return {
         "tools": [
@@ -2583,8 +2768,16 @@ def tools_payload() -> dict[str, Any]:
     }
 
 
+def runtime_profile_for(conversation_id: str):
+    """Resolve which assistant runtime this conversation is."""
+    return resolve_profile(
+        conversation_id,
+        assistant_name_provider=lambda: str(load_agent_settings().get("assistant_name") or "Friday"),
+    )
+
+
 def assistant_runtime_mode(conversation_id: str) -> str:
-    return "friday" if str(conversation_id or "").strip() == "friday-main" else "task"
+    return runtime_profile_for(conversation_id).id
 
 
 def is_compact_command(text: str) -> bool:
@@ -2617,28 +2810,18 @@ def clear_completed_task_plan(session: Any) -> None:
 
 def agent_system_context(*, mode: str = "task") -> str:
     settings = load_agent_settings()
-    assistant_name = str(settings.get("assistant_name") or "Friday").strip() or "Friday"
     nickname = str(settings.get("nickname") or "").strip()
     occupation = str(settings.get("occupation") or "").strip()
     details = str(settings.get("details") or "").strip()
     company_document_format = str(settings.get("company_document_format") or "").strip()
-    if mode == "friday":
-        blocks: list[str] = [
-            (
-                f"你是用户唯一、持续存在的项目经理助理“{assistant_name}”。"
-                "微信、网页持续会话、项目节点和提醒属于同一个助理运行时；"
-                "用户无需使用 /new，你应保持连续主体与跨工作回忆。"
-                "日历等尚未提供的接口不得声称已经接入。"
-            )
-        ]
-    else:
-        blocks = [
-            (
-                "你正在一个普通任务聊天中工作。它是可独立创建、可结束的任务工作区，"
-                "不具备持续主体、跨任务人格、外部消息通道或主动提醒能力。"
-                "只围绕本聊天和当前项目材料完成用户交办，不要主动介绍其他助理运行时。"
-            )
-        ]
+    # The voice belongs to the profile. Keeping it here as an if/else meant a
+    # new runtime could not have one without editing this function.
+    from .runtime_profiles import registry as runtime_profile_registry
+
+    profile = runtime_profile_registry(
+        assistant_name_provider=lambda: str(settings.get("assistant_name") or "Friday")
+    ).get(mode)
+    blocks: list[str] = [profile.system_context] if profile and profile.system_context else []
     if nickname or occupation or details:
         profile_lines = ["用户主动维护的长期资料（优先级高于自动记忆）："]
         if nickname:
@@ -2965,12 +3148,39 @@ def meeting_archive_from_manifest(manifest_path: Path) -> dict[str, Any]:
         "archive_dir": str(data.get("archive_dir") or manifest_path.parent.relative_to(WORKSPACE_ROOT)),
         "manifest_path": str(manifest_path.relative_to(WORKSPACE_ROOT)),
         "meeting_time": meeting_time_from_manifest(data),
-        "created_at": int(data.get("created_at") or manifest_path.stat().st_ctime),
-        "updated_at": int(data.get("updated_at") or manifest_path.stat().st_mtime),
+        "created_at": meeting_archive_timestamp(
+            data.get("created_at"),
+            fallback=manifest_path.stat().st_ctime,
+        ),
+        "updated_at": meeting_archive_timestamp(
+            data.get("updated_at"),
+            fallback=manifest_path.stat().st_mtime,
+        ),
         "source_path": str(data.get("source_path") or ""),
         "transcript_path": str(data.get("transcript_path") or ""),
         "outputs": outputs,
     }
+
+
+def meeting_archive_timestamp(value: Any, *, fallback: float) -> int:
+    """Accept both legacy epoch values and ISO 8601 manifest timestamps."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return int(fallback)
+    if isinstance(value, bool):
+        raise ValueError("会议归档时间不能是布尔值。")
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    raw = str(value).strip()
+    try:
+        return int(float(raw))
+    except ValueError:
+        pass
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        return int(datetime.fromisoformat(normalized).timestamp())
+    except ValueError as error:
+        raise ValueError(f"无效的会议归档时间：{raw}") from error
 
 
 def meeting_time_from_manifest(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -4047,6 +4257,7 @@ def add_project_file_bytes_payload(
             mime_type=mime_type,
             deduplicated=False,
         )
+        update_file_reference_index(target)
         return {"file": file_item_payload(target), "attachment": attachment, "project": project_payload(project)}
 
 
@@ -4063,6 +4274,7 @@ def delete_project_file_payload(project_id: str, payload: dict[str, Any]) -> dic
         if not file_path.is_file():
             raise ValueError("项目文件不存在。")
         file_path.unlink()
+        remove_from_file_reference_index(file_path)
         project["updated_at"] = int(time.time())
         write_project(project)
         return {"ok": True, "project": project_payload(project)}
@@ -4302,18 +4514,19 @@ def legacy_attachment_original_name(name: str) -> str:
     return match.group(1)
 
 
-def is_file_library_visible(path: Path) -> bool:
+def is_file_library_visible(path: Path, *, workspace_root: Path | None = None) -> bool:
     """Only expose user-added files and final office artifacts in the file library."""
 
+    root = (workspace_root or account_workspace_root()).resolve()
     try:
-        relative = path.relative_to(account_workspace_root())
+        relative = path.resolve().relative_to(root)
     except ValueError:
         return False
 
     parts = relative.parts
     if any(part.startswith(".") for part in parts):
         return False
-    if is_attachment_file(path):
+    if is_attachment_file(path, workspace_root=root):
         return True
     if len(parts) >= 3 and parts[0] == "meet_files" and parts[1] == "office_workspace":
         return parts[2] in {"pdf_inputs", "pdf_outputs"} and path.suffix.lower() == ".pdf"
@@ -4354,9 +4567,10 @@ FILE_LIBRARY_OUTPUT_MARKERS = (
 )
 
 
-def is_attachment_file(path: Path) -> bool:
+def is_attachment_file(path: Path, *, workspace_root: Path | None = None) -> bool:
+    root = (workspace_root or account_workspace_root()).resolve()
     try:
-        relative = path.relative_to(account_workspace_root())
+        relative = path.resolve().relative_to(root)
     except ValueError:
         return False
     parts = relative.parts
@@ -4516,6 +4730,7 @@ def add_attachment_bytes_payload(payload: dict[str, Any], data: bytes) -> dict[s
         if fingerprint:
             existing_path = indexed_attachment_path(index, fingerprint, target_dir)
             if existing_path is not None:
+                update_file_reference_index(existing_path)
                 return {
                     "attachment": attachment_payload_from_path(
                         existing_path,
@@ -4541,6 +4756,7 @@ def add_attachment_bytes_payload(payload: dict[str, Any], data: bytes) -> dict[s
                 "recording_metadata": probe_audio_metadata(target_path),
             }
             save_attachment_index(target_dir, index)
+        update_file_reference_index(target_path)
         return {
             "attachment": attachment_payload_from_path(
                 target_path,
@@ -4576,6 +4792,7 @@ def upload_metadata_from_query(parsed: Any) -> dict[str, Any]:
 def add_office_pdf_payload(payload: dict[str, Any]) -> dict[str, Any]:
     name, _mime_type, data = decode_uploaded_file(payload)
     target, pages = save_pdf_input(account_workspace_root(), name=name, data=data)
+    update_file_reference_index(target)
     return {
         "ok": True,
         "input": {
@@ -4597,6 +4814,7 @@ def merge_office_pdfs_payload(payload: dict[str, Any]) -> dict[str, Any]:
         source_paths=[str(path) for path in source_paths],
         output_name=required_string(payload, "output_name"),
     )
+    update_file_reference_index(output_path)
     return {
         "ok": True,
         "output": file_item_payload(output_path),
@@ -5553,6 +5771,8 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         include_shared_tools=current_auth_user().role == "admin",
         execution_account_id=str(current_auth_user().id),
         enabled_skill_ids=enabled_skill_ids(),
+        file_change_handler=update_file_reference_index,
+        agent_reminder_source=pending_agent_reminders,
     )
     max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
     max_steps = max(1, min(max_steps, 60))
@@ -5560,6 +5780,7 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         client=client,
         profile=profile,
         tools=tools,
+        workspace_root=account_workspace_root(),
         max_steps=max_steps,
         extra_system_context=agent_system_context(),
     )
@@ -5705,6 +5926,21 @@ def cancel_turn_payload(turn_id: str) -> dict[str, Any]:
     }
 
 
+def queue_turn_message_payload(turn_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Add a message to a turn that is already running, instead of cancelling it."""
+
+    content = str(payload.get("content") or "").strip()
+    store = get_turn_store()
+    turn = store.enqueue_message(turn_id, content) if content else store.load(turn_id)
+    return {
+        "ok": bool(content) and turn.status not in TERMINAL_STATUSES,
+        "turn_id": turn.id,
+        "conversation_id": turn.conversation_id,
+        "status": turn.status,
+        "queued_count": len(turn.queued_messages),
+    }
+
+
 def rewind_session_or_rebuild_from_display(
     store: SessionStore,
     session: Any,
@@ -5736,9 +5972,16 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     messages = sanitize_chat_messages(payload.get("messages"))
     if not messages or messages[-1]["role"] != "user":
         raise ValueError("Chat messages must end with a user message.")
-    context_file_paths = sanitize_context_file_paths(payload.get("context_file_paths"))
+    storage_root = account_workspace_root()
+    file_index_path = user_file_reference_index_path()
+    context_file_paths = sanitize_context_file_paths(
+        payload.get("context_file_paths"),
+        workspace_root=storage_root,
+    )
     context_file_paths, project_context, project_id = resolve_project_chat_context(
-        payload.get("project_id"), context_file_paths
+        payload.get("project_id"),
+        context_file_paths,
+        workspace_root=storage_root,
     )
     conversation_id = resolve_conversation_id(payload, messages)
     skill_hint = normalize_skill_hint(payload.get("skill_hint"))
@@ -5862,7 +6105,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         WORKSPACE_ROOT,
         client,
         profile,
-        data_workspace=account_workspace_root(),
+        data_workspace=storage_root,
         report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
         session_store=store,
@@ -5871,10 +6114,13 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         execution_account_id=str(current_auth_user().id),
         enabled_skill_ids=enabled_skill_ids(),
         friday_notification_handler=(
-            friday_notification_handler
-            if assistant_runtime_mode(conversation_id) == "friday"
+            notification_handler_for(conversation_id)
+            if runtime_profile_for(conversation_id).reminders_enabled
             else None
         ),
+        file_change_handler=update_file_reference_index,
+        agent_reminder_source=pending_agent_reminders,
+        sandbox_auto_allow=auto_approve,
     )
 
     def persist_task_plan(plan: list[dict[str, str]], explanation: str) -> None:
@@ -5887,9 +6133,29 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         store.save(session)
         debug_trace.emit("task_plan_updated", plan=plan, explanation=explanation)
 
+    reference_text = user_file_reference_text(session.messages)
+    visible_files = (
+        visible_file_reference_index(
+            workspace_root=storage_root,
+            index_path=file_index_path,
+        )
+        if extract_file_names(reference_text)
+        else {}
+    )
+    conversation_image_paths = refresh_conversation_image_paths(
+        session,
+        workspace_root=storage_root,
+        visible_files=visible_files,
+        index_path=file_index_path,
+    )
+    store.save(session)
     image_preparation = enrich_image_attachments_for_model(
         list(prepared_context.messages),
         profile,
+        workspace_root=storage_root,
+        visible_files=visible_files,
+        index_path=file_index_path,
+        conversation_image_paths=conversation_image_paths,
     )
     runtime_messages = image_preparation.messages
     runtime_system_context = (
@@ -5898,7 +6164,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         + agent_turn_time_context()
         + (
             memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
-            if assistant_runtime_mode(conversation_id) == "friday"
+            if runtime_profile_for(conversation_id).proactive_messages
             else ""
         )
         + project_context
@@ -5907,6 +6173,9 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             prepared_context.messages,
             skill_hint=skill_hint,
             context_file_paths=context_file_paths,
+            workspace_root=storage_root,
+            visible_files=visible_files,
+            index_path=file_index_path,
         )
     )
     runtime_message_count_before_run = len(runtime_messages)
@@ -5921,6 +6190,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         client=client,
         profile=profile,
         tools=tools,
+        workspace_root=account_workspace_root(),
         max_steps=max_steps,
         debug_trace=debug_trace,
         auto_approve=auto_approve,
@@ -5930,11 +6200,18 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
         reasoning_effort=reasoning_effort,
     )
+    nonstream_runtime = ConversationRuntime.from_messages(
+        runtime_messages, session_id=conversation_id
+    )
+    nonstream_base = len(nonstream_runtime.log.derive_transcript())
     result = agent.run_messages(
-        runtime_messages,
+        nonstream_runtime,
         system_context=runtime_system_context,
     )
-    session.messages.extend(dehydrate_model_messages(runtime_messages[runtime_message_count_before_run:]))
+    # History now lives in the log the run built, not in the list handed to it.
+    session.messages.extend(
+        dehydrate_model_messages((result.transcript or [])[nonstream_base:])
+    )
     final_content = result.final
     if contains_tool_call_markup(final_content):
         final_content = (
@@ -5948,7 +6225,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         session.messages[-1]["content"] = final_content
     clear_completed_task_plan(session)
     store.save(session)
-    if assistant_runtime_mode(conversation_id) == "friday":
+    if runtime_profile_for(conversation_id).memory_enabled:
         schedule_memory_refresh(
             client=client, profile=profile, session=session, conversation_id=conversation_id,
             conversation_title=str(session.metadata.get("title") or ""), project_id=project_id,
@@ -6005,9 +6282,16 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     messages = sanitize_chat_messages(payload.get("messages"))
     if not messages or messages[-1]["role"] != "user":
         raise ValueError("Chat messages must end with a user message.")
-    context_file_paths = sanitize_context_file_paths(payload.get("context_file_paths"))
+    storage_root = account_workspace_root()
+    file_index_path = user_file_reference_index_path()
+    context_file_paths = sanitize_context_file_paths(
+        payload.get("context_file_paths"),
+        workspace_root=storage_root,
+    )
     context_file_paths, project_context, project_id = resolve_project_chat_context(
-        payload.get("project_id"), context_file_paths
+        payload.get("project_id"),
+        context_file_paths,
+        workspace_root=storage_root,
     )
     conversation_id = resolve_conversation_id(payload, messages)
     skill_hint = normalize_skill_hint(payload.get("skill_hint"))
@@ -6284,7 +6568,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         WORKSPACE_ROOT,
         client,
         profile,
-        data_workspace=account_workspace_root(),
+        data_workspace=storage_root,
         report_data_root=user_data_dir(),
         include_shared_tools=current_auth_user().role == "admin",
         session_store=store,
@@ -6294,10 +6578,13 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         execution_turn_id=turn_runtime.turn_id,
         enabled_skill_ids=enabled_skill_ids(),
         friday_notification_handler=(
-            friday_notification_handler
-            if assistant_runtime_mode(conversation_id) == "friday"
+            notification_handler_for(conversation_id)
+            if runtime_profile_for(conversation_id).reminders_enabled
             else None
         ),
+        file_change_handler=update_file_reference_index,
+        agent_reminder_source=pending_agent_reminders,
+        sandbox_auto_allow=auto_approve,
     )
 
     def persist_stream_task_plan(plan: list[dict[str, str]], explanation: str) -> None:
@@ -6312,9 +6599,29 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         get_turn_store().update_metadata(turn_runtime.turn_id, {"task_plan": plan_state})
         debug_trace.emit("task_plan_updated", plan=plan, explanation=explanation)
 
+    reference_text = user_file_reference_text(session.messages)
+    visible_files = (
+        visible_file_reference_index(
+            workspace_root=storage_root,
+            index_path=file_index_path,
+        )
+        if extract_file_names(reference_text)
+        else {}
+    )
+    conversation_image_paths = refresh_conversation_image_paths(
+        session,
+        workspace_root=storage_root,
+        visible_files=visible_files,
+        index_path=file_index_path,
+    )
+    store.save(session)
     image_preparation = enrich_image_attachments_for_model(
         list(prepared_context.messages),
         profile,
+        workspace_root=storage_root,
+        visible_files=visible_files,
+        index_path=file_index_path,
+        conversation_image_paths=conversation_image_paths,
     )
     runtime_messages = image_preparation.messages
     runtime_system_context = (
@@ -6323,7 +6630,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         + agent_turn_time_context()
         + (
             memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
-            if assistant_runtime_mode(conversation_id) == "friday"
+            if runtime_profile_for(conversation_id).proactive_messages
             else ""
         )
         + project_context
@@ -6332,6 +6639,9 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             prepared_context.messages,
             skill_hint=skill_hint,
             context_file_paths=context_file_paths,
+            workspace_root=storage_root,
+            visible_files=visible_files,
+            index_path=file_index_path,
         )
     )
     runtime_message_count_before_run = len(runtime_messages)
@@ -6346,9 +6656,11 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         client=client,
         profile=profile,
         tools=tools,
+        workspace_root=account_workspace_root(),
         max_steps=max_steps,
         debug_trace=debug_trace,
         cancel_check=turn_runtime.cancelled,
+        pending_messages=turn_runtime.drain_messages,
         reasoning_effort=reasoning_effort,
         auto_approve=auto_approve,
         plan_update_callback=persist_stream_task_plan,
@@ -6356,6 +6668,39 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
         extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
     )
+    conversation_runtime = ConversationRuntime.from_messages(
+        runtime_messages, session_id=conversation_id
+    )
+    # Seeding drops history that cannot be projected, so the basis for "what
+    # this turn added" has to come from the log, not from the caller's list.
+    transcript_base = len(conversation_runtime.log.derive_transcript())
+    turn_mirror = DurableTurnMirror(
+        get_session_log_store(),
+        conversation_id,
+        skip_before_seq=conversation_runtime.log.seq,
+    )
+    conversation_runtime.writer = turn_mirror
+    turn_mirror.record_prompt(latest_user_message_content(conversation_runtime))
+    conversation_runtime.begin_turn(turn_runtime.turn_id, route="/api/agent/chat-stream")
+
+    def persist_runtime_history() -> None:
+        """Write back everything the turn recorded, on every exit path.
+
+        The old code persisted only on the success path, so a cancel or a
+        transport failure discarded the whole turn — including tool results
+        that had already cost minutes of real work.
+        """
+
+        # Persist the append-origin transcript, never the compacted model view:
+        # a replacement shadows history for the model only, and the projection
+        # it produces also shrinks, so slicing it by position misaligns.
+        turn_mirror.flush()
+        transcript = conversation_runtime.log.derive_transcript()
+        session.messages.extend(dehydrate_model_messages(transcript[transcript_base:]))
+        session.summary = prepared_context.summary
+        session.summary_message_count = prepared_context.summary_message_count
+        store.save(session)
+
     session_saved_after_run = False
     if image_preparation.notice:
         yield turn_runtime.emit(
@@ -6370,7 +6715,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         )
     try:
         for event in agent.iter_message_events(
-            runtime_messages,
+            conversation_runtime,
             system_context=runtime_system_context,
         ):
             turn_runtime.raise_if_cancelled()
@@ -6393,25 +6738,15 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                         "检测到模型把工具调用格式写入最终回复，后端已拦截，未展示原始工具JSON。"
                         "请重试刚才的请求；如果仍出现，请检查模型是否支持原生 tool calling。"
                     )
-                    last_runtime_message = runtime_messages[-1] if runtime_messages else None
-                    if isinstance(last_runtime_message, dict) and last_runtime_message.get("role") == "assistant":
-                        last_runtime_message["content"] = event["content"]
                 event["content"] = image_fallback_final_content(
                     str(event.get("content") or ""),
                     image_preparation.notice,
                 )
-                last_runtime_message = runtime_messages[-1] if runtime_messages else None
-                if isinstance(last_runtime_message, dict) and last_runtime_message.get("role") == "assistant":
-                    last_runtime_message["content"] = event["content"]
                 if not event.get("waiting_approval"):
                     clear_completed_task_plan(session)
-                session.messages.extend(
-                    dehydrate_model_messages(runtime_messages[runtime_message_count_before_run:])
-                )
-                session.summary = prepared_context.summary
-                session.summary_message_count = prepared_context.summary_message_count
-                store.save(session)
-                if assistant_runtime_mode(conversation_id) == "friday":
+                conversation_runtime.end_turn(TURN_END_COMPLETED)
+                persist_runtime_history()
+                if runtime_profile_for(conversation_id).memory_enabled:
                     schedule_memory_refresh(
                         client=client, profile=profile, session=session, conversation_id=conversation_id,
                         conversation_title=str(session.metadata.get("title") or ""), project_id=project_id,
@@ -6433,7 +6768,13 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 event["context_estimated_tokens"] = prepared_context.estimated_tokens
             yield turn_runtime.emit(event)
     except (AgentCancelled, TurnCancelled):
-        debug_trace.emit("http_chat_stream_cancelled", turn_id=turn_runtime.turn_id)
+        conversation_runtime.end_turn(TURN_END_ABORTED)
+        persist_runtime_history()
+        debug_trace.emit(
+            "http_chat_stream_cancelled",
+            turn_id=turn_runtime.turn_id,
+            stored_message_count=len(session.messages),
+        )
         yield turn_runtime.cancel_event()
         return
     except Exception as error:
@@ -6444,13 +6785,13 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             error=str(error),
             traceback=traceback.format_exc().splitlines()[-16:],
         )
+        conversation_runtime.end_turn(TURN_END_FAILED, detail=str(error))
+        persist_runtime_history()
         yield turn_runtime.fail_event(error)
         return
-    if not session_saved_after_run and len(runtime_messages) > runtime_message_count_before_run:
-        session.messages.extend(dehydrate_model_messages(runtime_messages[runtime_message_count_before_run:]))
-        session.summary = prepared_context.summary
-        session.summary_message_count = prepared_context.summary_message_count
-        store.save(session)
+    if not session_saved_after_run:
+        conversation_runtime.end_turn(TURN_END_COMPLETED)
+        persist_runtime_history()
         debug_trace.emit(
             "http_chat_stream_partial_saved",
             turn_id=turn_runtime.turn_id,
@@ -6559,14 +6900,19 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         execution_account_id=str(current_auth_user().id),
         execution_turn_id=turn_runtime.turn_id,
         enabled_skill_ids=enabled_skill_ids(),
+        file_change_handler=update_file_reference_index,
+        agent_reminder_source=pending_agent_reminders,
+        sandbox_auto_allow=pending_approval.get("auto_approve") is True,
     )
     agent = ReActAgent(
         client=client,
         profile=profile,
         tools=tools,
+        workspace_root=account_workspace_root(),
         max_steps=max(1, min(int(pending_approval.get("max_steps") or DEFAULT_MAX_STEPS), 60)),
         debug_trace=debug_trace,
         cancel_check=turn_runtime.cancelled,
+        pending_messages=turn_runtime.drain_messages,
         extra_system_context=extra_system_context,
         reasoning_effort=normalize_reasoning_effort(pending_approval.get("reasoning_effort")),
         auto_approve=pending_approval.get("auto_approve") is True,
@@ -6581,10 +6927,29 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         initial_task_plan=active_task_plan.get("steps", []) if isinstance(active_task_plan, dict) else [],
     )
 
+    resume_runtime = ConversationRuntime.from_messages(
+        runtime_messages, session_id=conversation_id
+    )
+    resume_transcript_base = len(resume_runtime.log.derive_transcript())
+    resume_mirror = DurableTurnMirror(
+        get_session_log_store(),
+        conversation_id,
+        skip_before_seq=resume_runtime.log.seq,
+    )
+    resume_runtime.writer = resume_mirror
+    resume_mirror.record_prompt(latest_user_message_content(resume_runtime))
+    resume_runtime.begin_turn(turn_runtime.turn_id, route="/api/agent/turns/:id/approve")
+
+    def persist_resume_history() -> None:
+        resume_mirror.flush()
+        transcript = resume_runtime.log.derive_transcript()
+        session.messages.extend(dehydrate_model_messages(transcript[resume_transcript_base:]))
+        session_store.save(session)
+
     session_saved_after_run = False
     try:
         for event in agent.iter_approved_tool_batch_events(
-            runtime_messages,
+            resume_runtime,
             pending_approval,
             system_context=system_context,
         ):
@@ -6636,9 +7001,6 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
                         "检测到模型把工具调用格式写入最终回复，后端已拦截，未展示原始工具JSON。"
                         "请重试刚才的请求；如果仍出现，请检查模型是否支持原生 tool calling。"
                     )
-                    last_runtime_message = runtime_messages[-1] if runtime_messages else None
-                    if isinstance(last_runtime_message, dict) and last_runtime_message.get("role") == "assistant":
-                        last_runtime_message["content"] = event["content"]
                 session.messages.extend(
                     message
                     for message in runtime_messages[runtime_message_count_before_run:]
@@ -6651,7 +7013,10 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
                     or 0
                 )
                 session_store.save(session)
+                # An approval wait keeps its turn open on purpose: the batch is
+                # parked, not finished, and resume must continue that same turn.
                 if not event.get("waiting_approval"):
+                    resume_runtime.end_turn(TURN_END_COMPLETED)
                     clear_completed_task_plan(session)
                     session_store.save(session)
                     turn_store.clear_pending_approval(turn_runtime.turn_id)
@@ -6677,6 +7042,8 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
                 )
             yield turn_runtime.emit(event)
     except (AgentCancelled, TurnCancelled):
+        resume_runtime.end_turn(TURN_END_ABORTED)
+        persist_resume_history()
         debug_trace.emit("approval_resume_cancelled", turn_id=turn_runtime.turn_id)
         yield turn_runtime.cancel_event()
         return
@@ -6688,11 +7055,13 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
             error=str(error),
             traceback=traceback.format_exc().splitlines()[-16:],
         )
+        resume_runtime.end_turn(TURN_END_FAILED, detail=str(error))
+        persist_resume_history()
         yield turn_runtime.fail_event(error)
         return
-    if not session_saved_after_run and len(runtime_messages) > runtime_message_count_before_run:
-        session.messages.extend(dehydrate_model_messages(runtime_messages[runtime_message_count_before_run:]))
-        session_store.save(session)
+    if not session_saved_after_run:
+        resume_runtime.end_turn(TURN_END_COMPLETED)
+        persist_resume_history()
         debug_trace.emit(
             "approval_resume_partial_saved",
             turn_id=turn_runtime.turn_id,
@@ -6814,11 +7183,75 @@ class ImageAttachmentPreparation:
     notice: str = ""
 
 
+CONVERSATION_IMAGE_PATHS_KEY = "conversation_image_paths"
+
+
+def user_file_reference_text(messages: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        str(message.get("content") or "")
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "user"
+    )
+
+
+def refresh_conversation_image_paths(
+    session: ConversationSession,
+    *,
+    workspace_root: Path,
+    visible_files: dict[str, list[str]],
+    index_path: Path | None = None,
+) -> list[str]:
+    """Persist the original image paths independently from the LLM text window.
+
+    Conversation compaction intentionally drops most old messages from the next
+    model request. Keeping this small path list lets a later visual question
+    rehydrate the original pixels without persisting Base64 or replacing the
+    image with lossy OCR text.
+    """
+
+    root = workspace_root.resolve()
+    candidates: list[str] = [
+        str(path)
+        for path in session.metadata.get(CONVERSATION_IMAGE_PATHS_KEY, [])
+        if isinstance(path, str)
+    ]
+    for message in session.messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        candidates.extend(
+            str(ref.get("path") or "")
+            for ref in extract_workspace_file_references(
+                str(message.get("content") or ""),
+                workspace_root=root,
+                visible_files=visible_files,
+                index_path=index_path,
+            )
+        )
+
+    image_paths: list[str] = []
+    seen: set[str] = set()
+    for raw_path in candidates:
+        normalized = normalize_workspace_reference_path(raw_path, workspace_root=root)
+        if not normalized or normalized in seen:
+            continue
+        candidate = (root / normalized).resolve()
+        mime_type = mimetypes.guess_type(candidate.name)[0] or ""
+        if not candidate.is_file() or not mime_type.startswith("image/"):
+            continue
+        seen.add(normalized)
+        image_paths.append(normalized)
+    session.metadata[CONVERSATION_IMAGE_PATHS_KEY] = image_paths
+    return image_paths
+
+
 def enrich_image_attachments_for_model(
     messages: list[dict[str, Any]],
     profile: ModelProfile,
     *,
     workspace_root: Path | None = None,
+    visible_files: dict[str, list[str]] | None = None,
+    index_path: Path | None = None,
+    conversation_image_paths: list[str] | None = None,
 ) -> ImageAttachmentPreparation:
     """Turn image paths embedded in chat messages into multimodal inputs.
 
@@ -6832,13 +7265,31 @@ def enrich_image_attachments_for_model(
     seen_paths: set[str] = set()
     attached_count = 0
     skipped_count = 0
+    candidate_names = {
+        name
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "user"
+        for name in extract_file_names(str(message.get("content") or ""))
+    }
+    if candidate_names and visible_files is None:
+        # Build/load the account index once for the whole turn. The old path
+        # rebuilt it once per historical user message.
+        visible_files = visible_file_reference_index(
+            workspace_root=root,
+            index_path=index_path,
+        )
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "user":
             enriched.append(message)
             continue
         text = str(message.get("content") or "")
         parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
-        for ref in extract_workspace_file_references(text):
+        for ref in extract_workspace_file_references(
+            text,
+            workspace_root=root,
+            visible_files=visible_files,
+            index_path=index_path,
+        ):
             path = str(ref.get("path") or "")
             candidate = (root / path).resolve()
             if root not in (candidate, *candidate.parents):
@@ -6865,6 +7316,57 @@ def enrich_image_attachments_for_model(
             enriched.append({**message, "content": parts})
         else:
             enriched.append(message)
+    retained_image_paths = [str(path) for path in (conversation_image_paths or []) if str(path)]
+    if retained_image_paths and not profile.supports_vision:
+        skipped_count += sum(1 for path in retained_image_paths if path not in seen_paths)
+    elif retained_image_paths:
+        target_index = next(
+            (
+                index
+                for index in range(len(enriched) - 1, -1, -1)
+                if isinstance(enriched[index], dict) and enriched[index].get("role") == "user"
+            ),
+            None,
+        )
+        if target_index is not None:
+            target = enriched[target_index]
+            original_content = target.get("content")
+            target_parts = (
+                list(original_content)
+                if isinstance(original_content, list)
+                else [{"type": "text", "text": str(original_content or "")}]
+            )
+            appended_retained_image = False
+            for path in retained_image_paths:
+                if path in seen_paths:
+                    continue
+                candidate = (root / path).resolve()
+                if root not in (candidate, *candidate.parents) or not candidate.is_file():
+                    continue
+                mime_type = mimetypes.guess_type(candidate.name)[0] or ""
+                if not mime_type.startswith("image/"):
+                    continue
+                try:
+                    encoded = base64.b64encode(candidate.read_bytes()).decode("ascii")
+                except OSError:
+                    continue
+                target_parts.extend(
+                    [
+                        {
+                            "type": "text",
+                            "text": f"\n\n[本会话持续视觉上下文：{path}]",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+                        },
+                    ]
+                )
+                seen_paths.add(path)
+                attached_count += 1
+                appended_retained_image = True
+            if appended_retained_image:
+                enriched[target_index] = {**target, "content": target_parts}
     notice = ""
     if skipped_count:
         notice = (
@@ -7058,7 +7560,11 @@ def sanitize_summary_message_count(raw_value: Any) -> int:
         return 0
 
 
-def sanitize_context_file_paths(raw_paths: Any) -> list[str]:
+def sanitize_context_file_paths(
+    raw_paths: Any,
+    *,
+    workspace_root: Path | None = None,
+) -> list[str]:
     if not isinstance(raw_paths, list):
         return []
     paths: list[str] = []
@@ -7067,7 +7573,10 @@ def sanitize_context_file_paths(raw_paths: Any) -> list[str]:
         if not isinstance(item, str):
             continue
         for candidate in split_workspace_reference_candidates(item):
-            normalized = normalize_workspace_reference_path(candidate)
+            normalized = normalize_workspace_reference_path(
+                candidate,
+                workspace_root=workspace_root,
+            )
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
@@ -7080,6 +7589,8 @@ def sanitize_context_file_paths(raw_paths: Any) -> list[str]:
 def resolve_project_chat_context(
     raw_project_id: Any,
     context_file_paths: list[str],
+    *,
+    workspace_root: Path | None = None,
 ) -> tuple[list[str], str, str]:
     if not raw_project_id:
         return context_file_paths, "", ""
@@ -7108,7 +7619,10 @@ def resolve_project_chat_context(
         *(str(item.get("path") or "") for item in files),
         *context_file_paths,
     ]:
-        normalized = normalize_workspace_reference_path(path)
+        normalized = normalize_workspace_reference_path(
+            path,
+            workspace_root=workspace_root,
+        )
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
@@ -7302,46 +7816,25 @@ def build_chat_session_system_context(
     *,
     skill_hint: str | None = None,
     context_file_paths: list[str] | None = None,
+    workspace_root: Path | None = None,
+    visible_files: dict[str, list[str]] | None = None,
+    index_path: Path | None = None,
 ) -> str:
     transcript = serialize_runtime_messages_for_context(session_messages)
-    known_file_refs = extract_workspace_file_references(transcript, context_file_paths=context_file_paths)
+    known_file_refs = extract_workspace_file_references(
+        transcript,
+        context_file_paths=context_file_paths,
+        workspace_root=workspace_root,
+        visible_files=visible_files,
+        index_path=index_path,
+    )
     known_paths_block = render_known_file_references(known_file_refs)
     skills_block = render_chat_skill_catalog()
-    skill_instruction = ""
-    meeting_intent = skill_hint == "meeting-minutes" or looks_like_meeting_minutes_request(transcript)
-    official_document_intent = (
-        skill_hint == "official-document" or looks_like_official_document_request(transcript)
+    # 技能由模型按索引里的 description 自行匹配。这里只传达用户在界面上做出的
+    # 显式选择——那是用户意图，不是我们替模型猜的意图。
+    skill_instruction = (
+        f"\n\n用户为本轮显式选择了技能 {skill_hint}。\n" if skill_hint else ""
     )
-    if skill_hint == "official-document":
-        skill_instruction = (
-            "\n\n本轮已选技能：official-document。先调用 "
-            "sys_skill(op='open', skill_id='official-document') 判断文种、要素和格式，"
-            "形成内容与文档规格后，再调用 sys_skill(op='open', skill_id='docx')，"
-            "由完整 Word 技能生成、编辑并验收最终文件。"
-        )
-    elif meeting_intent:
-        skill_instruction = (
-            "\n\n本轮匹配技能：meeting-minutes。先调用 "
-            "sys_skill(op='open', skill_id='meeting-minutes') 载入完整流程，再按说明执行。"
-        )
-    elif official_document_intent:
-        skill_instruction = (
-            "\n\n本轮匹配默认启用技能：official-document。先调用 "
-            "sys_skill(op='open', skill_id='official-document') 判断文种、要素和格式，"
-            "形成内容与文档规格后，再调用 sys_skill(op='open', skill_id='docx')，"
-            "由完整 Word 技能生成、编辑并验收最终文件。"
-        )
-    elif skill_hint:
-        skill_instruction = (
-            f"\n\n已选技能：{skill_hint}。"
-            f"先调用 sys_skill(op='open', skill_id='{skill_hint}') 载入说明，"
-            "技能专用工具通过 sys_skill 的 show/call 分层使用。"
-        )
-    elif looks_like_office_request(transcript):
-        skill_instruction = (
-            "\n\n本轮包含办公文件。根据文件类型从技能索引选择 docx/pdf/pptx/xlsx，"
-            "先用 sys_skill.open 载入说明，再通过 sys_skill.show/call 使用对应能力。"
-        )
     return (
         "\n\n当前会话动态上下文：最近消息以标准 messages 形式提供；较新的消息和工具结果优先。\n"
         f"{skills_block}{known_paths_block}{skill_instruction}\n"
@@ -7371,6 +7864,9 @@ def format_chat_goal(
     skill_hint: str | None = None,
     context_file_paths: list[str] | None = None,
     conversation_summary: str = "",
+    workspace_root: Path | None = None,
+    visible_files: dict[str, list[str]] | None = None,
+    index_path: Path | None = None,
 ) -> str:
     transcript = serialize_chat_transcript(messages)
     summary_block = (
@@ -7379,39 +7875,18 @@ def format_chat_goal(
         if conversation_summary
         else ""
     )
-    known_file_refs = extract_workspace_file_references(transcript, context_file_paths=context_file_paths)
+    known_file_refs = extract_workspace_file_references(
+        transcript,
+        context_file_paths=context_file_paths,
+        workspace_root=workspace_root,
+        visible_files=visible_files,
+        index_path=index_path,
+    )
     known_paths_block = render_known_file_references(known_file_refs)
     skills_block = render_chat_skill_catalog()
-    skill_instruction = ""
-    meeting_intent = skill_hint == "meeting-minutes" or looks_like_meeting_minutes_request(transcript)
-    official_document_intent = (
-        skill_hint == "official-document" or looks_like_official_document_request(transcript)
+    skill_instruction = (
+        f"\n\n用户为本轮显式选择了技能 {skill_hint}。\n" if skill_hint else ""
     )
-    if skill_hint == "official-document":
-        skill_instruction = (
-            "\n\n本轮已选技能 official-document：先调用 sys_skill.open 读取公文说明，"
-            "形成内容与文档规格后，再打开 docx 技能生成、编辑和验收 Word。"
-        )
-    elif meeting_intent:
-        skill_instruction = (
-            "\n\n本轮匹配技能 meeting-minutes：先调用 sys_skill.open 读取完整说明，"
-            "再通过 sys_skill.show/call 使用技能专用能力。"
-        )
-    elif official_document_intent:
-        skill_instruction = (
-            "\n\n本轮匹配默认启用技能 official-document：先调用 sys_skill.open 读取公文说明，"
-            "形成内容与文档规格后，再打开 docx 技能生成、编辑和验收 Word。"
-        )
-    elif skill_hint:
-        skill_instruction = (
-            f"\n\n已选技能 {skill_hint}：先调用 sys_skill.open 读取说明，"
-            "再通过 sys_skill.show/call 使用技能专用能力。"
-        )
-    elif looks_like_office_request(transcript):
-        skill_instruction = (
-            "\n\n本轮包含办公文件：从技能索引选择 docx/pdf/pptx/xlsx，"
-            "先调用 sys_skill.open，再通过 sys_skill.show/call 执行。"
-        )
     return (
         "你正在作为本地工作智能体与用户连续对话。"
         "core 文件与终端工具常驻；技能通过 sys_skill、外部 MCP 通过 mcporter 分层调用。"
@@ -7431,24 +7906,43 @@ def format_chat_goal(
 
 
 def render_chat_skill_catalog() -> str:
+    """One line per skill: the id to open it, and enough text to match against.
+
+    The model routes on meaning, so it needs the description and nothing else.
+    Labels, mentions and enabled flags are for the frontend; carrying them here
+    cost more characters than the descriptions themselves.
+    """
+
     skills = skill_catalog_payload()["skills"]
     if not skills:
         return ""
-    compact_skills = [
-        {
-            "id": str(skill.get("id") or ""),
-            "label": str(skill.get("label") or ""),
-            "mention": str(skill.get("mention") or ""),
-            "description": str(skill.get("description") or ""),
-            "when_to_use": str(skill.get("when_to_use") or ""),
-            "enabled": bool(skill.get("enabled", skill.get("default_enabled", False))),
-        }
-        for skill in skills
-    ]
-    return (
-        "当前已安装技能索引（只含路由摘要；匹配后用 sys_skill.open 读取完整说明）：\n"
-        f"{json.dumps(compact_skills, ensure_ascii=False, indent=2)}\n\n"
-    )
+    lines: list[str] = []
+    disabled: list[str] = []
+    for skill in skills:
+        skill_id = str(skill.get("id") or "").strip()
+        if not skill_id:
+            continue
+        if not bool(skill.get("enabled", skill.get("default_enabled", False))):
+            disabled.append(skill_id)
+            continue
+        summary = " ".join(
+            part
+            for part in (
+                str(skill.get("description") or "").strip(),
+                str(skill.get("when_to_use") or "").strip(),
+            )
+            if part
+        )
+        lines.append(f"- {skill_id}：{summary}" if summary else f"- {skill_id}")
+    if not lines and not disabled:
+        return ""
+    block = "已安装技能（任务匹配某条描述时，用 sys_skill.open 读取它的完整说明）：\n"
+    block += "\n".join(lines)
+    if disabled:
+        # Naming them costs one line and prevents "I can't do that" when the
+        # capability exists but is switched off.
+        block += "\n未启用（需用户先在网页技能页开启）：" + "、".join(disabled)
+    return block + "\n\n"
 
 
 def extract_workspace_paths(text: str) -> list[str]:
@@ -7475,28 +7969,43 @@ def extract_workspace_paths(text: str) -> list[str]:
 def extract_workspace_file_references(
     text: str,
     context_file_paths: list[str] | None = None,
+    *,
+    workspace_root: Path | None = None,
+    visible_files: dict[str, list[str]] | None = None,
+    index_path: Path | None = None,
 ) -> list[dict[str, str]]:
     refs: list[dict[str, str]] = []
     seen_paths: set[str] = set()
 
     for path in context_file_paths or []:
         for candidate in split_workspace_reference_candidates(path):
-            normalized = normalize_workspace_reference_path(candidate)
+            normalized = normalize_workspace_reference_path(
+                candidate,
+                workspace_root=workspace_root,
+            )
             if not normalized or normalized in seen_paths:
                 continue
             seen_paths.add(normalized)
             refs.append({"path": normalized, "source": "context"})
 
     for path in extract_workspace_paths(text):
-        normalized = normalize_workspace_reference_path(path)
+        normalized = normalize_workspace_reference_path(
+            path,
+            workspace_root=workspace_root,
+        )
         if not normalized or normalized in seen_paths:
             continue
         seen_paths.add(normalized)
         refs.append({"path": normalized, "source": "path"})
 
-    visible_files = visible_file_reference_index()
-    for name in extract_file_names(text):
-        for path in visible_files.get(name, []):
+    candidate_names = extract_file_names(text)
+    if candidate_names and visible_files is None:
+        visible_files = visible_file_reference_index(
+            workspace_root=workspace_root,
+            index_path=index_path,
+        )
+    for name in candidate_names:
+        for path in (visible_files or {}).get(name, []):
             if path in seen_paths:
                 continue
             seen_paths.add(path)
@@ -7538,8 +8047,13 @@ def render_known_file_references(refs: list[dict[str, str]]) -> str:
     )
 
 
-def normalize_workspace_reference_path(path: str) -> str:
-    workspace_prefix = f"{WORKSPACE_ROOT.as_posix()}/"
+def normalize_workspace_reference_path(
+    path: str,
+    *,
+    workspace_root: Path | None = None,
+) -> str:
+    root = (workspace_root or WORKSPACE_ROOT).resolve()
+    workspace_prefix = f"{root.as_posix()}/"
     candidate = path.strip().strip("`'\"").rstrip("，。；;、,.!?！？:：)]}")
     if not candidate or any(ord(char) < 32 for char in candidate):
         return ""
@@ -7559,10 +8073,10 @@ def normalize_workspace_reference_path(path: str) -> str:
     ):
         return ""
     try:
-        resolved = (WORKSPACE_ROOT / candidate).resolve()
+        resolved = (root / candidate).resolve()
     except (OSError, RuntimeError, ValueError):
         return ""
-    if WORKSPACE_ROOT not in (resolved, *resolved.parents):
+    if root not in (resolved, *resolved.parents):
         return ""
     try:
         exists = resolved.exists()
@@ -7570,7 +8084,7 @@ def normalize_workspace_reference_path(path: str) -> str:
         return ""
     if not exists:
         return candidate
-    return str(resolved.relative_to(WORKSPACE_ROOT))
+    return str(resolved.relative_to(root))
 
 
 def split_workspace_reference_candidates(value: str) -> list[str]:
@@ -7639,23 +8153,53 @@ def extract_file_names(text: str) -> list[str]:
     return names
 
 
-def visible_file_reference_index() -> dict[str, list[str]]:
-    files: list[Path] = []
-    for root_name in ("meet_files", "产出材料", "分析材料", "学习笔记"):
-        root = WORKSPACE_ROOT / root_name
-        if not root.exists():
-            continue
-        for item in root.rglob("*"):
-            if item.is_file() and is_file_library_visible(item):
-                files.append(item)
+def account_file_reference_index(
+    *,
+    workspace_root: Path | None = None,
+    index_path: Path | None = None,
+) -> PersistentFileReferenceIndex:
+    root = (workspace_root or account_workspace_root()).resolve()
+    if index_path is not None:
+        persistent_path = index_path.resolve()
+    elif workspace_root is not None:
+        persistent_path = root / ".work_agent" / "file_reference_index.json"
+    else:
+        persistent_path = user_file_reference_index_path().resolve()
+    scan_roots = [
+        root / "meet_files",
+        root / "产出材料",
+        root / "分析材料",
+        root / "学习笔记",
+    ]
+    return get_persistent_file_reference_index(
+        workspace_root=root,
+        index_path=persistent_path,
+        scan_roots=scan_roots,
+        is_visible=lambda path, root=root: is_file_library_visible(path, workspace_root=root),
+    )
 
-    files.sort(key=lambda item: int(item.stat().st_mtime), reverse=True)
-    index: dict[str, list[str]] = {}
-    for item in files:
-        name = item.name
-        path = str(item.relative_to(WORKSPACE_ROOT))
-        index.setdefault(name, []).append(path)
-    return index
+
+def visible_file_reference_index(
+    *,
+    workspace_root: Path | None = None,
+    index_path: Path | None = None,
+) -> dict[str, list[str]]:
+    """Load one persistent, account-scoped filename index for the current turn."""
+
+    return account_file_reference_index(
+        workspace_root=workspace_root,
+        index_path=index_path,
+    ).snapshot()
+
+
+def update_file_reference_index(path: Path) -> None:
+    """Immediately register a file created through a known Work Agent route."""
+
+    account_file_reference_index().upsert(path)
+
+
+def remove_from_file_reference_index(path: Path) -> None:
+    account_file_reference_index().remove(path)
 
 
 def looks_like_meeting_minutes_request(text: str) -> bool:
@@ -7666,81 +8210,6 @@ def looks_like_meeting_minutes_request(text: str) -> bool:
     return (
         any(word in normalized for word in meeting_words)
         and (any(word in normalized for word in audio_words) or any(word in normalized for word in output_words))
-    )
-
-
-def looks_like_office_request(text: str) -> bool:
-    normalized = text.lower()
-    cues = (
-        ".docx",
-        ".xlsx",
-        ".xlsm",
-        ".csv",
-        ".tsv",
-        ".pptx",
-        ".pdf",
-        "word",
-        "excel",
-        "ppt",
-        "pdf",
-        "文档",
-        "表格",
-        "幻灯片",
-        "演示",
-        "研报",
-        "白皮书",
-    )
-    return any(cue in normalized for cue in cues)
-
-
-def looks_like_official_document_request(text: str) -> bool:
-    normalized = text.lower()
-    explicit_cues = (
-        "公文格式",
-        "正式发文",
-        "红头文件",
-        "发文字号",
-        "主送机关",
-        "抄送机关",
-        "签发人",
-        "版记",
-        "gb/t 9704",
-        "gbt 9704",
-    )
-    if any(cue in normalized for cue in explicit_cues):
-        return True
-    document_types = (
-        "请示",
-        "批复",
-        "通报",
-        "通告",
-        "公告",
-        "公报",
-        "议案",
-        "命令",
-        "决定",
-        "决议",
-        "意见",
-        "通知",
-        "报告",
-        "函",
-        "纪要",
-    )
-    action_cues = (
-        "写",
-        "起草",
-        "撰写",
-        "制作",
-        "生成",
-        "形成",
-        "修改",
-        "润色",
-        "排版",
-        "转word",
-        "转 word",
-    )
-    return any(kind in normalized for kind in document_types) and any(
-        action in normalized for action in action_cues
     )
 
 
@@ -8046,12 +8515,18 @@ def main() -> int:
     atexit.register(stop_asr_worker)
     atexit.register(lambda: VAD_WORKER.stop() if VAD_WORKER else None)
     gateway = get_weixin_gateway()
-    for user in auth_store.list_users():
+    users = auth_store.list_users()
+    for user in users:
         gateway.ensure_worker(user.id, user_weixin_state_dir(user))
     atexit.register(gateway.stop_all)
     start_friday_scheduler()
     atexit.register(stop_friday_scheduler)
     server = ThreadingHTTPServer((args.host, args.port), WorkAgentHandler)
+    for user in users:
+        account_file_reference_index(
+            workspace_root=account_workspace_root(user),
+            index_path=user_file_reference_index_path(user),
+        ).warm_async()
     print(f"Work Agent web server running at http://{args.host}:{args.port}")
     print(f"Workspace: {WORKSPACE_ROOT}")
     server.serve_forever()

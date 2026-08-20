@@ -123,12 +123,19 @@ def build_default_tools(
     execution_turn_id: str = "",
     enabled_skill_ids: set[str] | None = None,
     friday_notification_handler: Callable[[dict[str, Any]], str] | None = None,
+    agent_reminder_source: Callable[[], list[dict[str, Any]]] | None = None,
+    file_change_handler: Callable[[Path], None] | None = None,
+    sandbox_auto_allow: bool = False,
 ) -> ToolBus:
     bus = ToolBus()
     private_workspace = data_workspace or workspace
 
     core_tools = LocalToolProvider("core", provider_kind="local")
-    register_file_tools(core_tools.registry, private_workspace)
+    register_file_tools(
+        core_tools.registry,
+        private_workspace,
+        on_file_changed=file_change_handler,
+    )
     register_shell_tools(
         core_tools.registry,
         private_workspace,
@@ -137,6 +144,7 @@ def build_default_tools(
         turn_id=execution_turn_id,
         conversation_id=str(conversation_id or ""),
         project_id=str(project_id or ""),
+        sandbox_auto_allow=sandbox_auto_allow,
     )
     if session_store is not None and conversation_id:
         register_history_recall_tool(
@@ -150,9 +158,10 @@ def build_default_tools(
             Tool(
                 name="notify_user",
                 description=(
-                    "Friday-only delivery interface. Use kind=reminder for a one-way bell notification "
-                    "that needs no reply; use kind=conversation for an important proactive message that "
-                    "should appear in Friday's ongoing conversation and invite a response."
+                    "Deliver something to the user outside this reply. Use kind=reminder for a one-way "
+                    "bell notification that needs no answer — available in any chat. Use kind=conversation "
+                    "for an important proactive message in the persistent assistant conversation; runtimes "
+                    "without that capability are refused and should send a reminder instead."
                 ),
                 parameters={
                     "type": "object",
@@ -185,7 +194,11 @@ def build_default_tools(
     # reads plus explicitly user-requested Reminder creation; Calendar events
     # and browser-side writes stay unavailable to the model.
     apple_pim_tools = LocalToolProvider("apple-schedule", provider_kind="skill")
-    register_apple_pim_tools(apple_pim_tools.registry, ApplePimService(workspace))
+    register_apple_pim_tools(
+        apple_pim_tools.registry,
+        ApplePimService(workspace),
+        agent_reminder_source=agent_reminder_source,
+    )
     bus.add_provider(apple_pim_tools)
 
     work_report_tools = LocalToolProvider("work-reports", provider_kind="skill")
@@ -342,7 +355,7 @@ def parse_args(argv: list[str] | None) -> Namespace:
     models_add.add_argument("--model", required=True)
     models_add.add_argument("--api-key-env", required=True)
     models_add.add_argument("--temperature", type=float, default=0.6)
-    models_add.add_argument("--max-tokens", type=int, default=8192)
+    models_add.add_argument("--max-tokens", type=int, default=16384)
     models_add.add_argument("--timeout-seconds", type=int, default=120)
     models_add.add_argument("--set-default", action="store_true")
 

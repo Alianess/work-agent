@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from work_agent_core.config import ModelProfile
+from work_agent_core.file_reference_index import PersistentFileReferenceIndex
+from work_agent_core.session_store import ConversationSession
+from work_agent_core import web_server
+
+
+class PersistentFileReferenceIndexTests(unittest.TestCase):
+    def make_index(self, root: Path, index_path: Path) -> PersistentFileReferenceIndex:
+        return PersistentFileReferenceIndex(
+            workspace_root=root,
+            index_path=index_path,
+            scan_roots=[root / "meet_files"],
+            is_visible=lambda path: path.suffix.lower() in {".png", ".md"},
+            refresh_interval_seconds=3600,
+        )
+
+    def test_persisted_snapshot_is_reused_without_rescanning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            image = root / "meet_files" / "attachments" / "history.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            index_path = root / "state" / "file_reference_index.json"
+
+            first = self.make_index(root, index_path)
+            self.assertEqual(first.snapshot()["history.png"], ["meet_files/attachments/history.png"])
+            self.assertTrue(index_path.is_file())
+
+            second = self.make_index(root, index_path)
+            with patch(
+                "work_agent_core.file_reference_index.os.walk",
+                side_effect=AssertionError("persisted index should not rescan"),
+            ):
+                second.warm_async()
+                self.assertEqual(
+                    second.snapshot()["history.png"],
+                    ["meet_files/attachments/history.png"],
+                )
+
+    def test_index_never_crosses_its_account_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            first_root = base / "u1" / "workspace"
+            second_root = base / "u2" / "workspace"
+            first_file = first_root / "meet_files" / "attachments" / "private.png"
+            second_file = second_root / "meet_files" / "attachments" / "private.png"
+            first_file.parent.mkdir(parents=True)
+            second_file.parent.mkdir(parents=True)
+            first_file.write_bytes(b"u1")
+            second_file.write_bytes(b"u2")
+
+            index = self.make_index(first_root, base / "u1" / "file_reference_index.json")
+
+            self.assertEqual(
+                index.snapshot()["private.png"],
+                ["meet_files/attachments/private.png"],
+            )
+            payload = (base / "u1" / "file_reference_index.json").read_text(encoding="utf-8")
+            self.assertNotIn(str(second_root), payload)
+
+    def test_attachment_visibility_uses_explicit_account_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "member-workspace"
+            image = root / "meet_files" / "attachments" / "private.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"member")
+
+            self.assertTrue(
+                web_server.is_file_library_visible(image, workspace_root=root)
+            )
+
+    def test_known_write_updates_and_delete_removes_persistent_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            index = self.make_index(root, root / "state" / "file_reference_index.json")
+            self.assertEqual(index.snapshot(), {})
+            image = root / "meet_files" / "attachments" / "new.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"new")
+
+            index.upsert(image)
+            self.assertEqual(index.snapshot()["new.png"], ["meet_files/attachments/new.png"])
+
+            image.unlink()
+            index.remove(image)
+            self.assertNotIn("new.png", index.snapshot())
+
+
+class HistoricalVisionContextTests(unittest.TestCase):
+    @staticmethod
+    def profile(*, supports_vision: bool = True) -> ModelProfile:
+        return ModelProfile(
+            name="vision-test",
+            provider="openai-compatible",
+            base_url="https://api.example.com/v1",
+            model="vision-test",
+            api_key_env="TEST_KEY",
+            supports_vision=supports_vision,
+        )
+
+    def test_filename_index_is_loaded_once_for_all_historical_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            image = root / "meet_files" / "attachments" / "history.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            messages = [
+                {"role": "user", "content": "请看 history.png"},
+                {"role": "assistant", "content": "我看到了。"},
+                {"role": "user", "content": "继续看 history.png 的右下角"},
+            ]
+
+            with patch.object(
+                web_server,
+                "visible_file_reference_index",
+                return_value={"history.png": ["meet_files/attachments/history.png"]},
+            ) as load_index:
+                prepared = web_server.enrich_image_attachments_for_model(
+                    messages,
+                    self.profile(),
+                    workspace_root=root,
+                )
+
+            self.assertEqual(load_index.call_count, 1)
+            self.assertEqual(prepared.attached_count, 1)
+
+    def test_later_question_keeps_original_image_pixels_in_model_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            image = root / "meet_files" / "attachments" / "history.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            messages = [
+                {"role": "user", "content": "图片 meet_files/attachments/history.png"},
+                {"role": "assistant", "content": "已经看到了。"},
+                {"role": "user", "content": "右下角那个很小的图标是什么？"},
+            ]
+
+            prepared = web_server.enrich_image_attachments_for_model(
+                messages,
+                self.profile(),
+                workspace_root=root,
+                visible_files={},
+            )
+
+            first_content = prepared.messages[0]["content"]
+            self.assertIsInstance(first_content, list)
+            self.assertTrue(first_content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+            self.assertEqual(prepared.messages[2], messages[2])
+
+    def test_compacted_history_rehydrates_persisted_conversation_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            image = root / "meet_files" / "attachments" / "history.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            session = ConversationSession(
+                id="vision-context",
+                messages=[
+                    {"role": "user", "content": "图片 meet_files/attachments/history.png"},
+                    {"role": "assistant", "content": "已经看到了。"},
+                ],
+            )
+
+            retained = web_server.refresh_conversation_image_paths(
+                session,
+                workspace_root=root,
+                visible_files={},
+            )
+            prepared = web_server.enrich_image_attachments_for_model(
+                [{"role": "user", "content": "右下角的小图标是什么？"}],
+                self.profile(),
+                workspace_root=root,
+                visible_files={},
+                conversation_image_paths=retained,
+            )
+
+            self.assertEqual(
+                session.metadata[web_server.CONVERSATION_IMAGE_PATHS_KEY],
+                ["meet_files/attachments/history.png"],
+            )
+            current_content = prepared.messages[0]["content"]
+            self.assertIsInstance(current_content, list)
+            self.assertIn("持续视觉上下文", current_content[1]["text"])
+            self.assertTrue(current_content[2]["image_url"]["url"].startswith("data:image/png;base64,"))
+            self.assertEqual(prepared.attached_count, 1)
+
+    def test_plain_text_history_does_not_touch_the_file_index(self) -> None:
+        messages = [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好。"},
+            {"role": "user", "content": "继续"},
+        ]
+
+        with patch.object(
+            web_server,
+            "visible_file_reference_index",
+            side_effect=AssertionError("plain text should not load the file index"),
+        ):
+            prepared = web_server.enrich_image_attachments_for_model(
+                messages,
+                self.profile(supports_vision=False),
+            )
+
+        self.assertEqual(prepared.messages, messages)
+
+
+if __name__ == "__main__":
+    unittest.main()

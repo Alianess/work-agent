@@ -1406,7 +1406,7 @@ export default function App() {
 
   function draftWorkReportRequest(kind: "daily" | "weekly" | "biweekly") {
     const label = kind === "daily" ? "日报" : kind === "weekly" ? "周报" : "双周报";
-    setChatInput(`请使用日报周报双周报技能，以 ${selectedWorkDate} 为基准生成${label}。先复用已有日报，只在缺口处回查工作证据。`);
+    setChatInput(`请使用日报周报双周报技能，以 ${selectedWorkDate} 为基准生成${label}。先复用已有日报，只在缺口处回查工作证据。按向部门领导提交的口径，写本人推进的业务事项、阶段结果和后续节点；不要写智能体、ASR/OCR、录音分块、Markdown/Word/PDF、文件转换、归档或格式校验等生产细节。`);
     setViewWithUrl("agent");
   }
 
@@ -3838,7 +3838,25 @@ export default function App() {
     setSelectedSkill(null);
     setAttachments([]);
     const conversationId = currentConversationIdRef.current;
-    if (activeChatRunsRef.current.has(conversationId)) {
+    const activeRun = activeChatRunsRef.current.get(conversationId);
+    if (activeRun) {
+      // Plain text can steer the run that is already going: it lands before the
+      // agent's next decision instead of waiting for a whole new turn. Anything
+      // that needs a fresh turn setup — attachments, an explicitly chosen skill
+      // — still queues as before.
+      const canSteer =
+        Boolean(activeRun.turnId) && queuedItem.attachments.length === 0 && !queuedItem.skill;
+      if (canSteer) {
+        try {
+          const result = await api.queueTurnMessage(activeRun.turnId as string, queuedItem.content);
+          if (result.ok) {
+            setStatus({ tone: "loading", text: "已发给正在运行的这一轮，会在下一步生效" });
+            return;
+          }
+        } catch {
+          // Fall through to the queue: a failed hand-off must not lose the message.
+        }
+      }
       const queue = [...(queuedChatMessagesRef.current.get(conversationId) ?? []), queuedItem];
       queuedChatMessagesRef.current.set(conversationId, queue);
       setQueuedChatCount(queue.length);
@@ -4054,6 +4072,11 @@ export default function App() {
           } else if (streamEvent.event === "activity") {
             appendDraftActivity(streamEvent);
           } else if (streamEvent.event === "activity_delta") {
+            if (streamEvent.stream_status === "network_retry") {
+              // Transient connection trouble. Say so, and say the model is not
+              // being swapped — a different endpoint would be a different model.
+              setStatus({ tone: "loading", text: "网络未就绪，正在重试同一模型端点…" });
+            }
             appendDraftActivityDelta(streamEvent);
           } else if (streamEvent.event === "delta" || streamEvent.event === "draft_delta") {
             streamedContent += streamEvent.content;
@@ -4487,6 +4510,11 @@ export default function App() {
           } else if (streamEvent.event === "activity") {
             appendDraftActivity(streamEvent);
           } else if (streamEvent.event === "activity_delta") {
+            if (streamEvent.stream_status === "network_retry") {
+              // Transient connection trouble. Say so, and say the model is not
+              // being swapped — a different endpoint would be a different model.
+              setStatus({ tone: "loading", text: "网络未就绪，正在重试同一模型端点…" });
+            }
             appendDraftActivityDelta(streamEvent);
           } else if (streamEvent.event === "delta" || streamEvent.event === "draft_delta") {
             streamedContent += streamEvent.content;
@@ -11592,6 +11620,19 @@ function buildActivityDisplayItems(events: AgentActivityEvent[]): ActivityDispla
     });
   });
   flushGroup();
+  if (displayItems.length === 0 && normalizedEvents.length > 0) {
+    // A turn that answered directly has no tool work to show, and the routine
+    // lifecycle events are all hidden as noise. Falling through to "no activity"
+    // then reads as a bug rather than as "nothing needed doing", so keep the
+    // model-thinking entry, which is what this turn actually did.
+    const thinking = normalizedEvents.filter((event) => /模型思考$/.test(event.title));
+    const fallback = thinking.length > 0 ? thinking[thinking.length - 1] : normalizedEvents[normalizedEvents.length - 1];
+    displayItems.push({
+      kind: "event",
+      key: fallback.id ?? "activity-direct-answer",
+      event: fallback
+    });
+  }
   return displayItems;
 }
 

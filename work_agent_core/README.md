@@ -188,7 +188,7 @@ meeting_audio_minutes/meeting_minutes_spec.md
   "model": "model-name",
   "api_key_env": "MY_MODEL_API_KEY",
   "temperature": 0.6,
-  "max_tokens": 4096,
+  "max_tokens": 16384,
   "timeout_seconds": 120
 }
 ```

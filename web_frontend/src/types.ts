@@ -704,6 +704,8 @@ export type AgentStreamEvent =
       input_summary?: string;
       result_summary?: string;
       activity_type?: "command" | "file_edit" | "work_note" | "runtime_summary" | "plan" | "approval_review";
+      /** What the model stream is doing right now, when this delta reports on it. */
+      stream_status?: "recovery_started" | "recovery_streaming" | "network_retry" | string;
       plan?: Array<{ step: string; status: "pending" | "in_progress" | "completed" }>;
       plan_completed?: number;
       plan_total?: number;

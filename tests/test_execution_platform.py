@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
+import subprocess
 import tempfile
 import unittest
 
-from work_agent_core.execution.backends import TrustedHostBackend
+from work_agent_core.execution.backends import SeatbeltBackend, TrustedHostBackend
 from work_agent_core.execution.models import (
     BackendKind,
     CapabilitySet,
@@ -147,6 +149,29 @@ class ExecutionPlatformTests(unittest.TestCase):
         self.assertEqual(deferred.error.code, "WORKSPACE_CONFLICT")
         self.assertEqual((self.root / "source.txt").read_text(encoding="utf-8"), "newer source\n")
 
+    def test_discard_changes_keeps_read_only_execution_out_of_the_source_workspace(self) -> None:
+        with patch.object(self.orchestrator.workspace, "capture_changes") as capture_changes:
+            result = self.orchestrator.submit(
+                self.request(
+                    key="discard-readonly",
+                    command=CommandSpec(
+                        argv=(
+                            "/usr/bin/python3",
+                            "-c",
+                            "from pathlib import Path; Path('ephemeral.txt').write_text('private')",
+                        )
+                    ),
+                    delivery_mode="discard_changes",
+                ),
+                source_root=self.root,
+            )
+
+        self.assertEqual(result.status, ExecutionStatus.SUCCEEDED)
+        self.assertEqual(result.delivery_status.value, "validated")
+        self.assertIsNone(result.change_set_id)
+        self.assertFalse((self.root / "ephemeral.txt").exists())
+        capture_changes.assert_not_called()
+
     def test_cancel_kills_process_before_delayed_side_effect(self) -> None:
         result = self.orchestrator.submit(
             self.request(
@@ -173,6 +198,45 @@ class ExecutionPlatformTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.backend, BackendKind.MACOS_SEATBELT)
+
+    def test_seatbelt_health_explains_nested_parent_sandbox(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="sandbox-exec: sandbox_apply: Operation not permitted\n",
+        )
+        with patch("work_agent_core.execution.backends.seatbelt.subprocess.run", return_value=completed):
+            health = SeatbeltBackend(sandbox_exec="/usr/bin/true").health()
+
+        self.assertFalse(health.available)
+        self.assertIn("不允许嵌套 Seatbelt", health.detail)
+        self.assertIn("launchd", health.detail)
+
+    def test_seatbelt_health_keeps_a_useful_error_when_probe_is_silent(self) -> None:
+        completed = subprocess.CompletedProcess(args=[], returncode=71, stdout="", stderr="")
+        with patch("work_agent_core.execution.backends.seatbelt.subprocess.run", return_value=completed):
+            health = SeatbeltBackend(sandbox_exec="/usr/bin/true").health()
+
+        self.assertFalse(health.available)
+        self.assertIn("退出码 71", health.detail)
+
+    def test_seatbelt_profile_keeps_file_and_network_boundaries_on_modern_macos(self) -> None:
+        profile = SeatbeltBackend._profile(
+            Path("/Users/example/workspace/snapshot"),
+            (Path("/Users/example/runtime"),),
+        )
+
+        self.assertIn("(allow default)", profile)
+        self.assertNotIn("(deny default)", profile)
+        self.assertIn("(deny file-read*)", profile)
+        self.assertIn("(deny file-write*)", profile)
+        self.assertIn("(deny network*)", profile)
+        self.assertIn('(literal "/Users")', profile)
+        self.assertIn('(literal "/Users/example")', profile)
+        self.assertIn('(subpath "/Users/example/workspace/snapshot")', profile)
+        self.assertIn('(subpath "/Users/example/runtime")', profile)
+        self.assertIn("(deny appleevent-send)", profile)
 
 
 if __name__ == "__main__":

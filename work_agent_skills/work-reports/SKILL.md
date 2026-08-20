@@ -11,15 +11,22 @@ successful artifact records to determine what happened during a period.
 
 ## Workflow
 
-Hard rule for weekly and biweekly reports: if `daily_reports` contains a date,
+Period rule: this account files **biweekly reports only**. Daily reports are
+internal raw material and are never submitted; there is no weekly report — do
+not generate one or use the word 周报. Before writing a biweekly report, read
+`references/biweekly-style.md` and follow it exactly: verb-first completed
+statements, concrete dates and amounts, 一是/二是 for conclusions, and the
+fixed 一、/（一）/1. heading levels. Reject adjectives such as 顺利/扎实/深入 and
+summary filler such as 本期重点/工作亮点.
+
+Hard rule for biweekly reports: if `daily_reports` contains a date,
 use that saved daily report as the source for that date. The backend deliberately
 omits that date from raw `evidence`; do not reopen or reconstruct its chats unless
 the user asks to verify one specific assertion. Raw projected turns are only for
 dates still missing a daily report.
 
 1. Use `sys_skill(op='show')` and `sys_skill(op='call')` to call
-   `collect_work_report_evidence` for the requested `daily`, `weekly`, or
-   `biweekly` period. Use explicit start/end dates when the user provides them.
+   `collect_work_report_evidence` for the requested `daily` or `biweekly` period. Use explicit start/end dates when the user provides them.
    This remains mandatory when editing, correcting, or supplementing an existing
    report: collect the same period again so the saved report and date-scoped
    account evidence are both available before rewriting it.
@@ -29,7 +36,10 @@ dates still missing a daily report.
    archive: user requests, public implementation-path notes, and final answers
    remain complete, while detailed tool arguments/results are folded to paths
    and compact outcomes. Do not reopen detailed tool logs unless a specific
-   assertion cannot be verified otherwise.
+   assertion cannot be verified otherwise. A saved daily report is evidence,
+   not wording that must be copied: rewrite any process-heavy daily wording into
+   the audience-facing business result before using it in a weekly or biweekly
+   report.
 3. Group work by business/project topic, not by chat title or tool name. Merge
    repeated discussion, drafting, revision, validation, and delivery into one
    outcome-oriented item.
@@ -47,7 +57,11 @@ dates still missing a daily report.
 7. Draft using the appropriate structure in
    `references/report-writing.md`. A user-provided approved report is the
    highest-priority style reference. Apply any account-local `style_references`
-   returned by the evidence tool before the reusable default structure.
+   returned by the evidence tool before the reusable default structure. Unless
+   the user asks for a technical activity log, write from the employee or
+   department's submission perspective for a manager: report the business work,
+   coordination, decision, result, risk, and next step rather than how an agent
+   produced the supporting material.
 8. Call `save_work_report` through `sys_skill` with the complete Markdown. Its
    successful result includes `verified=true`, a byte count, and a content hash;
    only treat that as a confirmed saved report. Work reports intentionally live
@@ -92,6 +106,19 @@ dates still missing a daily report.
   only when supported by reliable evidence.
 - Exclude mechanical activity such as opening skills, listing files, retries,
   environment checks, and transport errors unless they materially blocked work.
+- Treat AI-assisted production traces as evidence only. Do not report use of an
+  agent, model, ASR/OCR, audio chunk counts, Markdown/Word/PDF formats, file
+  conversion, directory or manifest operations, OOXML/schema checks, rendering,
+  or similar implementation and validation details. Keep a quantity only when
+  it measures the business itself (for example meetings held, enterprises
+  visited, agreements signed, applications submitted, or equipment delivered),
+  not the mechanics of producing the report.
+- A document is reportable only by its business purpose and status. Prefer
+  `形成会议纪要并明确后续事项` or `完成论证报告并提交审议` when those facts are
+  material; never enumerate companion formats, intermediate versions, paragraph
+  counts, file paths, or technical validation. If the underlying meeting,
+  survey, negotiation, or project推进 is the real work, lead with that work and
+  omit the document-production step altogether.
 - Do not impose per-message character clipping on the user request, public path
   notes, or final answer. If the complete projected period would threaten the
   context window, let the evidence tool balance whole turns across dates and

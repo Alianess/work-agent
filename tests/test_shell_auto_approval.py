@@ -21,7 +21,15 @@ class ShellAutoApprovalTests(unittest.TestCase):
         self.assertTrue(payload["auto_approvable"])
         self.assertTrue(payload["reviewable_by_model"])
 
-    def test_general_python_script_is_not_delegatable(self) -> None:
+    def test_general_python_script_needs_a_grant_but_a_reviewer_may_issue_it(self) -> None:
+        """The delegate and the reviewer are deliberately different boundaries.
+
+        A script under the project's own interpreter is bounded by the sandbox
+        and the workspace check, so refusing to let the reviewer clear it made
+        "review for me" unable to handle ordinary work. It still never runs
+        without some grant.
+        """
+
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
                 trusted_shell_tools_for_test(workspace).execute({"command": "python script.py"})
@@ -29,7 +37,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
 
         self.assertEqual(payload["status"], "approval_required")
         self.assertFalse(payload["auto_approvable"])
-        self.assertFalse(payload["reviewable_by_model"])
+        self.assertTrue(payload["reviewable_by_model"])
 
     def test_package_install_is_not_delegatable(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -194,6 +202,122 @@ class ShellAutoApprovalTests(unittest.TestCase):
         self.assertEqual(payload["status"], "denied")
         self.assertEqual(payload["risk_category"], "SYSTEM")
 
+    def test_command_naming_an_unsnapshotted_directory_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            (Path(workspace) / "meet_files/attachments").mkdir(parents=True)
+            tools = trusted_shell_tools_for_test(workspace)
+            quoted = json.loads(
+                tools.execute(
+                    {
+                        "command": (
+                            "python -c \"import pdfplumber; "
+                            "pdfplumber.open('meet_files/attachments/a.pdf')\""
+                        )
+                    }
+                )
+            )
+            unrelated = json.loads(tools.execute({"command": "python script.py"}))
+
+        self.assertIn("meet_files", quoted["isolated_workspace_note"])
+        self.assertNotIn("isolated_workspace_note", unrelated)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InlinePythonReadOnlyTests(unittest.TestCase):
+    """A policy that only sees the program name charges a click per probe."""
+
+    def test_read_only_probes_run_without_asking(self) -> None:
+        commands = [
+            '.venv/bin/python -c "import pypdfium2; print(\'ok\')"',
+            'python -c "import importlib.util; print(importlib.util.find_spec(\'x\'))"',
+            'python -c "import json; print(json.load(open(\'a.json\')))"',
+        ]
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            for command in commands:
+                payload = json.loads(tools.execute({"command": command}))
+                self.assertNotEqual(payload["status"], "approval_required", command)
+                # READ keeps delivery on discard, so a misjudgement cannot persist.
+                self.assertEqual(payload["risk_category"], "READ", command)
+
+    def test_snippets_with_effects_still_require_approval(self) -> None:
+        commands = [
+            'python -c "open(\'x.txt\',\'w\').write(\'boom\')"',
+            'python -c "import subprocess; subprocess.run([\'ls\'])"',
+            'python -c "import os; os.remove(\'a\')"',
+            'python -c "import urllib.request; urllib.request.urlopen(\'http://x\')"',
+            'python -c "exec(open(\'evil.py\').read())"',
+            'python -c "import json; json.dump({}, open(\'a.json\',\'w\'))"',
+            'python -c "def ("',
+        ]
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            for command in commands:
+                payload = json.loads(tools.execute({"command": command}))
+                self.assertEqual(payload["status"], "approval_required", command)
+
+    def test_reviewer_covers_project_scripts_but_not_installs_or_unknown_binaries(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            reviewable = {
+                command: json.loads(tools.execute({"command": command})).get("reviewable_by_model")
+                for command in (
+                    "python script.py",
+                    "node build.js",
+                    "pip install requests",
+                    "npm install",
+                    "pdftotext a.pdf -",
+                )
+            }
+        self.assertTrue(reviewable["python script.py"])
+        self.assertTrue(reviewable["node build.js"])
+        self.assertFalse(reviewable["pip install requests"])
+        self.assertFalse(reviewable["npm install"])
+        self.assertFalse(reviewable["pdftotext a.pdf -"])
+
+
+class ShellPipelineTests(unittest.TestCase):
+    """The parser is not the boundary; the sandbox is."""
+
+    def test_pipes_chains_and_globs_run(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            Path(workspace, "a.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+            tools = trusted_shell_tools_for_test(workspace)
+            for command, expected in (
+                ("cat a.txt | wc -l", "3"),
+                ("ls | head -1", "a.txt"),
+                ("echo hi && echo there", "hi"),
+            ):
+                payload = json.loads(tools.execute({"command": command}))
+                self.assertEqual(payload["status"], "executed", command)
+                self.assertIn(expected, payload["stdout"], command)
+
+    def test_every_stage_is_checked_not_just_the_first(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            payload = json.loads(tools.execute({"command": "echo hi | sudo tee /etc/passwd"}))
+        self.assertEqual(payload["status"], "denied")
+
+    def test_redirect_outside_the_workspace_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            payload = json.loads(tools.execute({"command": "ls > /tmp/escape-probe.txt"}))
+        self.assertEqual(payload["status"], "denied")
+        self.assertIn("工作区之外", payload["reason"])
+
+    def test_command_substitution_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            for command in ("cat $(echo a.txt)", "cat `echo a.txt`"):
+                payload = json.loads(tools.execute({"command": command}))
+                self.assertEqual(payload["status"], "denied", command)
+
+    def test_redirect_into_the_workspace_still_asks(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            tools.sandbox_auto_allow = False
+            payload = json.loads(tools.execute({"command": "ls > listing.txt"}))
+        self.assertEqual(payload["status"], "approval_required")

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from work_agent_core.docx_exporter import create_docx, resolve_document_title
 from work_agent_core.progress import command_heartbeat_text
@@ -17,6 +18,7 @@ from work_agent_core.runtime_env import find_runtime_executable
 from work_agent_core.skill_manifest import office_python, probe_skill_environment
 from work_agent_core.skill_runtime import render_skill_tool_arguments
 from work_agent_core import web_server
+from work_agent_core.execution.backends.base import BackendHealth
 
 
 class RuntimeEnvironmentTests(unittest.TestCase):
@@ -76,11 +78,7 @@ class RuntimeEnvironmentTests(unittest.TestCase):
         self.assertIn("complete Word workflow", skill_text)
         self.assertNotIn("create_docx_from_markdown", skill_text)
 
-    def test_official_document_routing_and_blank_open_source_format_default(self) -> None:
-        self.assertTrue(web_server.looks_like_official_document_request("帮我起草一份请示"))
-        self.assertTrue(web_server.looks_like_official_document_request("按公文格式排版"))
-        self.assertFalse(web_server.looks_like_official_document_request("制作一份产品宣传册"))
-
+    def test_blank_open_source_format_default(self) -> None:
         default_format = web_server.DEFAULT_AGENT_SETTINGS["company_document_format"]
         self.assertEqual(default_format, "")
 
@@ -193,6 +191,29 @@ class RuntimeEnvironmentTests(unittest.TestCase):
         self.assertEqual(heartbeat, "[20s] 本地 Qwen3-ASR 转写处理中...\n")
         self.assertNotIn("/", heartbeat)
         self.assertNotIn("\\", heartbeat)
+
+    def test_required_service_health_fails_when_seatbelt_is_unavailable(self) -> None:
+        with patch.object(
+            web_server.SeatbeltBackend,
+            "health",
+            return_value=BackendHealth(False, "nested sandbox"),
+        ):
+            payload = web_server.service_health_payload(require_execution=True)
+
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["execution"]["ready"])
+        self.assertEqual(payload["execution"]["detail"], "nested sandbox")
+
+    def test_ordinary_service_health_reports_but_does_not_require_seatbelt(self) -> None:
+        with patch.object(
+            web_server.SeatbeltBackend,
+            "health",
+            return_value=BackendHealth(False, "nested sandbox"),
+        ):
+            payload = web_server.service_health_payload()
+
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["execution"]["ready"])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from work_agent_core.config import ModelProfile
 from work_agent_core.llm import LLMResponse
+from work_agent_core.session_runtime import ConversationRuntime
 from work_agent_core.react import ReActAgent
 from work_agent_core.tool_bus import ToolBus
 
@@ -97,8 +98,7 @@ class PlanExecutionTests(unittest.TestCase):
     def test_running_react_path_is_model_compacted_to_checkpoint(self) -> None:
         client = _CheckpointClient()
         agent = ReActAgent(client=client, profile=self.profile, tools=ToolBus())
-        messages = [
-            {"role": "system", "content": "system"},
+        runtime = ConversationRuntime.from_messages([
             {"role": "user", "content": "完成复杂改造"},
             {"role": "assistant", "content": "我先核对代码", "tool_calls": [{
                 "id": "call-1",
@@ -106,18 +106,26 @@ class PlanExecutionTests(unittest.TestCase):
                 "function": {"name": "read_text_file", "arguments": '{"path":"/tmp/demo.py"}'},
             }]},
             {"role": "tool", "tool_call_id": "call-1", "name": "read_text_file", "content": "x = 1"},
-        ]
+        ])
+        messages = agent._request_messages(runtime)
 
         with patch("work_agent_core.react.ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS", 1):
-            event = agent._maybe_compact_active_runtime(messages, step=2)
+            event = agent._maybe_compact_active_runtime(runtime, messages, step=2)
 
         self.assertIsNotNone(event)
         self.assertEqual(event["activity_type"], "runtime_summary")
         self.assertEqual(client.calls, 1)
-        self.assertEqual(len(messages), 3)
-        self.assertIn("高保真检查点", messages[-1]["content"])
-        self.assertIn("运行测试", messages[-1]["content"])
 
+        # The model view folds to the prompt plus one checkpoint...
+        compacted = agent._request_messages(runtime)
+        self.assertEqual([item["role"] for item in compacted], ["system", "user", "assistant"])
+        self.assertIn("高保真检查点", compacted[-1]["content"])
+        self.assertIn("运行测试", compacted[-1]["content"])
+
+        # ...while the raw implementation path stays readable for a human.
+        transcript = runtime.log.derive_transcript()
+        self.assertEqual([item["role"] for item in transcript], ["user", "assistant", "tool"])
+        self.assertEqual(transcript[-1]["content"], "x = 1")
 
 if __name__ == "__main__":
     unittest.main()

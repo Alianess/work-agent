@@ -77,6 +77,9 @@ class _FakeTurnRuntime:
     def cancelled(self) -> bool:
         return False
 
+    def drain_messages(self) -> list[str]:
+        return []
+
     def raise_if_cancelled(self) -> None:
         return None
 
@@ -89,13 +92,13 @@ class _FakeAgent:
 
     def iter_approved_tool_batch_events(
         self,
-        runtime_messages: list[dict],
+        runtime_messages,
         _pending_approval: dict,
         *,
         system_context: str = "",
     ):
         del system_context
-        runtime_messages.append({"role": "assistant", "content": "done"})
+        runtime_messages.append_message({"role": "assistant", "content": "done"})
         yield {
             "event": "final",
             "content": "done",
@@ -107,7 +110,7 @@ class _FakeAgent:
 class _FakeWaitingAgent(_FakeAgent):
     def iter_approved_tool_batch_events(
         self,
-        runtime_messages: list[dict],
+        runtime_messages,
         _pending_approval: dict,
         *,
         system_context: str = "",
@@ -126,13 +129,15 @@ class _FakeWaitingAgent(_FakeAgent):
 class _FakeMalformedHistoryAgent(_FakeAgent):
     def iter_approved_tool_batch_events(
         self,
-        runtime_messages: list[dict],
+        runtime_messages,
         _pending_approval: dict,
         *,
         system_context: str = "",
     ):
         del system_context
-        runtime_messages.append(None)
+        # An append-only log validates at the boundary, so history that used to
+        # arrive malformed is now rejected before it can be recorded at all.
+        self.append_rejected = runtime_messages.append_message(None) is None
         yield {
             "event": "final",
             "content": '<tool_call name="shell_exec">{"command":"pwd"}</tool_call>',

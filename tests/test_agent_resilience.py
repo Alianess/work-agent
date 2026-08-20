@@ -8,6 +8,7 @@ import json
 from work_agent_core.config import ModelProfile
 from work_agent_core.approval_review import ApprovalReview
 from work_agent_core.llm import LLMResponse, LLMStreamChunk
+from work_agent_core.session_runtime import ConversationRuntime
 from work_agent_core.react import (
     NativeToolCall,
     ReActAgent,
@@ -254,6 +255,102 @@ class _ShellThenFinalClient:
         )
 
 
+class _LengthTruncatedThenSmallToolClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.message_snapshots: list[list[dict]] = []
+
+    def chat_tools_stream(self, messages, *_args, **_kwargs) -> LLMResponse:
+        self.calls += 1
+        self.message_snapshots.append([dict(message) for message in messages])
+        if self.calls == 1:
+            return LLMResponse(
+                content="正在写入完整脚本。",
+                raw={
+                    "choices": [{
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": "正在写入完整脚本。",
+                            "tool_calls": [{
+                                "id": "call_truncated",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_text_file",
+                                    "arguments": '{"path":"big.py","content":"unterminated',
+                                },
+                            }],
+                        },
+                    }],
+                },
+            )
+        if self.calls == 2:
+            return LLMResponse(
+                content="已缩小单次写入。",
+                raw={
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "已缩小单次写入。",
+                            "tool_calls": [{
+                                "id": "call_small",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_text_file",
+                                    "arguments": json.dumps(
+                                        {"path": "small.py", "content": "print('ok')"}
+                                    ),
+                                },
+                            }],
+                        },
+                    }],
+                },
+            )
+        return LLMResponse(
+            content="done",
+            raw={
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "done"},
+                }],
+            },
+        )
+
+
+class _AlwaysLengthTruncatedClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    # run_messages is now a projection of the streamed loop rather than a
+    # second implementation, so a fake only has to answer the streaming call.
+    def chat_tools_stream(self, *args, **kwargs) -> LLMResponse:
+        return self.chat(*args, **kwargs)
+
+    def chat(self, *_args, **_kwargs) -> LLMResponse:
+        self.calls += 1
+        return LLMResponse(
+            content="retrying",
+            raw={
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": "retrying",
+                        "tool_calls": [{
+                            "id": f"call_truncated_{self.calls}",
+                            "type": "function",
+                            "function": {
+                                "name": "write_text_file",
+                                "arguments": '{"path":"big.py","content":"unterminated',
+                            },
+                        }],
+                    },
+                }],
+            },
+        )
+
+
 class _ApprovalReviewerStub:
     def __init__(self, *, approve: bool) -> None:
         self.approve = approve
@@ -270,6 +367,134 @@ class _ApprovalReviewerStub:
 
 
 class AgentResilienceTests(unittest.TestCase):
+    def test_model_profile_default_output_limit_is_16384(self) -> None:
+        profile = ModelProfile(
+            name="default-limit-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+
+        self.assertEqual(profile.max_tokens, 16384)
+
+    def test_length_truncated_tool_call_is_not_executed_and_model_is_told_to_split(self) -> None:
+        calls: list[dict] = []
+        provider = LocalToolProvider("core")
+        provider.register(
+            Tool(
+                name="write_text_file",
+                description="test writer",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+                handler=lambda arguments: calls.append(arguments) or "written",
+            )
+        )
+        tools = ToolBus()
+        tools.add_provider(provider)
+        client = _LengthTruncatedThenSmallToolClient()
+        profile = ModelProfile(
+            name="tool-length-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(client=client, profile=profile, tools=tools)  # type: ignore[arg-type]
+
+        events = list(agent.iter_message_events([{"role": "user", "content": "write"}]))
+
+        self.assertEqual(calls, [{"path": "small.py", "content": "print('ok')"}])
+        self.assertEqual(client.calls, 3)
+        second_request = client.message_snapshots[1]
+        truncation_observation = next(
+            message["content"]
+            for message in second_request
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == "call_truncated"
+        )
+        self.assertIn("finish_reason=length", truncation_observation)
+        self.assertIn("不是 path/content", truncation_observation)
+        self.assertIn("没有执行", truncation_observation)
+        self.assertTrue(
+            any(event.get("activity_type") == "tool_arguments_truncated" for event in events)
+        )
+        final = next(event for event in events if event.get("event") == "final")
+        self.assertIn("done", final["content"])
+
+    def test_repeated_length_truncations_open_circuit_after_three_sync_attempts(self) -> None:
+        handler_calls: list[dict] = []
+        provider = LocalToolProvider("core")
+        provider.register(
+            Tool(
+                name="write_text_file",
+                description="test writer",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                },
+                handler=lambda arguments: handler_calls.append(arguments) or "written",
+            )
+        )
+        tools = ToolBus()
+        tools.add_provider(provider)
+        client = _AlwaysLengthTruncatedClient()
+        profile = ModelProfile(
+            name="tool-length-circuit-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(client=client, profile=profile, tools=tools)  # type: ignore[arg-type]
+
+        result = agent.run_messages([{"role": "user", "content": "write"}])
+
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(handler_calls, [])
+        self.assertIn("连续 3 次", result.final)
+        self.assertIn("停止自动重试", result.final)
+
+    def test_missing_required_tool_argument_is_reported_before_handler(self) -> None:
+        calls: list[dict] = []
+        provider = LocalToolProvider("core")
+        provider.register(
+            Tool(
+                name="write_text_file",
+                description="test writer",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+                handler=lambda arguments: calls.append(arguments) or "written",
+            )
+        )
+        tools = ToolBus()
+        tools.add_provider(provider)
+        profile = ModelProfile(
+            name="tool-validation-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(client=object(), profile=profile, tools=tools)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(ValueError, "write_text_file 缺少必填参数：path"):
+            agent._execute_model_tool("write_text_file", {"content": "hello"})
+
+        self.assertEqual(calls, [])
+
     def test_provider_usage_callback_receives_prompt_tokens_before_assistant_append(self) -> None:
         class UsageClient:
             def chat_tools_stream(self, messages, **_kwargs):
@@ -344,7 +569,8 @@ class AgentResilienceTests(unittest.TestCase):
             {"role": "user", "content": "new question"},
         ]
 
-        messages = agent._model_messages(history, system_context="dynamic time")
+        runtime = ConversationRuntime.from_messages(history)
+        messages = agent._request_messages(runtime, system_context="dynamic time")
 
         self.assertEqual(messages[0], {"role": "system", "content": "fixed system"})
         self.assertEqual(messages[1:3], history[:2])
@@ -382,8 +608,8 @@ class AgentResilienceTests(unittest.TestCase):
         )
         agent = ReActAgent(client=client, profile=profile, tools=tools)  # type: ignore[arg-type]
 
-        session_messages = [{"role": "user", "content": "补写日报"}]
-        events = list(agent.iter_message_events(session_messages))
+        runtime = ConversationRuntime.from_messages([{"role": "user", "content": "补写日报"}])
+        events = list(agent.iter_message_events(runtime))
 
         self.assertEqual(client.calls, 1)
         self.assertFalse(any(event.get("event") == "error" for event in events))
@@ -391,7 +617,7 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertTrue(final["deterministic_tool_final"])
         self.assertIn("已完成并核验保存2026-07-09 日报", final["content"])
         self.assertIn("work_reports/daily/2026-07-09.md", final["content"])
-        self.assertEqual(session_messages[-1]["role"], "assistant")
+        self.assertEqual(runtime.log.derive_messages()[-1]["role"], "assistant")
         self.assertTrue(
             any(
                 event.get("event") == "draft_delta"
@@ -789,8 +1015,8 @@ class AgentResilienceTests(unittest.TestCase):
             tools=tools,
         )
 
-        session_messages = [{"role": "user", "content": "test"}]
-        events = list(agent.iter_message_events(session_messages))
+        runtime = ConversationRuntime.from_messages([{"role": "user", "content": "test"}])
+        events = list(agent.iter_message_events(runtime))
         first_step_draft = "".join(
             str(event.get("content") or "")
             for event in events
@@ -814,7 +1040,7 @@ class AgentResilienceTests(unittest.TestCase):
                 for event in events
             )
         )
-        self.assertEqual(session_messages[-1]["content"], "资料读取完成。")
+        self.assertEqual(runtime.log.derive_messages()[-1]["content"], "资料读取完成。")
 
     def test_visible_model_content_streams_into_answer_draft_without_duplication(self) -> None:
         profile = ModelProfile(

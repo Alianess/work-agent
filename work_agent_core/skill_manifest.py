@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+import ast
 import json
 import os
 import re
@@ -468,6 +469,14 @@ def load_single_skill_manifest(root: Path, skill_dir: Path) -> "SkillManifest | 
     when_to_use = str(config.get("when_to_use") or description)
     outputs = [str(item) for item in config.get("outputs") or []]
     native_tools = summarize_declared_skill_tools(config.get("tools"))
+    # Runtime tools live in Python, not in this skill's scripts, so they cannot be
+    # declared under "tools". Naming them here still keeps the fact next to the
+    # skill that uses them instead of in a central table.
+    runtime_tools = [
+        str(item).strip()
+        for item in (config.get("runtime_tools") or [])
+        if str(item or "").strip()
+    ]
     dependencies = config.get("dependencies")
     raw_skill_dependencies = dependencies.get("skills") if isinstance(dependencies, dict) else []
     skill_dependencies: list[str] = []
@@ -488,6 +497,7 @@ def load_single_skill_manifest(root: Path, skill_dir: Path) -> "SkillManifest | 
         path=str(skill_dir.relative_to(root)),
         default_enabled=bool(config.get("default_enabled", False)),
         native_tools=native_tools,
+        runtime_tools=runtime_tools,
         skill_dependencies=skill_dependencies,
     )
 
@@ -699,6 +709,91 @@ def _probe_node_modules(modules: list[str]) -> dict[str, bool]:
 # Startup health report
 # ---------------------------------------------------------------------------
 
+def _script_top_level_imports(script: Path) -> set[str]:
+    """Return the top-level module names a script imports at module scope."""
+    try:
+        tree = ast.parse(script.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return set()
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules.add(node.module.split(".")[0])
+    # Sibling modules resolve from the script's own directory at run time and
+    # are never installed as packages.
+    return {
+        name
+        for name in modules
+        if not (script.parent / f"{name}.py").is_file() and not (script.parent / name).is_dir()
+    }
+
+
+def _unimportable_script_modules(
+    skill_dirs: dict[str, Path],
+    declarations: dict[str, list[tuple[dict[str, Any], str, str]]],
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Map each declared script to the third-party modules it cannot import.
+
+    A declared tool whose script dies at ``import`` is invisible to the health
+    report until a task reaches for it and fails, which is how a skill can ship
+    against a dependency that was never installed. One probe in the interpreter
+    that actually runs the scripts answers this for every skill at once.
+    """
+
+    wanted: dict[tuple[str, str], set[str]] = {}
+    for skill_id, declared in declarations.items():
+        for _tool_decl, _source, script_path in declared:
+            if not script_path.endswith(".py"):
+                continue
+            script = skill_dirs[skill_id] / script_path
+            if not script.is_file():
+                continue
+            modules = _script_top_level_imports(script)
+            if modules:
+                wanted[(skill_id, script_path)] = modules
+    if not wanted:
+        return {}
+
+    candidates = sorted({name for names in wanted.values() for name in names})
+    probe = (
+        "import importlib.util, json, sys\n"
+        f"names = {candidates!r}\n"
+        "missing = []\n"
+        "for name in names:\n"
+        "    if name in sys.stdlib_module_names:\n"
+        "        continue\n"
+        "    try:\n"
+        "        found = importlib.util.find_spec(name) is not None\n"
+        "    except Exception:\n"
+        "        found = False\n"
+        "    if not found:\n"
+        "        missing.append(name)\n"
+        "print(json.dumps(missing))\n"
+    )
+    try:
+        completed = subprocess.run(
+            [str(office_python()), "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return {}
+        missing = set(json.loads(completed.stdout or "[]"))
+    except Exception:
+        # A probe that cannot run must not turn every skill red.
+        return {}
+
+    return {
+        key: tuple(sorted(names & missing))
+        for key, names in wanted.items()
+        if names & missing
+    }
+
+
 def build_skill_health_report(workspace_root: str | Path) -> dict[str, Any]:
     """Build a per-skill registration/health report.
 
@@ -709,17 +804,31 @@ def build_skill_health_report(workspace_root: str | Path) -> dict[str, Any]:
     """
     root = Path(workspace_root).resolve()
     reports: list[SkillHealthReport] = []
+    skill_dirs = {manifest.id: root / manifest.path for manifest in load_skill_manifests(root)}
+    declarations = {
+        skill_id: list(discover_declared_tools(skill_dir, root))
+        for skill_id, skill_dir in skill_dirs.items()
+    }
+    unimportable = _unimportable_script_modules(skill_dirs, declarations)
     for manifest in load_skill_manifests(root):
         skill_dir = root / manifest.path
         tools: list[SkillToolRegistration] = []
         missing_scripts: list[str] = []
         issues: list[str] = []
-        for tool_decl, source, script_path in discover_declared_tools(skill_dir, root):
+        for tool_decl, source, script_path in declarations.get(manifest.id, []):
             ok, reason = validate_tool_declaration(tool_decl, manifest.id)
             full_script = skill_dir / script_path
             script_exists = full_script.is_file()
             if not script_exists:
                 missing_scripts.append(script_path)
+            missing_modules = unimportable.get((manifest.id, script_path), ())
+            if script_exists and missing_modules:
+                ok = False
+                reason = (
+                    f"脚本依赖的模块未安装：{', '.join(missing_modules)}"
+                    f"（{script_path}）。"
+                )
+                issues.append(reason)
             if not ok:
                 tools.append(
                     SkillToolRegistration(
@@ -788,6 +897,9 @@ class SkillManifest:
     path: str
     default_enabled: bool = False
     native_tools: list[dict[str, str]] = field(default_factory=list)
+    runtime_tools: list[str] = field(default_factory=list)
+    """Python-registered tools this skill is allowed to call."""
+
     skill_dependencies: list[str] = field(default_factory=list)
 
     def to_payload(self) -> dict[str, Any]:

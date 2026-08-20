@@ -157,3 +157,52 @@ class ApplePimWebPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentReminderBridgeTests(unittest.TestCase):
+    """The assistant must be able to see the reminders it set itself."""
+
+    def test_schedule_view_includes_assistant_reminders(self) -> None:
+        from work_agent_core.host_services.apple_pim import register_apple_pim_tools
+        from work_agent_core.tools import ToolRegistry
+
+        class _Service:
+            def status(self) -> dict:
+                return {"events_authorization": "full_access", "reminders_authorization": "full_access"}
+
+            def items(self, **_kwargs) -> dict:
+                return {"ok": True, "reminders": [{"title": "Apple 那边的待办"}]}
+
+        registry = ToolRegistry()
+        register_apple_pim_tools(
+            registry,
+            _Service(),
+            agent_reminder_source=lambda: [{"title": "智能体自己设的提醒", "source": "assistant"}],
+        )
+        payload = json.loads(
+            registry.get("list_apple_schedule").handler({"include_events": False, "include_reminders": True})
+        )
+        self.assertEqual(payload["reminders"][0]["title"], "Apple 那边的待办")
+        self.assertEqual(payload["agent_reminders"][0]["title"], "智能体自己设的提醒")
+
+    def test_a_failing_source_never_breaks_the_schedule_read(self) -> None:
+        from work_agent_core.host_services.apple_pim import register_apple_pim_tools
+        from work_agent_core.tools import ToolRegistry
+
+        class _Service:
+            def status(self) -> dict:
+                return {"events_authorization": "full_access", "reminders_authorization": "full_access"}
+
+            def items(self, **_kwargs) -> dict:
+                return {"ok": True, "reminders": []}
+
+        def _broken() -> list:
+            raise RuntimeError("store unavailable")
+
+        registry = ToolRegistry()
+        register_apple_pim_tools(registry, _Service(), agent_reminder_source=_broken)
+        payload = json.loads(
+            registry.get("list_apple_schedule").handler({"include_events": False, "include_reminders": True})
+        )
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("agent_reminders", payload)

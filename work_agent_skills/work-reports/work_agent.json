@@ -12,5 +12,13 @@
     "双周报 Markdown",
     "缺失工作日提醒",
     "错误日报删除及回读核验"
+  ],
+  "runtime_tools": [
+    "check_work_report_status",
+    "collect_work_report_evidence",
+    "delete_work_report",
+    "read_saved_work_report",
+    "save_work_report",
+    "update_workday_calendar"
   ]
 }

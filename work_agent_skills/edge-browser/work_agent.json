@@ -1,3 +1,26 @@
 {
-  "id": "edge-browser", "label": "浏览器操作（Edge）", "mention": "@浏览器", "description": "隔离 Edge 中的文本化 DOM/可及性快照浏览器操作，不使用截图或鼠标坐标。", "when_to_use": "需要真实网页渲染、登录、JavaScript 页面或页面交互时启用。", "outputs": ["页面可及性快照", "受控浏览器操作结果"]
+  "id": "edge-browser",
+  "label": "浏览器操作（Edge）",
+  "mention": "@浏览器",
+  "description": "隔离 Edge 中的文本化 DOM/可及性快照浏览器操作，不使用截图或鼠标坐标。",
+  "when_to_use": "需要真实网页渲染、登录、JavaScript 页面或页面交互时启用。",
+  "outputs": [
+    "页面可及性快照",
+    "受控浏览器操作结果"
+  ],
+  "runtime_tools": [
+    "browser_click",
+    "browser_close",
+    "browser_fill_form",
+    "browser_find",
+    "browser_hover",
+    "browser_navigate",
+    "browser_navigate_back",
+    "browser_press_key",
+    "browser_select_option",
+    "browser_snapshot",
+    "browser_tabs",
+    "browser_type",
+    "browser_wait_for"
+  ]
 }

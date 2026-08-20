@@ -9,44 +9,8 @@ from .tool_bus import ToolProvider
 from .tools import Tool
 
 
-SKILL_TOOL_ALIASES: dict[str, set[str]] = {
-    "meeting-minutes": {
-        "check_meeting_asr_progress",
-        "transcribe_meeting_audio",
-    },
-    "docx": {"process_office_document", "create_docx_from_markdown", "docx_soffice"},
-    "pdf": {"process_office_document", "create_pdf_from_markdown"},
-    "pptx": {"process_office_document", "create_pptx_from_outline"},
-    "xlsx": {
-        "process_office_document",
-        "create_xlsx_from_markdown",
-        "manage_timeline_xlsx",
-        "manage_project_timeline",
-    },
-    "skill-creator": {
-        "validate_work_agent_skill",
-        "scaffold_work_agent_skill",
-        "inspect_skill_health",
-    },
-    "work-reports": {
-        "collect_work_report_evidence",
-        "save_work_report",
-        "read_saved_work_report",
-        "delete_work_report",
-        "check_work_report_status",
-        "update_workday_calendar",
-    },
-    "apple-schedule": {"list_apple_schedule", "create_apple_reminder"},
-    "edge-browser": {
-        "browser_click", "browser_close", "browser_fill_form", "browser_find",
-        "browser_hover", "browser_navigate", "browser_navigate_back", "browser_press_key",
-        "browser_select_option", "browser_snapshot", "browser_tabs", "browser_type", "browser_wait_for",
-    },
-    "weixin-search": {
-        "weixin_search", "weixin_search_all", "resolve_weixin_article_url",
-        "get_weixin_article_content",
-    },
-}
+# Available to every skill, so this is a property of skills in general,
+# not a per-skill table.
 COMMON_SKILL_TOOLS = {"run_skill_script", "precheck_skill_environment"}
 
 
@@ -98,6 +62,7 @@ class SkillGateway:
         )
 
     def handle(self, args: dict[str, Any]) -> str:
+        args = _lift_nested_envelope(args)
         op = str(args.get("op") or "").strip().lower()
         if op == "list":
             return self._list_skills()
@@ -224,7 +189,7 @@ class SkillGateway:
             }
             if manifest.tool_name:
                 names.add(manifest.tool_name)
-            names.update(SKILL_TOOL_ALIASES.get(manifest.id, set()))
+            names.update(manifest.runtime_tools)
             names.update(COMMON_SKILL_TOOLS)
             for dependency_id in manifest.skill_dependencies:
                 names.update(names_for(dependency_id, visiting))
@@ -279,6 +244,33 @@ class SkillGateway:
                 "arguments": {},
             },
         }
+
+
+def _lift_nested_envelope(args: dict[str, Any]) -> dict[str, Any]:
+    """Accept the routing fields nested one level inside ``arguments``.
+
+    Some providers emit ``{"op": "show", "arguments": {"skill_id": ...,
+    "tool_name": ...}}`` instead of putting ``skill_id``/``tool_name`` at the
+    top level. The call is unambiguous, so rejecting it only costs a full model
+    round-trip before the model retries with the same intent.
+    """
+
+    nested = args.get("arguments")
+    if not isinstance(nested, dict):
+        return args
+    lifted = dict(args)
+    moved: list[str] = []
+    for field in ("skill_id", "tool_name"):
+        if str(lifted.get(field) or "").strip():
+            continue
+        value = str(nested.get(field) or "").strip()
+        if value:
+            lifted[field] = value
+            moved.append(field)
+    if not moved:
+        return args
+    lifted["arguments"] = {key: value for key, value in nested.items() if key not in moved}
+    return lifted
 
 
 def normalize_skill_tool_arguments(tool: Tool, arguments: dict[str, Any]) -> dict[str, Any]:

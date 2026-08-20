@@ -54,6 +54,12 @@ class TurnRuntime:
     def cancelled(self) -> bool:
         return self.store.is_cancel_requested(self.turn.id)
 
+    def enqueue_message(self, content: str) -> None:
+        self.store.enqueue_message(self.turn.id, content)
+
+    def drain_messages(self) -> list[str]:
+        return self.store.drain_messages(self.turn.id)
+
     def raise_if_cancelled(self) -> None:
         if self.cancelled():
             raise TurnCancelled("用户停止了当前轮。")

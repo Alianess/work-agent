@@ -10,7 +10,7 @@ permission prompts and data synchronization with iPhone/iCloud.
 
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import json
 import os
 import platform
@@ -211,12 +211,22 @@ def _required(value: str, label: str) -> str:
     return clean
 
 
-def register_apple_pim_tools(registry: ToolRegistry, service: ApplePimService) -> None:
+def register_apple_pim_tools(
+    registry: ToolRegistry,
+    service: ApplePimService,
+    *,
+    agent_reminder_source: Callable[[], list[dict[str, Any]]] | None = None,
+) -> None:
     """Expose reads and explicitly requested Reminder creation to ReAct.
 
     The Schedule page remains read-only. A model may create one Reminder only
     after a direct user instruction in the current conversation; it can never
     create Calendar events or infer a reminder from work context.
+
+    ``agent_reminder_source`` contributes the reminders the assistant itself
+    set. Without it the agent could create a reminder and then be unable to see
+    it, so the two reminder stores each looked half-broken from the other's
+    side. The host service stays unaware of where those come from.
     """
 
     def list_schedule_handler(args: dict[str, Any]) -> str:
@@ -240,16 +250,20 @@ def register_apple_pim_tools(registry: ToolRegistry, service: ApplePimService) -
                 ensure_ascii=False,
                 indent=2,
             )
-        return json.dumps(
-            service.items(
-                start_at=str(args.get("start_at") or ""),
-                end_at=str(args.get("end_at") or ""),
-                include_events=include_events,
-                include_reminders=include_reminders,
-            ),
-            ensure_ascii=False,
-            indent=2,
+        payload = service.items(
+            start_at=str(args.get("start_at") or ""),
+            end_at=str(args.get("end_at") or ""),
+            include_events=include_events,
+            include_reminders=include_reminders,
         )
+        if requested_reminders and agent_reminder_source is not None:
+            try:
+                agent_items = agent_reminder_source()
+            except Exception:
+                agent_items = []
+            if agent_items:
+                payload = {**payload, "agent_reminders": agent_items}
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     registry.register(
         Tool(

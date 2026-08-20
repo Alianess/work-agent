@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+from work_agent_core import web_server
 from work_agent_core.web_server import meeting_time_from_manifest
 
 
@@ -37,6 +42,30 @@ class MeetingArchiveTests(unittest.TestCase):
         self.assertIsNone(
             meeting_time_from_manifest({"recording_metadata": {"recording_started_at": "not-a-time"}})
         )
+
+    def test_archive_accepts_iso_created_at(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_dir = root / "meet_files" / "会议项目" / "测试会议"
+            archive_dir.mkdir(parents=True)
+            manifest = archive_dir / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "meeting_id": "meeting-test",
+                        "title": "测试会议",
+                        "created_at": "2026-08-07T16:53:56+08:00",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(web_server, "WORKSPACE_ROOT", root):
+                result = web_server.meeting_archive_from_manifest(manifest)
+
+        self.assertEqual(result["created_at"], 1786092836)
+        self.assertIsInstance(result["updated_at"], int)
 
 
 if __name__ == "__main__":

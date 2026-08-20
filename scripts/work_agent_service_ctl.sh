@@ -34,7 +34,7 @@ ensure_source_plist() {
 
 wait_for_health() {
   local attempts=20
-  local health_url="http://127.0.0.1:8787/api/health"
+  local health_url="http://127.0.0.1:8787/api/health?require_execution=1"
   local attempt
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     if /usr/bin/curl --connect-timeout 1 --silent --fail "$health_url" >/dev/null; then
@@ -43,7 +43,7 @@ wait_for_health() {
     fi
     sleep 1
   done
-  print -u2 "Work Agent did not become healthy within ${attempts}s. Check: $0 errors"
+  print -u2 "Work Agent did not become healthy within ${attempts}s. Check: $SCRIPT_DIR/work_agent_service_ctl.sh errors"
   return 1
 }
 

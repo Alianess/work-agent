@@ -58,8 +58,14 @@ class ToolRegistry:
 
 
 class WorkspaceFiles:
-    def __init__(self, workspace_root: str | Path) -> None:
+    def __init__(
+        self,
+        workspace_root: str | Path,
+        *,
+        on_file_changed: Callable[[Path], None] | None = None,
+    ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
+        self.on_file_changed = on_file_changed
 
     def resolve(self, raw_path: str) -> Path:
         path = Path(raw_path).expanduser()
@@ -73,10 +79,20 @@ class WorkspaceFiles:
     def read_text(self, args: dict[str, Any]) -> str:
         path = self.resolve(str(args["path"]))
         max_chars = int(args.get("max_chars") or 12000)
+        offset = max(0, int(args.get("offset") or 0))
         text = path.read_text(encoding=args.get("encoding") or "utf-8")
-        if len(text) > max_chars:
-            return text[:max_chars] + f"\n\n[truncated to {max_chars} chars from {len(text)}]"
-        return text
+        total = len(text)
+        window = text[offset : offset + max_chars]
+        if offset == 0 and total <= max_chars:
+            return window
+        # A cut with no way back leaves the model unable to tell what it missed.
+        next_offset = offset + len(window)
+        remaining = total - next_offset
+        note = f"\n\n[chars {offset}-{next_offset} of {total}"
+        if remaining > 0:
+            note += f"; {remaining} remaining — read again with offset={next_offset}"
+        note += "]"
+        return window + note
 
     def write_text(self, args: dict[str, Any]) -> str:
         path = self.resolve(str(args["path"]))
@@ -184,6 +200,8 @@ class WorkspaceFiles:
                 }
             )
             raise RuntimeError(f"patch 应用失败：{result.stderr or result.stdout}")
+        for relative_path in touched_paths:
+            self._notify_file_changed(self.workspace_root / relative_path)
         emit_tool_progress(
             {
                 "event": "activity_delta",
@@ -272,6 +290,7 @@ class WorkspaceFiles:
                 }
             )
             raise
+        self._notify_file_changed(path)
         emit_tool_progress(
             {
                 "event": "activity_delta",
@@ -288,6 +307,16 @@ class WorkspaceFiles:
             }
         )
         return path
+
+    def _notify_file_changed(self, path: Path) -> None:
+        if self.on_file_changed is None:
+            return
+        try:
+            self.on_file_changed(path)
+        except Exception:
+            # File writes are authoritative. Index maintenance must never turn
+            # a successful user edit into a failed tool call.
+            return
 
     def _display_path(self, path: Path) -> str:
         try:
@@ -413,17 +442,34 @@ def clip_text(value: str, limit: int, *, suffix: str = "\n...[truncated]") -> st
     return text[:limit].rstrip() + suffix
 
 
-def register_file_tools(registry: ToolRegistry, workspace_root: str | Path) -> None:
-    files = WorkspaceFiles(workspace_root)
+def register_file_tools(
+    registry: ToolRegistry,
+    workspace_root: str | Path,
+    *,
+    on_file_changed: Callable[[Path], None] | None = None,
+) -> None:
+    files = WorkspaceFiles(workspace_root, on_file_changed=on_file_changed)
     registry.register(
         Tool(
             name="read_text_file",
-            description="Read a UTF-8 text file from the workspace.",
+            description=(
+                "Read a UTF-8 text file from the workspace. Returns at most max_chars from offset; "
+                "when more remains, the result says how much and which offset to read next. "
+                "When the user message, an attachment, earlier conversation, or a previous tool result already "
+                "names an exact path, read that path directly instead of scanning the workspace to confirm it. "
+                "Reading, joining, tidying or rewriting plain text and Markdown always goes through the workspace "
+                "file tools, never through python or a terminal command."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "max_chars": {"type": "integer", "default": 12000},
+                    "offset": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Character offset to start from; use the value the previous read reported.",
+                    },
                 },
                 "required": ["path"],
             },
@@ -435,7 +481,10 @@ def register_file_tools(registry: ToolRegistry, workspace_root: str | Path) -> N
             name="write_text_file",
             description=(
                 "Write a complete UTF-8 text file under the workspace. "
-                "For small changes to existing files, prefer edit_text_file or apply_unified_patch so the model does not rewrite the whole file."
+                "For small changes to existing files, prefer edit_text_file or apply_unified_patch so the model does not rewrite the whole file. "
+                "Do not resend a long script or long document through repeated whole-file writes; split it into smaller modules or "
+                "staged patches. If a tool result reports finish_reason=length or truncated arguments, immediately send less in one "
+                "call — that is a size problem, not a path/content nesting problem, so do not retry the same payload unchanged."
             ),
             parameters={
                 "type": "object",
@@ -495,6 +544,7 @@ def register_file_tools(registry: ToolRegistry, workspace_root: str | Path) -> N
             description=(
                 "List files under a specific workspace directory. "
                 "Use only when no exact file path is available; prefer reading explicit paths from the user message, attachments, or prior tool output. "
+                "Narrow it to the smallest directory that can hold the answer, for example meet_files or meet_files/attachments. "
                 "Do not list the workspace root '.' unless the user explicitly asks to inspect the whole project."
             ),
             parameters={

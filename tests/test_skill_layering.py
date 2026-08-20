@@ -10,6 +10,7 @@ from work_agent_core.config import ModelProfile
 from work_agent_core.llm import OpenAICompatibleClient
 from work_agent_core.session_store import SessionStore
 from work_agent_core.skill_gateway import SkillGateway, normalize_skill_tool_arguments
+from work_agent_core.skill_manifest import load_skill_manifests
 from work_agent_core.tool_bus import LocalToolProvider
 from work_agent_core.tools import Tool
 
@@ -192,6 +193,20 @@ class SkillLayeringTests(unittest.TestCase):
                 }
             )
 
+    def test_sys_skill_accepts_routing_fields_nested_in_arguments(self) -> None:
+        gateway = self.bus.get_model_tool("sys_skill")
+
+        shown = json.loads(
+            gateway.handler(
+                {
+                    "op": "show",
+                    "arguments": {"skill_id": "anysearch", "tool_name": "anysearch_search"},
+                }
+            )
+        )
+        self.assertEqual(shown["skill_id"], "anysearch")
+        self.assertEqual(shown["tool"]["name"], "anysearch_search")
+
     def test_sys_skill_reports_conditional_arguments_and_injects_scope(self) -> None:
         gateway = self.bus.get_model_tool("sys_skill")
         with self.assertRaisesRegex(ValueError, "skill_id"):
@@ -285,6 +300,38 @@ class SkillLayeringTests(unittest.TestCase):
         )
         self.assertEqual(normalized["path"], "meet_files/course.pdf")
         self.assertEqual(normalized["output_dir"], "meet_files/course_materials")
+
+
+class SkillOwnsItsToolListTests(unittest.TestCase):
+    """哪个技能能调哪些 Python 工具，写在那个技能自己的配置里。
+
+    这些工具注册在 Python 里，没法用技能的 script 声明，所以原先被塞进
+    skill_gateway 的一张中央字典。搬回各自的 work_agent.json 之后，
+    新增一个技能不再需要回头改 harness 的代码。
+    """
+
+    def test_each_skill_declares_the_runtime_tools_it_uses(self) -> None:
+        manifests = {item.id: item for item in load_skill_manifests(Path.cwd())}
+
+        expected = {
+            "meeting-minutes": {"check_meeting_asr_progress", "transcribe_meeting_audio"},
+            "docx": {"process_office_document", "create_docx_from_markdown", "docx_soffice"},
+            "pdf": {"process_office_document", "create_pdf_from_markdown"},
+            "pptx": {"process_office_document", "create_pptx_from_outline"},
+            "apple-schedule": {"list_apple_schedule", "create_apple_reminder"},
+        }
+        for skill_id, names in expected.items():
+            self.assertIn(skill_id, manifests, skill_id)
+            self.assertEqual(set(manifests[skill_id].runtime_tools), names, skill_id)
+
+    def test_no_central_table_remains(self) -> None:
+        import work_agent_core.skill_gateway as gateway
+
+        self.assertFalse(hasattr(gateway, "SKILL_TOOL_ALIASES"))
+        # Available to every skill, so this one is not a per-skill table.
+        self.assertEqual(
+            gateway.COMMON_SKILL_TOOLS, {"run_skill_script", "precheck_skill_environment"}
+        )
 
 
 if __name__ == "__main__":

@@ -365,6 +365,29 @@ class WorkReportStoreTests(unittest.TestCase):
         self.assertIn("current-chat compressed miss as an account-wide miss", skill_text)
         self.assertIn("Never pass\n  `.docx`", skill_text)
 
+    def test_report_prompts_require_manager_facing_business_language(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill_text = (root / "work_agent_skills/work-reports/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        writing_text = (
+            root / "work_agent_skills/work-reports/references/report-writing.md"
+        ).read_text(encoding="utf-8")
+        history_text = (root / "work_agent_core/history_recall.py").read_text(
+            encoding="utf-8"
+        )
+        server_text = (root / "work_agent_core/web_server.py").read_text(encoding="utf-8")
+        frontend_text = (root / "web_frontend/src/App.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("A saved daily report is evidence", skill_text)
+        self.assertIn("department's submission perspective for a manager", skill_text)
+        self.assertIn("audio chunk counts", skill_text)
+        self.assertIn("Manager-facing content filter", writing_text)
+        self.assertIn("51/51", writing_text)
+        self.assertIn("工作汇报默认面向部门领导", history_text)
+        self.assertIn("仅是取证和生产过程，不得写入日报", server_text)
+        self.assertIn("按向部门领导提交的口径", frontend_text)
+
 
 if __name__ == "__main__":
     unittest.main()

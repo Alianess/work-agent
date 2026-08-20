@@ -26,6 +26,8 @@ from .memory import (
     estimate_messages_tokens,
     summarize_active_react_checkpoint,
 )
+from .session_log import ASSISTANT_MESSAGE, TURN_END_ABORTED, TURN_END_COMPLETED, TURN_END_FAILED
+from .session_runtime import ConversationRuntime
 from .progress import compact_preview_text, set_tool_cancel_check, set_tool_progress_sink
 from .session_store import repair_runtime_message_sequence
 from .shell_tools import issue_internal_approval_grant
@@ -38,6 +40,7 @@ MODEL_STREAM_MAX_MULTIPLIER = 4
 MODEL_STREAM_MAX_EXTENSION_SECONDS = 60
 MODEL_RECOVERY_TIMEOUT_GRACE_SECONDS = 5
 MODEL_RECOVERY_MAX_MULTIPLIER = 4
+MAX_CONSECUTIVE_TOOL_LENGTH_TRUNCATIONS = 3
 
 
 class AgentCancelled(RuntimeError):
@@ -51,6 +54,101 @@ class AgentResult:
     model_profile: str
     used_tools: bool = False
     messages: list[Message] | None = None
+    # Append-origin history: what actually happened, before any compaction
+    # replacement shadowed part of it for the model.
+    transcript: list[Message] | None = None
+
+
+@dataclass
+class LoopHooks:
+    """Where behaviour attaches to the loop instead of being welded into it.
+
+    Hooks are generators so they can emit activity events the same way the loop
+    does; ``yield from`` composes them without a separate event channel. A hook
+    that raises is treated as absent — extending the loop must not be able to
+    end a turn.
+    """
+
+    transform_context: Callable[..., Iterator[dict[str, Any]]] | None = None
+    """Called before each model request, after built-in compaction.
+
+    Free to append context to the runtime; the request is rebuilt afterwards.
+    This is the mounting point for long-term memory injection.
+    """
+
+    should_stop_after_turn: Callable[..., bool] | None = None
+    """Called after a step's tool batch. Returning True ends the turn cleanly."""
+
+    before_tool_call: Callable[..., Iterator[dict[str, Any]]] | None = None
+    """Called before a tool runs.
+
+    Return ``{"block": True, "observation": "..."}`` to skip execution and hand
+    the model that text instead. Approval does not run through this yet — see
+    the note in TODO.md — but a gate no longer has to be welded into the loop.
+    """
+
+    after_tool_call: Callable[..., Iterator[dict[str, Any]]] | None = None
+    """Called once a tool result is settled.
+
+    Return ``{"observation": "..."}`` to replace what the model sees.
+    """
+
+
+WORKSPACE_CONTEXT_FILENAME = "AGENTS.md"
+WORKSPACE_CONTEXT_MAX_CHARS = 4000
+_WORKSPACE_CONTEXT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def read_workspace_context(workspace_root: Any) -> str:
+    """Read this workspace's own conventions, if it states any.
+
+    Bounded and cached by mtime: it is injected on every request, so an
+    unbounded file would quietly become the largest thing in the prompt.
+    """
+
+    if not workspace_root:
+        return ""
+    path = Path(workspace_root) / WORKSPACE_CONTEXT_FILENAME
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return ""
+    cached = _WORKSPACE_CONTEXT_CACHE.get(str(path))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if len(text) > WORKSPACE_CONTEXT_MAX_CHARS:
+        text = (
+            text[:WORKSPACE_CONTEXT_MAX_CHARS].rstrip()
+            + f"\n\n[{WORKSPACE_CONTEXT_FILENAME} 超出 {WORKSPACE_CONTEXT_MAX_CHARS} 字符，"
+            f"其余部分未载入；需要时直接读取该文件。]"
+        )
+    _WORKSPACE_CONTEXT_CACHE[str(path)] = (stamp, text)
+    return text
+
+
+def _latest_user_content(runtime: "ConversationRuntime") -> str:
+    for message in reversed(runtime.log.derive_messages()):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def as_conversation_runtime(
+    conversation: "list[Message] | ConversationRuntime",
+) -> ConversationRuntime:
+    """Accept either a live conversation or a plain message list.
+
+    Callers that still hold flat history get a runtime seeded from it, so there
+    is one loop implementation rather than one per calling convention.
+    """
+
+    if isinstance(conversation, ConversationRuntime):
+        return conversation
+    return ConversationRuntime.from_messages(conversation)
 
 
 class ReActAgent:
@@ -65,6 +163,9 @@ class ReActAgent:
         extra_system_context: str | None = None,
         debug_trace: Any | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        pending_messages: Callable[[], list[str]] | None = None,
+        hooks: LoopHooks | None = None,
+        workspace_root: str | Path | None = None,
         reasoning_effort: str = "medium",
         auto_approve: bool = False,
         approval_reviewer: ApprovalReviewer | None = None,
@@ -77,9 +178,17 @@ class ReActAgent:
         self.tools = tools
         self.max_steps = max_steps
         self.extra_system_context = (extra_system_context or "").strip()
+        # Set before the prompt is built: the workspace's own conventions are
+        # part of it.
+        self.workspace_root = Path(workspace_root) if workspace_root else None
         self.system_prompt = system_prompt or self._default_system_prompt()
         self.debug_trace = debug_trace
         self.cancel_check = cancel_check
+        # Interrupting is not the only thing a person may want mid-run. Draining
+        # a queue lets the user add to the work instead of killing it, which is
+        # what makes an early wrap-up recoverable without restarting the turn.
+        self.pending_messages = pending_messages
+        self.hooks = hooks or LoopHooks()
         self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         self.auto_approve = bool(auto_approve)
         self.approval_reviewer = approval_reviewer or ApprovalReviewer(
@@ -100,227 +209,37 @@ class ReActAgent:
 
     def run_messages(
         self,
-        session_messages: list[Message],
+        conversation: list[Message] | ConversationRuntime,
         *,
         system_context: str = "",
     ) -> AgentResult:
-        self.active_runtime_was_compacted = False
-        messages: list[Message] = self._model_messages(session_messages, system_context=system_context)
-        tool_schemas = self._tool_schemas()
+        """Run one turn without streaming, over the same loop as the UI path.
+
+        There is exactly one place with loop logic. A second implementation had
+        already drifted — it never grew the local compaction fallback the
+        streaming path relies on — so the non-streaming entry point is now a
+        projection of the streamed event sequence rather than a copy of it.
+        """
+
+        runtime = as_conversation_runtime(conversation)
+        final = ""
+        steps_used = 0
         used_tools = False
-        self._trace(
-            "agent_start",
-            mode="sync",
-            session_message_count=len(session_messages),
-            model_message_count=len(messages),
-            tool_schema_count=len(tool_schemas),
-            messages=compact_message_summary(session_messages[-12:]),
-        )
-
-        for step in range(1, self.max_steps + 1):
-            self._raise_if_cancelled()
-            self._maybe_compact_active_runtime(messages, step=step)
-            started_at = time.monotonic()
-            self._trace(
-                "llm_start",
-                step=step,
-                message_count=len(messages),
-                tool_schema_count=len(tool_schemas),
-            )
-            response = self.client.chat(
-                messages,
-                profile=self.profile,
-                reasoning_effort=self.reasoning_effort,
-                tools=tool_schemas,
-                tool_choice="auto",
-            )
-            self._record_response_usage(response.raw, session_messages)
-            self._trace(
-                "llm_end",
-                step=step,
-                elapsed_ms=int((time.monotonic() - started_at) * 1000),
-                response=response_debug_summary(response.raw, response.content),
-            )
-            assistant_message = response_message(response.raw)
-            tool_calls = normalize_tool_calls(assistant_message)
-            self._trace(
-                "llm_decision",
-                step=step,
-                content_chars=len(str(assistant_message.get("content") or response.content or "")),
-                native_tool_call_count=count_native_tool_calls(assistant_message),
-                parsed_tool_calls=[{"id": call.id, "name": call.name} for call in tool_calls],
-            )
-
-            # ReAct state transition is determined only by whether a tool call
-            # can be parsed from this assistant message. Content may contain
-            # user-visible preamble before tool calls, so content presence is
-            # never an end signal.
-            if not tool_calls:
-                raw_content = str(assistant_message.get("content") or response.content or "")
-                if contains_tool_call_markup(raw_content):
-                    assistant_fix, user_fix = text_tool_call_repair_messages()
-                    messages.extend([assistant_fix, user_fix])
-                    continue
-                final = raw_content.strip()
-                if not final:
-                    raise RuntimeError(empty_model_response_message(self.profile.name))
-                final_message: Message = {
-                    "role": "assistant",
-                    "content": final,
-                }
-                session_messages.append(final_message)
-                messages.append(final_message)
-                self._trace(
-                    "agent_final",
-                    step=step,
-                    used_tools=used_tools,
-                    final_chars=len(str(final_message["content"])),
-                )
-                return AgentResult(
-                    final=str(final_message["content"]),
-                    steps_used=step,
-                    model_profile=self.profile.name,
-                    used_tools=used_tools,
-                    messages=session_messages,
-                )
-
-            batch_session_start = len(session_messages)
-            batch_model_start = len(messages)
-            completed_tool_messages: list[Message] = []
-            deterministic_final: str | None = None
-            assistant_history = assistant_message_for_history(assistant_message, tool_calls=tool_calls)
-            session_messages.append(assistant_history)
-            messages.append(assistant_history)
-            for index, tool_call in enumerate(tool_calls):
-                self._raise_if_cancelled()
-                used_tools = True
-                tool_name = tool_call.name
-                tool_input = tool_call.arguments
-                tool_started_at = time.monotonic()
-                self._trace(
-                    "tool_start",
-                    step=step,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call.id,
-                    arguments=tool_input,
-                )
-                try:
-                    observation = self._execute_model_tool(
-                        tool_name,
-                        tool_input,
-                        tool_call_id=tool_call.id or f"call_{step}_{index}",
-                    )
-                except Exception as error:
-                    observation = f"TOOL_ERROR: {type(error).__name__}: {error}"
-                    self._trace(
-                        "tool_error",
-                        step=step,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call.id,
-                        elapsed_ms=int((time.monotonic() - tool_started_at) * 1000),
-                        error_type=type(error).__name__,
-                        error=str(error),
-                    )
-                else:
-                    self._trace(
-                        "tool_end",
-                        step=step,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call.id,
-                        elapsed_ms=int((time.monotonic() - tool_started_at) * 1000),
-                        observation_chars=len(str(observation)),
-                        observation_preview=str(observation)[:2000],
-                    )
-
-                approval_payload = parse_shell_approval_required_observation(tool_name, observation)
-                review: ApprovalReview | None = None
-                if (
-                    approval_payload is not None
-                    and self.auto_approve
-                    and approval_payload.get("reviewable_by_model") is True
-                ):
-                    review = self._review_approval(session_messages, approval_payload, step=step)
-                    approval_payload = approval_payload_with_review(approval_payload, review)
-                    if review.approved:
-                        observation = self._execute_model_tool(
-                            tool_name,
-                            approval_granted_tool_input(
-                                tool_call,
-                                approval_payload,
-                                source="reviewer",
-                            ),
-                            trusted_approval=True,
-                            tool_call_id=tool_call.id or f"call_{step}_{index}",
-                        )
-                        approval_payload = parse_shell_approval_required_observation(tool_name, observation)
-                tool_message: Message = {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id or f"call_{step}_{index}",
-                    "name": tool_name,
-                    "content": observation,
-                }
-                if approval_payload is not None:
-                    del session_messages[batch_session_start:]
-                    del messages[batch_model_start:]
-                    final = approval_required_final_text(
-                        approval_payload,
-                        batch_count=len(tool_calls),
-                        batch_remaining=len(tool_calls) - index,
-                    )
-                    self._trace(
-                        "agent_waiting_approval",
-                        step=step,
-                        tool_name=tool_name,
-                        command=approval_payload.get("command"),
-                        batch_count=len(tool_calls),
-                        batch_remaining=len(tool_calls) - index,
-                    )
-                    return AgentResult(
-                        final=final,
-                        steps_used=step,
-                        model_profile=self.profile.name,
-                        used_tools=True,
-                        messages=session_messages,
-                    )
-                session_messages.append(tool_message)
-                messages.append(tool_message)
-                terminal_text = deterministic_tool_success_final(
-                    tool_name,
-                    tool_input,
-                    observation,
-                )
-                if terminal_text and len(tool_calls) == 1:
-                    deterministic_final = terminal_text
-
-            if deterministic_final:
-                final_message: Message = {"role": "assistant", "content": deterministic_final}
-                session_messages.append(final_message)
-                messages.append(final_message)
-                self._trace(
-                    "agent_deterministic_final",
-                    step=step,
-                    used_tools=True,
-                    final_chars=len(deterministic_final),
-                )
-                return AgentResult(
-                    final=deterministic_final,
-                    steps_used=step,
-                    model_profile=self.profile.name,
-                    used_tools=True,
-                    messages=session_messages,
-                )
-
-        final = f"Reached max ReAct steps ({self.max_steps}) without final answer."
-        final_message: Message = {"role": "assistant", "content": final}
-        session_messages.append(final_message)
-        messages.append(final_message)
-        self._trace("agent_max_steps", max_steps=self.max_steps, used_tools=used_tools)
+        for event in self.iter_message_events(runtime, system_context=system_context):
+            kind = event.get("event")
+            if kind == "final":
+                final = str(event.get("content") or "")
+                steps_used = int(event.get("steps_used") or 0)
+                used_tools = bool(event.get("used_tools"))
+            elif kind == "error":
+                raise RuntimeError(str(event.get("message") or "agent failed"))
         return AgentResult(
             final=final,
-            steps_used=self.max_steps,
+            steps_used=steps_used,
             model_profile=self.profile.name,
             used_tools=used_tools,
-            messages=session_messages,
+            messages=runtime.log.derive_messages(),
+            transcript=runtime.log.derive_transcript(),
         )
 
     def iter_events(self, goal: str) -> Iterator[dict[str, Any]]:
@@ -328,22 +247,25 @@ class ReActAgent:
 
     def iter_message_events(
         self,
-        session_messages: list[Message],
+        conversation: list[Message] | ConversationRuntime,
         *,
         system_context: str = "",
     ) -> Iterator[dict[str, Any]]:
+        runtime = as_conversation_runtime(conversation)
         self.active_runtime_was_compacted = False
-        messages: list[Message] = self._model_messages(session_messages, system_context=system_context)
+        messages: list[Message] = self._request_messages(runtime, system_context=system_context)
         tool_schemas = self._tool_schemas()
         used_tools = False
         visible_content_parts: list[str] = []
+        last_truncation_signature: tuple[str, ...] = ()
+        consecutive_truncations = 0
         self._trace(
             "agent_start",
             mode="stream",
-            session_message_count=len(session_messages),
+            session_message_count=runtime.log.seq,
             model_message_count=len(messages),
             tool_schema_count=len(tool_schemas),
-            messages=compact_message_summary(session_messages[-12:]),
+            messages=compact_message_summary(runtime.log.derive_messages()[-12:]),
         )
 
         yield {
@@ -356,10 +278,13 @@ class ReActAgent:
 
         for step in range(1, self.max_steps + 1):
             self._raise_if_cancelled()
+            messages = self._request_messages(runtime, system_context=system_context)
             try:
-                checkpoint_event = self._maybe_compact_active_runtime(messages, step=step)
+                checkpoint_event = self._maybe_compact_active_runtime(
+                    runtime, messages, step=step
+                )
             except ContextCompactionError as error:
-                fallback_count = self._compact_active_runtime_locally(messages)
+                fallback_count = self._compact_active_runtime_locally(runtime)
                 self._trace(
                     "active_runtime_compaction_failed",
                     step=step,
@@ -381,6 +306,36 @@ class ReActAgent:
                 }
             if checkpoint_event is not None:
                 yield checkpoint_event
+                messages = self._request_messages(runtime, system_context=system_context)
+            if self.hooks.transform_context is not None:
+                try:
+                    yield from self.hooks.transform_context(runtime, step=step)
+                except Exception:
+                    self._trace(
+                        "transform_context_hook_failed",
+                        step=step,
+                        traceback=traceback.format_exc().splitlines()[-8:],
+                    )
+                else:
+                    messages = self._request_messages(runtime, system_context=system_context)
+            # Record the non-history half of the request before dispatching it.
+            # History is already the log; the prompt, the late blocks and the
+            # route exist only at request time and are otherwise unrecoverable.
+            runtime.record_request_header(
+                system_prompt=self.system_prompt,
+                late_blocks=self._late_system_blocks(system_context),
+                tool_names=[
+                    str((schema.get("function") or {}).get("name") or "")
+                    for schema in tool_schemas
+                ],
+                profile=self.profile.name,
+                model=self.profile.model,
+                endpoint=str(getattr(self.profile, "base_url", "") or ""),
+                step=step,
+                reason="initial" if step == 1 else "change",
+                reasoning_effort=self.reasoning_effort,
+                max_tokens=self.profile.max_tokens,
+            )
             try:
                 response = yield from self._plan_with_progress(
                     messages=messages,
@@ -388,7 +343,7 @@ class ReActAgent:
                     step=step,
                     draft_prefix=visible_react_draft_prefix(visible_content_parts),
                 )
-                self._record_response_usage(response.raw, session_messages)
+                self._record_response_usage(response.raw, runtime)
             except AgentCancelled:
                 self._trace("agent_cancelled", step=step)
                 raise
@@ -405,6 +360,70 @@ class ReActAgent:
             assistant_message = response_message(response.raw)
             tool_calls = normalize_tool_calls(assistant_message)
 
+            finish_reason = response_finish_reason(response.raw)
+            if tool_calls and finish_reason == "length":
+                signature = tuple(call.name for call in tool_calls)
+                consecutive_truncations = (
+                    consecutive_truncations + 1
+                    if signature == last_truncation_signature
+                    else 1
+                )
+                last_truncation_signature = signature
+                used_tools = True
+                assistant_history, tool_messages = truncated_tool_call_messages(
+                    tool_calls,
+                    max_tokens=self.profile.max_tokens,
+                    attempt=consecutive_truncations,
+                )
+                runtime.append_message(assistant_history)
+                for _item in tool_messages:
+                    runtime.append_message(_item)
+                self._trace(
+                    "tool_calls_truncated",
+                    step=step,
+                    finish_reason=finish_reason,
+                    max_tokens=self.profile.max_tokens,
+                    consecutive_count=consecutive_truncations,
+                    tool_names=list(signature),
+                )
+                detail = str(tool_messages[0].get("content") or "")
+                yield {
+                    "event": "activity",
+                    "phase": "error",
+                    "title": "工具参数被输出上限截断",
+                    "detail": detail,
+                    "activity_type": "tool_arguments_truncated",
+                    "command_status": "error",
+                    "step": step,
+                }
+                if consecutive_truncations >= MAX_CONSECUTIVE_TOOL_LENGTH_TRUNCATIONS:
+                    final = repeated_tool_truncation_final(
+                        signature,
+                        max_tokens=self.profile.max_tokens,
+                        attempts=consecutive_truncations,
+                    )
+                    final_message: Message = {"role": "assistant", "content": final}
+                    runtime.append_message(final_message)
+                    display_final = merge_visible_react_content(visible_content_parts, final)
+                    self._trace(
+                        "tool_truncation_circuit_open",
+                        step=step,
+                        attempts=consecutive_truncations,
+                        tool_names=list(signature),
+                    )
+                    yield {
+                        "event": "final",
+                        "content": display_final,
+                        "steps_used": step,
+                        "model_profile": self.profile.name,
+                        "used_tools": True,
+                        "tool_truncation_circuit_open": True,
+                    }
+                    return
+                continue
+            last_truncation_signature = ()
+            consecutive_truncations = 0
+
             # ReAct state transition is determined only by whether a tool call
             # can be parsed from this assistant message. Content may contain
             # user-visible preamble before tool calls, so content presence is
@@ -420,7 +439,12 @@ class ReActAgent:
                         "step": step,
                     }
                     assistant_fix, user_fix = text_tool_call_repair_messages()
-                    messages.extend([assistant_fix, user_fix])
+                    for _fix in (assistant_fix, user_fix):
+                        runtime.record_context_injection(
+                            str(_fix.get('content') or ''),
+                            kind='tool_call_repair',
+                            role=str(_fix.get('role') or 'system'),
+                        )
                     continue
                 final = raw_content.strip()
                 if not final:
@@ -435,8 +459,18 @@ class ReActAgent:
                     "role": "assistant",
                     "content": final,
                 }
-                session_messages.append(final_message)
-                messages.append(final_message)
+                runtime.append_message(final_message)
+                # The agent would stop here. Anything the user queued while it
+                # was working is a reason to keep going instead — no prompt
+                # needs to warn the model against wrapping up early when a
+                # person can simply add the next sentence.
+                follow_up = self._drain_pending_messages()
+                if follow_up:
+                    visible_content_parts.append(final)
+                    yield from self._inject_pending_messages(
+                        runtime, follow_up, step=step, title="用户追加了消息，继续本轮"
+                    )
+                    continue
                 display_final = merge_visible_react_content(visible_content_parts, final)
                 self._trace(
                     "agent_final",
@@ -483,13 +517,13 @@ class ReActAgent:
                     "activity_type": "work_note",
                     "step": step,
                 }
-            batch_session_start = len(session_messages)
-            batch_model_start = len(messages)
+            # An append-only log has no rollback: a batch paused for approval
+            # keeps its recorded prefix, and resume continues from the exact
+            # call that needed the grant.
             completed_tool_messages: list[Message] = []
             deterministic_final: str | None = None
             assistant_history = assistant_message_for_history(assistant_message, tool_calls=tool_calls)
-            session_messages.append(assistant_history)
-            messages.append(assistant_history)
+            runtime.append_message(assistant_history)
             for index, tool_call in enumerate(tool_calls):
                 self._raise_if_cancelled()
                 used_tools = True
@@ -518,12 +552,25 @@ class ReActAgent:
                     "tool_name": tool_name,
                 }
 
-                observation = yield from self._execute_tool_with_progress(
-                    tool_name,
-                    tool_input,
-                    step,
-                    tool_call_id=tool_call.id or f"call_{step}_{index}",
+                gate = yield from self._run_tool_hook(
+                    self.hooks.before_tool_call,
+                    name="before_tool_call",
+                    runtime=runtime,
+                    step=step,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
                 )
+                if gate is not None and gate.get("block"):
+                    observation = str(
+                        gate.get("observation") or f"{tool_name} 被运行时策略拦下，未执行。"
+                    )
+                else:
+                    observation = yield from self._execute_tool_with_progress(
+                        tool_name,
+                        tool_input,
+                        step,
+                        tool_call_id=tool_call.id or f"call_{step}_{index}",
+                    )
                 self._raise_if_cancelled()
                 approval_payload = parse_shell_approval_required_observation(tool_name, observation)
                 review: ApprovalReview | None = None
@@ -544,7 +591,7 @@ class ReActAgent:
                         "step": step,
                         "tool_name": tool_name,
                     }
-                    review = self._review_approval(session_messages, approval_payload, step=step)
+                    review = self._review_approval(runtime.log.derive_messages(), approval_payload, step=step)
                     approval_payload = approval_payload_with_review(approval_payload, review)
                     yield {
                         "event": "activity",
@@ -601,7 +648,7 @@ class ReActAgent:
                     approval_payload = parse_shell_approval_required_observation(tool_name, observation)
                 if approval_payload is not None:
                     pending_approval = pending_tool_batch_state(
-                        runtime_messages_before_batch=session_messages[:batch_session_start],
+                        runtime_messages_before_batch=[],
                         assistant_message=assistant_history,
                         tool_calls=tool_calls,
                         approval_index=index,
@@ -617,8 +664,6 @@ class ReActAgent:
                         auto_approve=self.auto_approve,
                         visible_content_parts=visible_content_parts,
                     )
-                    del session_messages[batch_session_start:]
-                    del messages[batch_model_start:]
                     yield {
                         "event": "activity",
                         "phase": "action",
@@ -683,14 +728,25 @@ class ReActAgent:
                     "tool_name": tool_name,
                 }
 
+                revised = yield from self._run_tool_hook(
+                    self.hooks.after_tool_call,
+                    name="after_tool_call",
+                    runtime=runtime,
+                    step=step,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    observation=observation,
+                )
+                if revised is not None and revised.get("observation") is not None:
+                    observation = str(revised["observation"])
+
                 tool_message: Message = {
                     "role": "tool",
                     "tool_call_id": tool_call.id or f"call_{step}_{index}",
                     "name": tool_name,
                     "content": observation,
                 }
-                session_messages.append(tool_message)
-                messages.append(tool_message)
+                runtime.append_message(tool_message)
                 completed_tool_messages.append(tool_message)
 
                 terminal_text = deterministic_tool_success_final(
@@ -703,8 +759,7 @@ class ReActAgent:
 
             if deterministic_final:
                 final_message: Message = {"role": "assistant", "content": deterministic_final}
-                session_messages.append(final_message)
-                messages.append(final_message)
+                runtime.append_message(final_message)
                 display_final = merge_visible_react_content(visible_content_parts, deterministic_final)
                 self._trace(
                     "agent_deterministic_final",
@@ -729,10 +784,47 @@ class ReActAgent:
                 }
                 return
 
+            # Tools for this step are done. Anything the user typed while they
+            # ran goes in before the next model call, so steering lands on the
+            # next decision rather than after the turn is over.
+            steering = self._drain_pending_messages()
+            if steering:
+                yield from self._inject_pending_messages(
+                    runtime, steering, step=step, title="用户中途补充"
+                )
+
+            if self.hooks.should_stop_after_turn is not None:
+                try:
+                    stop_now = bool(
+                        self.hooks.should_stop_after_turn(
+                            runtime, step=step, used_tools=used_tools
+                        )
+                    )
+                except Exception:
+                    self._trace(
+                        "should_stop_hook_failed",
+                        step=step,
+                        traceback=traceback.format_exc().splitlines()[-8:],
+                    )
+                    stop_now = False
+                if stop_now:
+                    final = "已按运行时要求在本轮结束。"
+                    runtime.append_message({"role": "assistant", "content": final})
+                    display_final = merge_visible_react_content(visible_content_parts, final)
+                    self._trace("agent_stopped_by_hook", step=step)
+                    yield {
+                        "event": "final",
+                        "content": display_final,
+                        "steps_used": step,
+                        "model_profile": self.profile.name,
+                        "used_tools": used_tools,
+                        "stopped_by_hook": True,
+                    }
+                    return
+
         final = f"Reached max ReAct steps ({self.max_steps}) without final answer."
         final_message: Message = {"role": "assistant", "content": final}
-        session_messages.append(final_message)
-        messages.append(final_message)
+        runtime.append_message(final_message)
         display_final = merge_visible_react_content(visible_content_parts, final)
         self._trace("agent_max_steps", max_steps=self.max_steps, used_tools=used_tools)
         yield {
@@ -752,7 +844,7 @@ class ReActAgent:
 
     def iter_approved_tool_batch_events(
         self,
-        session_messages: list[Message],
+        conversation: list[Message] | ConversationRuntime,
         pending_approval: dict[str, Any],
         *,
         system_context: str = "",
@@ -793,13 +885,15 @@ class ReActAgent:
             if legacy_visible_text:
                 visible_content_parts.append(legacy_visible_text)
 
-        runtime_messages_before_batch = list(session_messages)
-        messages = self._model_messages(session_messages, system_context=system_context)
-        session_messages.append(assistant_history)
-        messages.append(assistant_history)
-        for tool_message in completed_tool_messages:
-            session_messages.append(tool_message)
-            messages.append(tool_message)
+        runtime = as_conversation_runtime(conversation)
+        # The paused batch was never rolled back, so its assistant message and
+        # the results that already landed are still recorded. Replaying them
+        # here would duplicate the call the grant was issued against.
+        if runtime.log.latest(ASSISTANT_MESSAGE) is None:
+            runtime.append_message(assistant_history)
+            for tool_message in completed_tool_messages:
+                runtime.append_message(tool_message)
+        messages = self._request_messages(runtime, system_context=system_context)
 
         yield {
             "event": "draft_reset",
@@ -869,7 +963,7 @@ class ReActAgent:
                     "step": step,
                     "tool_name": tool_name,
                 }
-                review = self._review_approval(session_messages, approval_payload, step=step)
+                review = self._review_approval(runtime.log.derive_messages(), approval_payload, step=step)
                 approval_payload = approval_payload_with_review(approval_payload, review)
                 yield {
                     "event": "activity",
@@ -902,7 +996,7 @@ class ReActAgent:
                 approval_payload = parse_shell_approval_required_observation(tool_name, observation)
             if approval_payload is not None:
                 next_pending = pending_tool_batch_state(
-                    runtime_messages_before_batch=runtime_messages_before_batch,
+                    runtime_messages_before_batch=[],
                     assistant_message=assistant_history,
                     tool_calls=tool_calls,
                     approval_index=index,
@@ -976,15 +1070,13 @@ class ReActAgent:
                 "name": tool_name,
                 "content": observation,
             }
-            session_messages.append(tool_message)
-            messages.append(tool_message)
+            runtime.append_message(tool_message)
             completed_tool_messages.append(tool_message)
 
         # The approved batch is now structurally complete: assistant(tool_calls)
         # is followed by one tool message per tool_call_id. Continue normal
         # ReAct from that state and force used_tools=true on the final event.
-        session_messages[:] = repair_runtime_message_sequence(session_messages)
-        for event in self.iter_message_events(session_messages, system_context=system_context):
+        for event in self.iter_message_events(runtime, system_context=system_context):
             if event.get("event") == "draft_reset":
                 event["content"] = (
                     visible_react_draft_prefix(visible_content_parts)
@@ -1010,64 +1102,25 @@ class ReActAgent:
             yield event
 
     def _default_system_prompt(self) -> str:
+        """What the model needs from the harness, and nothing it can learn elsewhere.
+
+        Every character here is paid on every request, so a rule only belongs in
+        this text when it has nowhere closer to live. Rules about a tool live in
+        that tool's description; rules about this workspace live in AGENTS.md;
+        rules about a domain live in that domain's skill. Termination lives in
+        the loop, which can simply be resumed.
+        """
+
         return (
             "你是本地工作智能体。你可以使用工具读取/写入工作区文件，并调用已注册技能或 MCP 工具。\n"
             "工具定义只通过 API 的 tools 字段提供；你必须使用原生 tool calling 调用工具，"
             "不要在正文中模拟任何工具标签、XML、JSON 或伪协议。\n"
-            "必须牢记 ReAct 的终止语义：只输出 assistant content 而不输出 tool_calls，会被运行时立即视为最终答复并结束整个 ReAct。"
-            "因此，只要用户要求的工作仍有任何一步未实际执行，或你的正文中还会出现‘我会’‘现在开始’‘下面’‘接下来’‘随后’"
-            "等尚待执行的动作，就不得只输出 content；必须在同一条 assistant 消息中同时发起完成下一步所需的原生 tool_calls。"
-            "只有任务已经交付并验证、无需工具即可完整回答，或确实需要用户补充信息/批准而无法继续时，才可以只输出 Markdown 正文结束本轮。"
-            "最终正文应陈述已经发生并核验的结果，不得用未来时计划冒充交付；不要把整段答复放进代码围栏。\n\n"
-            "文件交付任务还有更严格的完成条件：只要用户要求生成、整理、修改或交付文件，而本轮尚未成功执行写入/生成类工具并完成相应核验，"
-            "就绝对不得输出 content-only 最终答复。读取文件、打开技能、确定文种或方案、查看工具参数、环境预检以及描述‘会保留/将记录/按某方式处理’，"
-            "都不构成交付；必须继续在同一条 assistant 消息中发起实际写入、生成或核验所需的原生 tool_calls。"
-            "文件任务的最终答复必须引用已经存在且已核验的产物路径。\n\n"
-            "最多工具调用轮数由运行时控制。不要编造工具结果。\n\n"
-            "展示规则：在需要工具的复杂工作中，如果你形成了会影响后续理解的路线选择、范围判断、"
-            "关键发现或修正，请在发起 tool_calls 的同一条 assistant content 中先写一小段自然语言工作说明；"
-            "它是用户可见、可长期保留的实施路径原文。不要逐条播报机械操作，也不要输出隐私思维链。"
-            "具体命令、参数、回显和中间观察只应体现在活动/工具调用中。"
-            "最终答复只写用户要的结论、摘要、文件路径或下一步建议；不要在最终答复中重复整条过程。\n\n"
-            "计划执行规则：简单问答、单一读取、单文件小改和一步即可验证的任务直接处理，不要建立计划。"
-            "当任务包含三个及以上相互依赖的动作、跨多个文件或材料、研究后还要形成产物、存在显著不确定性，"
-            "或预计需要较长时间执行时，先调用 update_plan 建立 2 至 7 个以结果为导向的步骤，再继续调用实际工具。"
-            "计划不是最终答复，也不是 DAG：任何时刻至多一个步骤为 in_progress；完成并验证后标 completed，"
-            "再推进下一步。只有新证据使原路线失效时才修改计划；不得为展示进度而频繁改写。复杂任务结束前，"
-            "必须把所有已完成步骤更新为 completed；确实无法完成的步骤保留 pending，并在最终答复说明原因。\n\n"
-            "终端权限规则：需要终端时调用 shell_exec。只读查看类命令会自动执行；脚本、安装、长任务或写入类命令"
-            "会返回 approval_required，并附带风险类别、工作目录、超时和命令预览；"
-            "系统会交由独立审查智能体或用户审批；模型不得自行伪造审批状态或重试绕过；"
-            "不得因为预计某个后续动作可能需要权限，就提前在正文中要求用户回复‘允许执行’‘确认’等口令。"
-            "必须先优先调用现有 core 文件工具或技能专用工具；只有确实必须使用 shell_exec 时，先实际调用 shell_exec，"
-            "并且仅当工具真实返回 approval_required 后才暂停。审批由系统审批卡处理，不得用 content-only 正文模拟审批、"
-            "不得让用户手工输入许可，也不得把尚未发起的命令描述成待审批状态。"
-            "被拒绝的危险命令不能绕过。shell_exec 是 argv 执行，不是完整 shell：不要传 2>&1、管道、重定向或依赖 ls 的通配符；"
-            "需要按文件名模式检查时使用 find 或 rg --files。任何非零 returncode 都是失败，最终答复不得把含失败命令的验证概括为“全部通过”。\n\n"
-            "运行环境规则：本项目只有一套受支持的 Python 环境，即工作区根目录 `.venv`；"
-            "Python、pip、Office 脚本、会议 ASR 和 VAD 都必须使用它。不要创建或调用 `.venv_agent`、"
-            "`meeting_audio_minutes/.venv_project`、`.venv_deepfilter`、Conda、系统 Python 或临时 venv，"
-            "也不要用 `--user` 安装包。环境检查使用 `scripts/runtime_env.sh check`，缺依赖时说明原因并请求用户批准后"
-            "使用 `scripts/runtime_env.sh bootstrap`；Node/npm 使用该脚本的 node/npm 子命令。"
-            "FFmpeg、LibreOffice、Poppler 属于声明的原生工具，不代表额外 Python 环境。"
-            "DeepFilterNet 因 Python 版本冲突不进入主运行环境，音频降噪默认使用 FFmpeg。\n\n"
-            "文件使用规则：如果用户消息、参考附件、历史对话或上一步工具结果里已经出现明确文件路径，"
-            "必须优先读取/写入这些明确路径；不要为了确认而先扫描工作区。"
-            "修改现有文本文件时，小范围改动优先使用 edit_text_file；跨多处或多文件改动优先使用 apply_unified_patch；"
-            "只有创建完整新文件或确实需要重写成品时才使用 write_text_file。"
-            "读取、拼接、整理或改写纯文本/Markdown 文件时，必须使用 read_text_file、write_text_file、"
-            "edit_text_file 或 apply_unified_patch；不得为这类操作调用 python、shell_exec 或其他终端命令。"
-            "终端隔离后端不可用时，不要发起或请求用户审批一个必然失败的终端动作；"
-            "如果现有文件工具可以完成同一交付，必须直接改用文件工具继续。"
-            "只有缺少路径且任务确实依赖本地文件时，才可以调用 list_workspace_files，并且必须限定到最小目录"
-            "（例如 meet_files 或 meet_files/attachments）。"
-            "除非用户明确要求查看整个项目结构，否则不要调用 list_workspace_files(path='.') 或扫描工作区根目录。\n\n"
-            "个人待办语义规则：用户问“待办”“待办事项”“我有什么待办”时，待办事项只指 Apple「提醒事项」（当前 Mac 已同步的数据），"
-            "不得从项目、日报、会议纪要、历史对话或工作上下文推测任务后混入回答。必须先通过 apple-schedule 技能读取提醒事项，"
-            "并调用 list_apple_schedule(include_events=false, include_reminders=true)；没有读到数据时如实说明。"
-            "只有用户明确说“工作任务”或“项目待办”时，才按工作上下文回答。"
-            "用户在当前对话中明确要求新增/添加/创建待办或提醒时，才可经 apple-schedule 的 create_apple_reminder 创建一项提醒；"
-            "不得从讨论、计划或会议内容推断写入，不得新增 Apple 日历事件，也不得擅自补全日期、时间、备注或列表。\n\n"
+            "最终正文陈述已经发生并核验的结果，不用未来时计划冒充交付；不要把整段答复放进代码围栏。\n"
+            "不要编造工具结果。最多工具调用轮数由运行时控制。\n\n"
+            # Not a style preference: this note is what the UI shows as the
+            # turn's 实施路径, so it is the only way that panel gets written.
+            "在需要多步工具的工作中，如果你形成了会影响后续理解的路线选择、范围判断或关键发现，"
+            "请在发起 tool_calls 的同一条 assistant content 中先写一小段自然语言工作说明。\n\n"
             "技能分层规则：领域任务先根据系统提示中的技能索引判断是否已有对应技能。"
             "匹配时先调用 sys_skill 的 open 读取该技能说明；关闭的技能不能在对话中 activate，"
             "必须提示用户先在网页“技能”页启用并开始新对话。需要技能专用工具时，"
@@ -1075,19 +1128,34 @@ class ReActAgent:
             "不要猜测或直接调用未出现在顶层 tools 中的技能工具名。"
             "read_text_file、write_text_file、edit_text_file、apply_unified_patch、list_workspace_files 和 shell_exec "
             "是常驻 core 能力，可以直接调用。外部 MCP 能力通过 mcporter 的 list/show/call 分层使用。\n\n"
+            f"{self._workspace_context_block()}"
             f"{self._extra_system_context_block()}"
         )
+
+    def _workspace_context_block(self) -> str:
+        """Conventions that belong to this workspace, not to the harness.
+
+        Mirrors what a project instruction file does elsewhere: the rules travel
+        with the directory, so moving the agent to another workspace does not
+        carry another project's Python layout along with it.
+        """
+
+        text = read_workspace_context(self.workspace_root)
+        if not text:
+            return ""
+        return f"<workspace_context>\n{text}\n</workspace_context>\n\n"
+
 
     def _extra_system_context_block(self) -> str:
         if not self.extra_system_context:
             return ""
         return f"{self.extra_system_context}\n\n"
 
-    def _model_messages(self, session_messages: list[Message], *, system_context: str = "") -> list[Message]:
-        messages: list[Message] = [{"role": "system", "content": self.system_prompt}]
-        late_system_messages: list[Message] = []
+    def _late_system_blocks(self, system_context: str) -> list[Message]:
+        """Per-request context that is re-rendered every step, not history."""
+        blocks: list[Message] = []
         if self.task_plan:
-            late_system_messages.append(
+            blocks.append(
                 {
                     "role": "system",
                     "content": (
@@ -1098,25 +1166,25 @@ class ReActAgent:
                 }
             )
         if system_context.strip():
-            late_system_messages.append({"role": "system", "content": system_context.strip()})
+            blocks.append({"role": "system", "content": system_context.strip()})
+        return blocks
 
-        # Keep per-turn state after the reusable conversation prefix.  Placing
-        # it immediately before the newest user message preserves the usual
-        # final-user role expected by OpenAI-compatible providers while a
-        # changing timestamp or task plan invalidates at most the newest turn
-        # of prompt-cache coverage instead of the entire long history.
-        latest_user_index = next(
-            (
-                index
-                for index in range(len(session_messages) - 1, -1, -1)
-                if session_messages[index].get("role") == "user"
-            ),
-            len(session_messages),
+    def _request_messages(
+        self,
+        runtime: ConversationRuntime,
+        *,
+        system_context: str = "",
+    ) -> list[Message]:
+        """Derive this step's provider messages from the log.
+
+        Assembly is a pure function of the log plus the blocks re-rendered for
+        this request, so nothing the model receives can come from state that
+        was never recorded.
+        """
+
+        return runtime.build_request_messages(
+            self.system_prompt, self._late_system_blocks(system_context)
         )
-        messages.extend(session_messages[:latest_user_index])
-        messages.extend(late_system_messages)
-        messages.extend(session_messages[latest_user_index:])
-        return messages
 
     def _trace(self, event: str, **payload: Any) -> None:
         tracer = self.debug_trace
@@ -1141,6 +1209,63 @@ class ReActAgent:
             self._trace("agent_cancel_requested")
             raise AgentCancelled("用户停止了当前轮。")
 
+    def _drain_pending_messages(self) -> list[str]:
+        if self.pending_messages is None:
+            return []
+        try:
+            queued = self.pending_messages() or []
+        except Exception:
+            # A broken inbox must never take the turn down with it.
+            return []
+        return [str(item).strip() for item in queued if str(item or "").strip()]
+
+    def _inject_pending_messages(
+        self,
+        runtime: ConversationRuntime,
+        texts: list[str],
+        *,
+        step: int,
+        title: str,
+    ) -> Iterator[dict[str, Any]]:
+        """Put what the user said mid-run into the conversation, as themselves."""
+
+        for text in texts:
+            runtime.append_message({"role": "user", "content": text})
+        self._trace("pending_messages_injected", step=step, count=len(texts))
+        yield {
+            "event": "activity",
+            "phase": "thinking",
+            "title": title,
+            "detail": "\n\n".join(texts),
+            "activity_type": "user_steering",
+            "step": step,
+        }
+
+    def _run_tool_hook(
+        self,
+        hook: Callable[..., Iterator[dict[str, Any]]] | None,
+        *,
+        name: str,
+        **payload: Any,
+    ) -> Iterator[dict[str, Any]]:
+        """Run one tool hook, forwarding its events and returning its decision.
+
+        A hook that raises is treated as absent: extending the loop must never
+        be able to fail a tool call that would otherwise have worked.
+        """
+
+        if hook is None:
+            return None
+        try:
+            result = yield from hook(**payload)
+        except Exception:
+            self._trace(
+                f"{name}_hook_failed",
+                traceback=traceback.format_exc().splitlines()[-8:],
+            )
+            return None
+        return result if isinstance(result, dict) else None
+
     def _tool_schemas(self) -> list[dict[str, Any]]:
         schemas = [
             {
@@ -1160,7 +1285,17 @@ class ReActAgent:
                     "name": "update_plan",
                     "description": (
                         "Create or update a short living execution plan for a genuinely complex task. "
-                        "Do not use for simple questions or one-step work."
+                        "Do not use for simple questions, a single read, a small one-file edit, or "
+                        "anything verifiable in one step. Use it when the task has three or more "
+                        "dependent actions, spans several files or documents, needs research before "
+                        "producing something, carries real uncertainty, or will take a while: then "
+                        "call update_plan with 2 to 7 outcome-shaped steps before continuing with the "
+                        "real tools. A plan is not the final answer and is not a DAG: at most one step "
+                        "is in_progress at a time; mark a step completed only once it is done and "
+                        "verified, then move on. Revise the plan only when new evidence invalidates the "
+                        "route, never to show progress. Before finishing a complex task, mark every "
+                        "finished step completed; leave genuinely blocked steps pending and say why in "
+                        "the final answer."
                     ),
                     "parameters": {
                         "type": "object",
@@ -1219,6 +1354,16 @@ class ReActAgent:
                 safe_input.pop("_approval_source", None)
                 safe_input.pop("_approval_action_id", None)
                 safe_input.pop("_approval_grant", None)
+            missing = [
+                str(name)
+                for name in (tool.parameters.get("required") or [])
+                if name not in safe_input or safe_input.get(name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"工具 {tool_name} 缺少必填参数：{', '.join(missing)}。"
+                    "请补齐参数后重试。"
+                )
             return str(tool.handler(safe_input))
         finally:
             set_tool_cancel_check(previous_cancel_check)
@@ -1291,6 +1436,7 @@ class ReActAgent:
 
     def _maybe_compact_active_runtime(
         self,
+        runtime: ConversationRuntime,
         messages: list[Message],
         *,
         step: int,
@@ -1298,14 +1444,13 @@ class ReActAgent:
         estimated = estimate_messages_tokens(messages)
         if estimated < ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS:
             return None
-        user_indexes = [index for index, message in enumerate(messages) if message.get("role") == "user"]
-        if not user_indexes:
-            return None
-        active_start = user_indexes[-1]
-        active_messages = messages[active_start:]
+        folded_seqs = runtime.active_turn_surface_seqs()
         # A user prompt by itself has no completed implementation path to fold.
-        if len(active_messages) < 3:
+        if len(folded_seqs) < 2:
             return None
+        active_messages = [{"role": "user", "content": _latest_user_content(runtime)}] + [
+            message for message in runtime.log.derive_messages()[-len(folded_seqs):]
+        ]
         checkpoint = summarize_active_react_checkpoint(
             self.client,
             self.profile,
@@ -1314,23 +1459,17 @@ class ReActAgent:
         )
         if not checkpoint:
             return None
-        original_count = len(active_messages)
-        messages[active_start:] = [
-            active_messages[0],
-            {
-                "role": "assistant",
-                "content": (
-                    "本轮运行上下文已压缩。以下是继续执行所需的高保真检查点；"
-                    "它不是最终答复：\n\n" + checkpoint
-                ),
-            },
-        ]
+        runtime.record_compaction(
+            folded_seqs,
+            "本轮运行上下文已压缩。以下是继续执行所需的高保真检查点；"
+            "它不是最终答复：\n\n" + checkpoint,
+        )
         self.active_runtime_was_compacted = True
         self._trace(
             "active_runtime_compacted",
             step=step,
             estimated_tokens=estimated,
-            original_message_count=original_count,
+            original_message_count=len(folded_seqs),
             checkpoint_chars=len(checkpoint),
         )
         return {
@@ -1338,37 +1477,31 @@ class ReActAgent:
             "phase": "thinking",
             "title": "压缩运行上下文",
             "detail": (
-                f"本轮约 {estimated} tokens；已将 {original_count} 条正在执行的 ReAct 消息整理为检查点，"
-                "完整原始轨迹仍保留在后端日志。"
+                f"本轮约 {estimated} tokens；已将 {len(folded_seqs)} 条正在执行的 ReAct 消息整理为检查点，"
+                "完整原始轨迹仍保留在事件日志中。"
             ),
             "activity_type": "runtime_summary",
             "step": step,
         }
 
-    def _compact_active_runtime_locally(self, messages: list[Message]) -> int:
+    def _compact_active_runtime_locally(self, runtime: ConversationRuntime) -> int:
         """Bound a large active run without spending another model request."""
-        user_indexes = [index for index, message in enumerate(messages) if message.get("role") == "user"]
-        if not user_indexes:
+        folded_seqs = runtime.active_turn_surface_seqs()
+        if len(folded_seqs) < 2:
             return 0
-        active_start = user_indexes[-1]
-        active_messages = messages[active_start:]
-        if len(active_messages) < 3:
-            return 0
-        keep_tail = active_messages[-8:]
-        compacted: list[Message] = [dict(active_messages[0])]
-        for message in keep_tail:
-            if message is active_messages[0]:
-                continue
-            item = dict(message)
-            content = item.get("content")
-            if isinstance(content, str) and len(content) > 8000:
-                item["content"] = content[:8000] + "\n[本地降级：工具输出已截断]"
-            compacted.append(item)
-        messages[active_start:] = repair_runtime_message_sequence(compacted)
+        kept = runtime.log.derive_messages()[-4:]
+        digest = "\n\n".join(
+            f"[{item.get('role')}] {truncate_text(str(item.get('content') or ''), 2000)}"
+            for item in kept
+        )
+        runtime.record_compaction(
+            folded_seqs,
+            "本轮运行上下文已本地降级整理（模型压缩不可用）。以下保留最近的执行片段：\n\n" + digest,
+        )
         self.active_runtime_was_compacted = True
-        return len(compacted)
+        return len(folded_seqs)
 
-    def _record_response_usage(self, raw: dict[str, Any], session_messages: list[Message]) -> None:
+    def _record_response_usage(self, raw: dict[str, Any], runtime: ConversationRuntime) -> None:
         if self.usage_callback is None or self.active_runtime_was_compacted:
             return
         usage = raw.get("usage") if isinstance(raw, dict) else None
@@ -1377,7 +1510,7 @@ class ReActAgent:
         if int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0) <= 0:
             return
         try:
-            self.usage_callback(dict(usage), session_messages)
+            self.usage_callback(dict(usage), runtime.log.derive_messages())
         except Exception as error:
             self._trace(
                 "provider_usage_callback_failed",
@@ -1529,7 +1662,7 @@ class ReActAgent:
                     last_stream_at = time.monotonic()
                     status = str(getattr(chunk, "status", "") or "")
                     status_detail = str(getattr(chunk, "status_detail", "") or "")
-                    if status == "recovery_started":
+                    if status in {"recovery_started", "network_retry"}:
                         recovery_started_at = last_stream_at
                         recovery_last_stream_at = None
                     elif status == "recovery_streaming":
@@ -1604,7 +1737,7 @@ class ReActAgent:
                 except queue.Empty:
                     break
                 delta_status = delta.get("status") or ""
-                if delta_status == "recovery_started":
+                if delta_status in {"recovery_started", "network_retry"}:
                     if draft_content_chars:
                         yield {"event": "draft_reset", "content": draft_prefix, "step": step}
                     content_buffer = ""
@@ -1650,6 +1783,9 @@ class ReActAgent:
                         "title": f"第 {step} 轮 · 模型思考",
                         "content": preview,
                         "append_mode": "replace",
+                        # Carried as a field so the UI never has to pattern-match
+                        # the preview text to know what the stream is doing.
+                        "stream_status": stream_status,
                         "step": step,
                     }
                 if (
@@ -1772,7 +1908,7 @@ class ReActAgent:
                 except queue.Empty:
                     break
                 delta_status = delta.get("status") or ""
-                if delta_status == "recovery_started":
+                if delta_status in {"recovery_started", "network_retry"}:
                     if draft_content_chars:
                         yield {"event": "draft_reset", "content": draft_prefix, "step": step}
                     content_buffer = ""
@@ -1816,6 +1952,9 @@ class ReActAgent:
                         "title": f"第 {step} 轮 · 模型思考",
                         "content": preview,
                         "append_mode": "replace",
+                        # Carried as a field so the UI never has to pattern-match
+                        # the preview text to know what the stream is doing.
+                        "stream_status": stream_status,
                         "step": step,
                     }
                 if (
@@ -1914,14 +2053,22 @@ def model_stream_preview(
     status_detail: str = "",
 ) -> str:
     tool = tool_name.strip()
-    if status == "recovery_started":
+    if status == "network_retry":
+        headline = f"[{elapsed_seconds}s] 网络未就绪，正在重试同一端点。"
+    elif status == "recovery_started":
         headline = f"[{elapsed_seconds}s] 主流已结束，正在启动流式恢复。"
     elif status == "recovery_streaming":
         headline = f"[{elapsed_seconds}s] 恢复流正在返回。"
     else:
         headline = f"[{elapsed_seconds}s] 模型正在流式返回。"
     lines = [headline]
-    if status in {"recovery_started", "recovery_streaming"}:
+    if status == "network_retry":
+        # Never silently switch endpoints: a different route is a different
+        # model, and the user asked for this one.
+        lines.append("连接失败通常是短暂的，正在退避后重试同一模型端点；不会更换模型。")
+        if status_detail:
+            lines.append(status_detail)
+    elif status in {"recovery_started", "recovery_streaming"}:
         lines.append("当前请求未形成完整决策，系统正在自动恢复；已完成的工具结果会继续保留。")
         if status_detail:
             lines.append(f"主流结束信息：{status_detail}")
@@ -2092,6 +2239,82 @@ def response_message(raw: dict[str, Any]) -> dict[str, Any]:
     choice = (raw.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     return message if isinstance(message, dict) else {}
+
+
+def response_finish_reason(raw: dict[str, Any]) -> str:
+    choice = (raw.get("choices") or [{}])[0] if isinstance(raw, dict) else {}
+    if not isinstance(choice, dict):
+        return ""
+    return str(choice.get("finish_reason") or "").strip().lower()
+
+
+def truncated_tool_call_messages(
+    tool_calls: list[NativeToolCall],
+    *,
+    max_tokens: int,
+    attempt: int,
+) -> tuple[Message, list[Message]]:
+    """Return compact history that tells the model a length-truncated call was not run.
+
+    The raw arguments may contain tens of thousands of incomplete characters. Keeping
+    them in active history both wastes context and encourages the model to repeat the
+    same payload, so ReAct history stores only a small sentinel call plus an actionable
+    tool observation. The trace keeps the finish reason, limit, tool names, and repeat
+    count without copying the oversized incomplete payload again.
+    """
+    compact_calls: list[dict[str, Any]] = []
+    tool_messages: list[Message] = []
+    for index, tool_call in enumerate(tool_calls):
+        call_id = tool_call.id or f"call_truncated_{index}"
+        compact_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.name,
+                    "arguments": json.dumps(
+                        {"_tool_arguments_truncated": True},
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        )
+        tool_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": tool_call.name,
+                "content": (
+                    "TOOL_ERROR: ToolArgumentsTruncated: 本次模型响应达到输出上限"
+                    f"（finish_reason=length，max_tokens={max_tokens}），"
+                    f"{tool_call.name} 的参数未保证完整，因此系统没有执行该工具。"
+                    "这不是 path/content 是否平铺或 arguments 是否嵌套的问题。"
+                    "下一轮不得重新发送同一份完整内容；请立即显著缩小单次工具参数，"
+                    "把长脚本拆成较小模块/文件，或用小型分段补丁逐步完成。"
+                    f"这是相同工具组合连续第 {attempt} 次被截断。"
+                ),
+            }
+        )
+    assistant_message: Message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": compact_calls,
+    }
+    return assistant_message, tool_messages
+
+
+def repeated_tool_truncation_final(
+    tool_names: tuple[str, ...],
+    *,
+    max_tokens: int,
+    attempts: int,
+) -> str:
+    names = "、".join(tool_names) or "工具调用"
+    return (
+        f"{names} 连续 {attempts} 次达到模型输出上限（max_tokens={max_tokens}），"
+        "系统已停止自动重试，且没有执行这些不完整的工具调用，以免反复消耗和写入残缺文件。"
+        "需要把单次生成内容进一步拆小后再继续。"
+    )
 
 
 def empty_model_response_message(profile_name: str) -> str:

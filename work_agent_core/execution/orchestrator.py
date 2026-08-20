@@ -67,7 +67,10 @@ class ExecutionOrchestrator:
         self.workspace = WorkspaceManager(self.execution_root)
         self.validator = validator or ValidationService()
         self.backends: dict[BackendKind, ExecutionBackend] = backends or {
-            BackendKind.MACOS_SEATBELT: SeatbeltBackend(runtime_workspace_root=self.runtime_workspace_root),
+            BackendKind.MACOS_SEATBELT: SeatbeltBackend(
+                runtime_workspace_root=self.runtime_workspace_root,
+                readable_source_root=self.workspace_root,
+            ),
             BackendKind.TRUSTED_HOST: TrustedHostBackend(),
         }
 
@@ -310,27 +313,32 @@ class ExecutionOrchestrator:
         self.store.update_status(execution_id, ExecutionStatus.PREPARING)
         emitter.emit("execution.preparing", phase="preparing", summary="正在创建私有工作区和执行环境。")
         try:
-            snapshot = self.workspace.create_snapshot(
-                source_root=source_root,
-                account_id=request.account_id,
-                project_id=request.project_id,
+            snapshot = (
+                None
+                if request.in_place
+                else self.workspace.create_snapshot(
+                    source_root=source_root,
+                    account_id=request.account_id,
+                    project_id=request.project_id,
+                )
             )
             contract = self._contract(
                 execution_id=execution_id,
                 request=request,
                 backend=initial_contract.backend,
                 capabilities=initial_contract.capabilities,
-                snapshot_id=snapshot.snapshot_id,
+                snapshot_id=snapshot.snapshot_id if snapshot else "",
             )
             self.store.store_contract(contract)
             log_dir = self.execution_root / "logs" / execution_id
-            environment = backend.prepare(contract, workspace_path=snapshot.workspace_path, log_dir=log_dir)
+            workspace_path = snapshot.workspace_path if snapshot else Path(source_root).resolve()
+            environment = backend.prepare(contract, workspace_path=workspace_path, log_dir=log_dir)
             self.store.update_status(execution_id, ExecutionStatus.RUNNING)
             emitter.emit(
                 "environment.ready",
                 phase="running",
                 summary="隔离执行环境已就绪。",
-                payload={"backend": contract.backend.value, "environment_id": environment.environment_id, "snapshot_id": snapshot.snapshot_id},
+                payload={"backend": contract.backend.value, "environment_id": environment.environment_id, "snapshot_id": snapshot.snapshot_id if snapshot else ""},
             )
             if request.command is None:
                 raise failure("POLICY_DENIED", "当前执行请求没有可运行的命令。", phase="preparing")
@@ -347,6 +355,7 @@ class ExecutionOrchestrator:
                 process,
                 request,
                 emitter,
+                workspace_path=workspace_path,
                 on_event=on_event,
             )
         except ExecutionFailure as error:
@@ -373,11 +382,12 @@ class ExecutionOrchestrator:
     def _settle_process(
         self,
         record: ExecutionRecord,
-        snapshot: WorkspaceSnapshot,
+        snapshot: WorkspaceSnapshot | None,
         process: ProcessOutcome,
         request: ExecutionRequest,
         emitter: EventEmitter,
         *,
+        workspace_path: Path,
         on_event: EventCallback | None,
     ) -> ExecutionResult:
         if process.cancelled:
@@ -395,9 +405,20 @@ class ExecutionOrchestrator:
                 process=process,
                 on_event=on_event,
             )
-        change_set = self.workspace.capture_changes(execution_id=record.execution_id, snapshot=snapshot)
+        # In-place execution has no snapshot to diff against: the command wrote
+        # the real workspace directly, so there is nothing to capture or apply.
+        discard_changes = request.delivery_mode == "discard_changes"
+        change_set = (
+            None
+            if discard_changes or snapshot is None
+            else self.workspace.capture_changes(execution_id=record.execution_id, snapshot=snapshot)
+        )
         if process.exit_code != 0:
-            receipt_status = ExecutionStatus.PARTIAL if change_set.changes else ExecutionStatus.FAILED
+            receipt_status = (
+                ExecutionStatus.PARTIAL
+                if change_set is not None and change_set.changes
+                else ExecutionStatus.FAILED
+            )
             return self._finish_error(
                 record,
                 ExecutionError("PROCESS_FAILED", f"命令退出码为 {process.exit_code}。", phase="running"),
@@ -408,7 +429,7 @@ class ExecutionOrchestrator:
             )
         self.store.update_status(record.execution_id, ExecutionStatus.VALIDATING)
         emitter.emit("validation.started", phase="validating", summary="正在核验执行产物。")
-        validations = self.validator.validate(snapshot.workspace_path, request.validations)
+        validations = self.validator.validate(workspace_path, request.validations)
         required_failures = [item for item in validations if item.status == "failed"]
         for item in validations:
             emitter.emit(
@@ -427,6 +448,45 @@ class ExecutionOrchestrator:
                 change_set=change_set,
                 on_event=on_event,
             )
+        if discard_changes:
+            result = ExecutionResult(
+                execution_id=record.execution_id,
+                status=ExecutionStatus.SUCCEEDED,
+                process=process,
+                validations=validations,
+                delivery_status=DeliveryStatus.VALIDATED,
+                receipt_id=f"rcpt_{uuid.uuid4().hex}",
+            )
+            emitter.emit(
+                "execution.completed",
+                phase="complete",
+                summary="只读执行与验证已完成，私有快照未写回。",
+            )
+            self._store_receipt(result, applied_paths=[])
+            return result
+        if change_set is None:
+            # In-place execution wrote the real workspace directly, so there is
+            # no change set to apply and nothing was staged for review.
+            result = ExecutionResult(
+                execution_id=record.execution_id,
+                status=ExecutionStatus.SUCCEEDED,
+                process=process,
+                validations=validations,
+                delivery_status=DeliveryStatus.APPLIED,
+                receipt_id=f"rcpt_{uuid.uuid4().hex}",
+            )
+            self.store.update_status(
+                record.execution_id,
+                ExecutionStatus.SUCCEEDED,
+                delivery_status=DeliveryStatus.APPLIED,
+            )
+            emitter.emit(
+                "execution.completed",
+                phase="complete",
+                summary="执行与验证已完成，命令直接在工作区内运行。",
+            )
+            self._store_receipt(result, applied_paths=[])
+            return result
         if change_set.changes and request.delivery_mode == "apply_after_validation":
             self.store.update_status(record.execution_id, ExecutionStatus.APPLYING, delivery_status=DeliveryStatus.VALIDATED)
             emitter.emit("delivery.applying", phase="applying", summary="验证通过，正在将变更原子写回工作区。")

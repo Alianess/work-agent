@@ -10,5 +10,10 @@
     "work_agent.json",
     "技能测试与评估材料"
   ],
-  "source_url": "https://github.com/anthropics/skills/tree/main/skills/skill-creator"
+  "source_url": "https://github.com/anthropics/skills/tree/main/skills/skill-creator",
+  "runtime_tools": [
+    "inspect_skill_health",
+    "scaffold_work_agent_skill",
+    "validate_work_agent_skill"
+  ]
 }

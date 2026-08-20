@@ -32,6 +32,9 @@ class AgentTurn:
     final_message: str = ""
     error: str = ""
     cancel_requested: bool = False
+    queued_messages: list[str] = field(default_factory=list)
+    """What the user said while this turn was already running."""
+
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
@@ -51,6 +54,7 @@ class AgentTurn:
             "final_message": self.final_message,
             "error": self.error,
             "cancel_requested": self.cancel_requested,
+            "queued_messages": [str(item) for item in self.queued_messages],
             "metadata": sanitize_json_value(self.metadata),
         }
 
@@ -72,6 +76,11 @@ class AgentTurn:
             final_message=str(payload.get("final_message") or ""),
             error=str(payload.get("error") or ""),
             cancel_requested=bool(payload.get("cancel_requested")),
+            queued_messages=[
+                str(item)
+                for item in (payload.get("queued_messages") or [])
+                if str(item or "").strip()
+            ],
             metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
         )
 
@@ -316,6 +325,37 @@ class TurnStore:
             turn.updated_at = int(time.time())
             self._write(turn)
             return turn
+
+    def enqueue_message(self, turn_id: str, content: str) -> AgentTurn:
+        """Add something the user said while the turn was already running.
+
+        Interrupting is not the only thing a person may want mid-run. A queued
+        message lets them add to the work instead of killing it and starting
+        over, which is the whole reason the loop can keep going.
+        """
+
+        text = str(content or "").strip()
+        with _TURN_LOCK:
+            turn = self.load(turn_id)
+            if not text or turn.status in TERMINAL_STATUSES:
+                return turn
+            turn.queued_messages.append(text)
+            turn.updated_at = int(time.time())
+            self._write(turn)
+            return turn
+
+    def drain_messages(self, turn_id: str) -> list[str]:
+        """Take everything queued so far. Draining twice must not repeat them."""
+
+        with _TURN_LOCK:
+            turn = self.load(turn_id)
+            queued = list(turn.queued_messages)
+            if not queued:
+                return []
+            turn.queued_messages = []
+            turn.updated_at = int(time.time())
+            self._write(turn)
+            return queued
 
     def mark_cancelled(self, turn_id: str, *, reason: str = "用户停止了当前轮。") -> AgentTurn:
         with _TURN_LOCK:

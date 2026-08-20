@@ -204,6 +204,11 @@ export const api = {
       `/api/agent/turns/${encodeURIComponent(turnId)}/cancel`,
       { method: "POST", body: JSON.stringify({}) }
     ),
+  queueTurnMessage: (turnId: string, content: string) =>
+    requestJson<{ ok: boolean; turn_id: string; status: string; queued_count: number }>(
+      `/api/agent/turns/${encodeURIComponent(turnId)}/message`,
+      { method: "POST", body: JSON.stringify({ content }) }
+    ),
   approveAgentTurn: (
     turnId: string,
     payload: { conversation_id?: string },

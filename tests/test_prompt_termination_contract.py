@@ -9,7 +9,65 @@ from work_agent_core.tool_bus import ToolBus
 
 
 class PromptTerminationContractTests(unittest.TestCase):
-    def test_system_prompt_explains_content_only_ends_react(self) -> None:
+    @staticmethod
+    def _prompt() -> str:
+        profile = ModelProfile(
+            name="prompt-contract-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        return ReActAgent(
+            client=object(),  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+        ).system_prompt
+
+    def test_termination_is_carried_by_the_loop_not_by_the_prompt(self) -> None:
+        """终止语义归循环管，不再靠提示词反复叮嘱。
+
+        原来这里有 500 多字在恐吓模型"不许只输出 content 就收尾"。那是在替
+        缺失的 steering / follow-up 队列付租金：模型提前收尾时无法接续，只能
+        用文字预防。队列补上之后（见 tests/test_turn_steering.py），人补一句
+        就能继续，这些字就该消失。
+        """
+
+        prompt = self._prompt()
+
+        self.assertNotIn("必须牢记 ReAct 的终止语义", prompt)
+        self.assertNotIn("就不得只输出 content", prompt)
+        self.assertNotIn("必须在同一条 assistant 消息中同时发起", prompt)
+        self.assertNotIn("就绝对不得输出 content-only 最终答复", prompt)
+        self.assertNotIn("本轮尚未成功执行写入/生成类工具并完成相应核验", prompt)
+
+    def test_prompt_keeps_only_what_has_nowhere_closer_to_live(self) -> None:
+        """留在提示词里的，是没有更近的家可回的规则。"""
+
+        prompt = self._prompt()
+
+        self.assertIn("未来时计划冒充交付", prompt)
+        self.assertIn("不要编造工具结果", prompt)
+        self.assertIn("原生 tool calling", prompt)
+        # 这条不是文风偏好：UI 的"实施路径"面板全靠它写出来。
+        self.assertIn("先写一小段自然语言工作说明", prompt)
+
+    def test_terminal_rules_moved_onto_the_terminal_tool(self) -> None:
+        """讲 shell_exec 的话写在 shell_exec 上，模型看到它时才付这笔钱。"""
+
+        from work_agent_core.shell_tools import register_shell_tools
+        from work_agent_core.tools import ToolRegistry
+
+        registry = ToolRegistry()
+        register_shell_tools(registry, Path.cwd())
+        description = registry.get("shell_exec").description
+
+        self.assertIn("approval_required", description)
+        self.assertNotIn("确认", self._prompt())
+        for moved in ("允许执行", "simulate an approval", "denied command stays denied"):
+            self.assertIn(moved, description)
+
+    def test_plan_rules_moved_onto_the_plan_tool(self) -> None:
         profile = ModelProfile(
             name="prompt-contract-test",
             provider="openai-compatible",
@@ -22,21 +80,54 @@ class PromptTerminationContractTests(unittest.TestCase):
             profile=profile,
             tools=ToolBus(),
         )
+        schema = next(
+            item
+            for item in agent._tool_schemas()
+            if item["function"]["name"] == "update_plan"
+        )
+        description = schema["function"]["description"]
 
-        prompt = agent.system_prompt
-        self.assertIn("只输出 assistant content 而不输出 tool_calls", prompt)
-        self.assertIn("立即视为最终答复并结束整个 ReAct", prompt)
-        self.assertIn("必须在同一条 assistant 消息中同时发起", prompt)
-        self.assertIn("未来时计划冒充交付", prompt)
-        self.assertIn("不得因为预计某个后续动作可能需要权限", prompt)
-        self.assertIn("审批由系统审批卡处理", prompt)
-        self.assertIn("不得让用户手工输入许可", prompt)
-        self.assertIn("本轮尚未成功执行写入/生成类工具并完成相应核验", prompt)
-        self.assertIn("查看工具参数、环境预检", prompt)
-        self.assertIn("已经存在且已核验的产物路径", prompt)
-        self.assertIn("个人待办语义规则", prompt)
-        self.assertIn("待办事项只指 Apple「提醒事项」", prompt)
-        self.assertIn("不得从项目、日报、会议纪要、历史对话或工作上下文推测任务", prompt)
+        self.assertIn("2 to 7 outcome-shaped steps", description)
+        self.assertIn("at most one step", description)
+        self.assertNotIn("计划执行规则", agent.system_prompt)
+
+    def test_file_tool_rules_moved_onto_the_file_tools(self) -> None:
+        from work_agent_core.tools import ToolRegistry, register_file_tools
+
+        registry = ToolRegistry()
+        register_file_tools(registry, Path.cwd())
+
+        self.assertIn("finish_reason=length", registry.get("write_text_file").description)
+        self.assertIn("never through python or a terminal command", registry.get("read_text_file").description)
+        self.assertIn("smallest directory", registry.get("list_workspace_files").description)
+        self.assertNotIn("文件使用规则", self._prompt())
+
+    def test_workspace_rules_moved_into_the_workspace_file(self) -> None:
+        """环境约定跟着目录走，换个工作区就不该带着上一个项目的 Python 布局。"""
+
+        from work_agent_core.react import read_workspace_context
+
+        prompt_without_workspace = self._prompt()
+        self.assertNotIn(".venv_deepfilter", prompt_without_workspace)
+        self.assertNotIn("runtime_env.sh", prompt_without_workspace)
+
+        context = read_workspace_context(Path.cwd())
+        self.assertIn(".venv", context)
+        self.assertIn("runtime_env.sh", context)
+        self.assertIn("--user", context)
+
+    def test_todo_semantics_live_in_the_skill_not_the_prompt(self) -> None:
+        """Apple 待办语义已经同时在技能正文和常驻技能索引里，提示词不必再抄一遍。"""
+
+        from work_agent_core import web_server
+
+        self.assertNotIn("个人待办语义规则", self._prompt())
+        self.assertIn("提醒事项", web_server.render_chat_skill_catalog())
+
+    def test_prompt_stays_within_its_budget(self) -> None:
+        """提示词是每一次请求都要付的税，给它一个会响的上限。"""
+
+        self.assertLess(len(self._prompt()), 3200)
 
     def test_apple_schedule_skill_distinguishes_reminders_from_work_tasks(self) -> None:
         skill_text = (

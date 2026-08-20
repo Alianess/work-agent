@@ -11,5 +11,9 @@
     "明确指令下新增的 Apple 提醒事项",
     "macOS EventKit 授权状态"
   ],
-  "default_enabled": true
+  "default_enabled": true,
+  "runtime_tools": [
+    "create_apple_reminder",
+    "list_apple_schedule"
+  ]
 }

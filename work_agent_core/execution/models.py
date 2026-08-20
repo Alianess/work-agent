@@ -159,6 +159,11 @@ class ExecutionRequest:
     host_service: HostServiceCall | None = None
     validations: tuple[ValidationSpec, ...] = ()
     delivery_mode: str = "apply_after_validation"
+    # Run in the account's real workspace instead of a private copy. The OS
+    # sandbox is still the boundary; what changes is that the command can see
+    # the data it was asked about. A snapshot that excludes the user's own
+    # files makes every command report them as missing.
+    in_place: bool = False
     reason: str = ""
     created_at_ms: int = 0
 

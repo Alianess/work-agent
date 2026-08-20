@@ -33,6 +33,15 @@ class FakeResponse:
 
 
 class ModelConfigurationTests(unittest.TestCase):
+    def test_llm_route_not_found_has_actionable_message(self) -> None:
+        message = web_server.friendly_error_message(
+            RuntimeError("LLM stream failed with HTTP 404: edge route not found")
+        )
+
+        self.assertIn("模型接口没有找到可用路由", message)
+        self.assertIn("连接测试", message)
+        self.assertIn("不会自动改用其他模型", message)
+
     def test_model_profile_vision_capability_is_explicit_and_legacy_safe(self) -> None:
         deepseek = ModelProfile.from_dict({
             "name": "deepseek-v4-flash",
