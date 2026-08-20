@@ -545,6 +545,35 @@ def file_to_text(path: Path) -> str:
     return "\n\n".join(sections)
 
 
+TRANSCRIPT_DIRECTORIES = frozenset({"asr_full", "asr_outputs", "realtime_transcripts"})
+"""本系统写会议转写的地方。
+
+分类不是猜的：这几个目录是我们自己写的，就像排除列表一样属于自我认知。
+类型标对了，模型才能用 source_kinds 把口语闲聊挡在文档检索之外——实测转写
+占了索引 51% 的窗口，不分开的话，问"中试基地为什么要建"会被录音里的
+"跑模型啊""九零幺零出了很多人才"淹掉。
+"""
+
+
+TRANSCRIPT_NAME_MARKERS = ("ASR转写稿", "transcript")
+"""会议纪要技能给转写产物起的名字。
+
+和目录一样属于自我认知——这些文件是我们自己写出来的，不是在猜用户的命名。
+只看目录不够：整理文件系统时把 121 份转写稿移进了 文字稿/，它们仍然是转写。
+"""
+
+
+def classify_source(path: Path, relative_to: Path | None = None) -> str:
+    key = file_source_key(path, relative_to)
+    parts = Path(key).parts
+    if any(part in TRANSCRIPT_DIRECTORIES for part in parts):
+        return SOURCE_TRANSCRIPT
+    name = Path(key).name
+    if any(marker in name for marker in TRANSCRIPT_NAME_MARKERS):
+        return SOURCE_TRANSCRIPT
+    return SOURCE_DOCUMENT
+
+
 def build_file_tree(
     path: Path,
     *,
@@ -560,10 +589,16 @@ def build_file_tree(
             stamp = int(resolved.stat().st_mtime * 1000)
         except OSError:
             stamp = 0
-    return build_document_tree(
+    tree = build_document_tree(
         source_id=identifier,
         title=resolved.name,
         text=file_to_text(resolved),
         occurred_at=stamp,
         meta={"path": resolved.as_posix(), "suffix": resolved.suffix.lower()},
     )
+    kind = classify_source(resolved, relative_to)
+    if kind != SOURCE_DOCUMENT:
+        tree.source_kind = kind
+        for node in tree.nodes:
+            node.source_kind = kind
+    return tree

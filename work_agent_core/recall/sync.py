@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+import re
 import time
 
 from ..session_log import (
@@ -56,6 +57,27 @@ DEFAULT_SKIP_DIRECTORIES = frozenset(
 MAX_FILE_BYTES = 20 * 1024 * 1024
 
 
+_DATA_URL = re.compile(r"data:[a-z]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+
+def readable_content(value: Any) -> str:
+    """从消息内容里取出人能读的那部分。
+
+    多模态消息的 content 是内容块列表，直接 str() 会把整段 base64 当正文索引
+    进去——实测一条这样的消息在索引里长成 860 万 token 的节点。现在写入侧已经
+    不再落盘 base64，但历史里还有，索引不能指望语料是干净的。
+    """
+
+    if isinstance(value, list):
+        parts = [
+            str(item.get("text") or "")
+            for item in value
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        return "\n".join(part for part in parts if part.strip()).strip()
+    return _DATA_URL.sub("[图片]", str(value or "")).strip()
+
+
 def turns_from_log(log: SessionLog) -> list[dict[str, Any]]:
     """把事件日志摊成"轮"。
 
@@ -81,7 +103,7 @@ def turns_from_log(log: SessionLog) -> list[dict[str, Any]]:
         if current is None:
             current = {"title": "第 1 轮", "occurred_at": int(event.ts_ms or 0), "messages": []}
             turns.append(current)
-        content = str(dict(event.data).get("content") or "").strip()
+        content = readable_content(dict(event.data).get("content"))
         if not content:
             continue
         role = "user" if event.type == USER_MESSAGE else "assistant"
