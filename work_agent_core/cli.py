@@ -127,6 +127,7 @@ def build_default_tools(
     agent_reminder_source: Callable[[], list[dict[str, Any]]] | None = None,
     file_change_handler: Callable[[Path], None] | None = None,
     sandbox_auto_allow: bool = False,
+    recall_data_root: str | Path | None = None,
 ) -> ToolBus:
     bus = ToolBus()
     private_workspace = data_workspace or workspace
@@ -155,7 +156,7 @@ def build_default_tools(
             project_id=str(project_id or ""),
         )
     # 统一检索：材料、纪要、聊天走同一个索引，命中最小片段并给出标价的展开地图。
-    register_recall_tools(core_tools.registry, Path(private_workspace))
+    register_recall_tools(core_tools.registry, Path(recall_data_root or private_workspace))
     if friday_notification_handler is not None:
         core_tools.registry.register(
             Tool(

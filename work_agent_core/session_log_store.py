@@ -219,6 +219,23 @@ class SessionLogStore:
             updated_at_ms=int(header_row["updated_at_ms"]) if header_row else 0,
         )
 
+    def delete(self, session_id: str) -> int:
+        """真的删掉这条会话的全部事件。
+
+        删除必须落到每一处存储，否则"删了"只是从列表里消失：日志、检索索引和
+        派生记忆各留一份，磁盘不减、检索还搜得到。
+        """
+
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM session_events WHERE session_id = ?", (session_id,)
+            )
+            removed = int(cursor.rowcount or 0)
+            connection.execute(
+                "DELETE FROM session_headers WHERE session_id = ?", (session_id,)
+            )
+        return removed
+
     def list_sessions(self) -> list[str]:
         with self._lock, self._transaction() as connection:
             rows = connection.execute(

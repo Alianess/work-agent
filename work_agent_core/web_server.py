@@ -89,6 +89,7 @@ from .observers import build_default_registry
 from .work_ledger import build_work_ledger, merge_ledgers
 from .recall.tools import (
     backfill_vectors_once,
+    recall_index_for,
     index_file_async,
     index_conversation_async,
     recall_status,
@@ -2787,6 +2788,7 @@ def tools_payload() -> dict[str, Any]:
         execution_account_id=str(current_auth_user().id),
         enabled_skill_ids=enabled_skill_ids(),
         file_change_handler=update_file_reference_index,
+        recall_data_root=user_data_dir(),
         agent_reminder_source=pending_agent_reminders,
     )
     return {
@@ -3322,11 +3324,37 @@ def cascade_delete_conversations(conversation_ids: Iterable[str]) -> dict[str, i
         get_turn_store().discard_pending_for_conversation(conversation_id)
         for conversation_id in ids
     )
+    # 事件日志与检索索引也要跟着删。它们是后加的，之前不在这条链路上，
+    # 结果是"删了"只从列表里消失：76MB 的日志还在，检索照样搜得到。
+    # 账户目录从 session_store 推导，不再另找一次当前用户——这条路径在没有
+    # 认证上下文时（比如单测）会抛，而清理不该因此变成噪音。
+    data_root = session_store.session_dir.parent
+    deleted_events = 0
+    try:
+        deleted_events = sum(
+            SessionLogStore(session_store.session_dir / "session_log.sqlite3").delete(
+                conversation_id
+            )
+            for conversation_id in ids
+        )
+    except Exception as error:
+        print(f"[delete] 事件日志清理失败：{type(error).__name__}: {error}")
+    deleted_recall = 0
+    try:
+        index = recall_index_for(data_root)
+        for conversation_id in ids:
+            index.forget_source(f"chat:{conversation_id}")
+            deleted_recall += 1
+        index.vacuum_vectors()
+    except Exception as error:
+        print(f"[delete] 检索索引清理失败：{type(error).__name__}: {error}")
     return {
         "sessions": deleted_sessions,
         "history_index_rows": history_index_rows,
         "memories": deleted_memories,
         "pending_turns": deleted_pending_turns,
+        "log_events": deleted_events,
+        "recall_sources": deleted_recall,
     }
 
 
@@ -5810,6 +5838,7 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         execution_account_id=str(current_auth_user().id),
         enabled_skill_ids=enabled_skill_ids(),
         file_change_handler=update_file_reference_index,
+        recall_data_root=user_data_dir(),
         agent_reminder_source=pending_agent_reminders,
     )
     max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
@@ -6157,6 +6186,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         file_change_handler=update_file_reference_index,
+        recall_data_root=user_data_dir(),
         agent_reminder_source=pending_agent_reminders,
         sandbox_auto_allow=auto_approve,
     )
@@ -6634,6 +6664,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             else None
         ),
         file_change_handler=update_file_reference_index,
+        recall_data_root=user_data_dir(),
         agent_reminder_source=pending_agent_reminders,
         sandbox_auto_allow=auto_approve,
     )
@@ -6767,7 +6798,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         store.save(session)
         # 让检索索引跟上这一轮。后台线程：索引写入不许挡住回复。
         index_conversation_async(
-            account_workspace_root(),
+            user_data_dir(),
             conversation_id,
             conversation_runtime.log,
             title=str(session.title or conversation_id),
@@ -6973,6 +7004,7 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         execution_turn_id=turn_runtime.turn_id,
         enabled_skill_ids=enabled_skill_ids(),
         file_change_handler=update_file_reference_index,
+        recall_data_root=user_data_dir(),
         agent_reminder_source=pending_agent_reminders,
         sandbox_auto_allow=pending_approval.get("auto_approve") is True,
     )
@@ -8285,7 +8317,7 @@ def update_file_reference_index(path: Path) -> None:
     """Immediately register a file created through a known Work Agent route."""
 
     account_file_reference_index().upsert(path)
-    index_file_async(account_workspace_root(), path)
+    index_file_async(user_data_dir(), path, workspace_root=account_workspace_root())
 
 
 def remove_from_file_reference_index(path: Path) -> None:

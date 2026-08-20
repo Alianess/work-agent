@@ -202,6 +202,13 @@ def register_recall_tools(
 
 
 def sync_for(data_root: str | Path, *, workspace_root: str | Path | None = None) -> RecallSync:
+    """索引住在账户数据目录，语料来自工作区——两个根不是一回事。
+
+    混同的代价很实在：admin 的 account_workspace_root() 是仓库根，索引就被建到
+    了仓库根下的一个空库里，而真正的语料库在账户目录下。工具查的和写的不是同
+    一个索引，检索永远是空的。
+    """
+
     return RecallSync(
         recall_index_for(data_root), workspace_root=workspace_root or data_root
     )
@@ -241,13 +248,14 @@ def index_file_async(
     data_root: str | Path,
     path: str | Path,
     *,
+    workspace_root: str | Path | None = None,
     on_error: Callable[[Exception], None] | None = None,
 ) -> threading.Thread | None:
     """文件写入或更新后立刻入索引。同样放后台，不挡住写文件的那一步。"""
 
     def _run() -> None:
         try:
-            report = sync_for(data_root).index_file(path)
+            report = sync_for(data_root, workspace_root=workspace_root).index_file(path)
             if report.touched:
                 backfill_vectors_once(data_root, budget=32)
         except Exception as error:  # pragma: no cover - 后台维护不得影响主路径
