@@ -126,6 +126,11 @@ class ModelProfile:
     max_tokens: int = 16384
     timeout_seconds: int = 120
     supports_vision: bool = False
+    auth_header: str = "Authorization"
+    """认证头名。多数厂商用 Authorization，也有用 api-key 的（如 Dots）。"""
+
+    auth_scheme: str = "Bearer"
+    """认证值前缀。为空时直接放裸 key。"""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelProfile":
@@ -138,12 +143,21 @@ class ModelProfile:
             temperature=float(data.get("temperature", 0.6)),
             max_tokens=int(data.get("max_tokens", 16384)),
             timeout_seconds=int(data.get("timeout_seconds", 120)),
+            auth_header=str(data.get("auth_header") or "Authorization"),
+            auth_scheme=str(data.get("auth_scheme", "Bearer")),
             supports_vision=(
                 bool(data["supports_vision"])
                 if isinstance(data.get("supports_vision"), bool)
                 else infer_model_vision_support(data)
             ),
         )
+
+    def auth_headers(self) -> dict[str, str]:
+        """认证头。厂商各写各的，所以这件事属于 profile，不属于客户端。"""
+
+        key = self.api_key()
+        value = f"{self.auth_scheme} {key}".strip() if self.auth_scheme else key
+        return {self.auth_header: value, "Content-Type": "application/json"}
 
     def api_key(self) -> str:
         value = os.getenv(self.api_key_env)

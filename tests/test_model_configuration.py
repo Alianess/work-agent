@@ -258,5 +258,54 @@ class ModelConfigurationTests(unittest.TestCase):
         urlopen.assert_not_called()
 
 
+class ProviderAuthTests(unittest.TestCase):
+    """认证头各家写法不同，所以它属于 profile，不属于客户端。"""
+
+    @staticmethod
+    def _profile(**overrides):
+        from work_agent_core.config import ModelProfile
+
+        base = {
+            "name": "p",
+            "provider": "openai-compatible",
+            "base_url": "https://example.invalid/v1",
+            "model": "m",
+            "api_key_env": "TEST_PROVIDER_KEY",
+        }
+        base.update(overrides)
+        return ModelProfile(**base)
+
+    def setUp(self) -> None:
+        os.environ["TEST_PROVIDER_KEY"] = "k-123"
+        self.addCleanup(os.environ.pop, "TEST_PROVIDER_KEY", None)
+
+    def test_the_default_is_a_bearer_authorization_header(self) -> None:
+        headers = self._profile().auth_headers()
+        self.assertEqual(headers["Authorization"], "Bearer k-123")
+
+    def test_a_provider_can_use_a_bare_key_in_its_own_header(self) -> None:
+        headers = self._profile(auth_header="api-key", auth_scheme="").auth_headers()
+
+        self.assertEqual(headers["api-key"], "k-123")
+        self.assertNotIn("Authorization", headers)
+
+    def test_dots_maps_the_thinking_switch_instead_of_reasoning_effort(self) -> None:
+        from work_agent_core.llm import apply_reasoning_controls
+
+        profile = self._profile(
+            name="dots3-note",
+            base_url="https://note3-prev-api.askdiandian.com/v1",
+            model="dots3-note-prev",
+        )
+
+        on = apply_reasoning_controls({}, profile=profile, reasoning_effort="high")
+        off = apply_reasoning_controls({}, profile=profile, reasoning_effort="light")
+
+        self.assertEqual(on["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual(off["chat_template_kwargs"], {"enable_thinking": False})
+        # 该模型只有开/关两档，没有 reasoning_effort
+        self.assertNotIn("reasoning_effort", on)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,19 @@
       "max_tokens": 16384,
       "timeout_seconds": 120,
       "supports_vision": false
+    },
+    {
+      "name": "dots3-note",
+      "provider": "openai-compatible",
+      "base_url": "https://note3-prev-api.askdiandian.com/v1",
+      "model": "dots3-note-prev",
+      "api_key_env": "DOTS_API_KEY",
+      "auth_header": "api-key",
+      "auth_scheme": "",
+      "temperature": 0.6,
+      "max_tokens": 32768,
+      "timeout_seconds": 300,
+      "supports_vision": true
     }
   ]
 }

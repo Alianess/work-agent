@@ -69,10 +69,17 @@ def should_prefer_direct_connection(profile: ModelProfile) -> bool:
     return is_deepseek_profile(profile) and host in {"api.deepseek.com", "api.deepseek.cn"}
 
 
+def is_dots_profile(profile: ModelProfile) -> bool:
+    identity = " ".join([profile.name, profile.provider, profile.model]).lower()
+    return "dots" in identity or "askdiandian" in profile.base_url.lower()
+
+
 def supports_reasoning_effort(profile: ModelProfile) -> bool:
     identity = " ".join([profile.name, profile.provider, profile.model]).lower()
-    return is_deepseek_profile(profile) or any(
-        marker in identity for marker in ("gpt-5", "o3", "o4")
+    return (
+        is_deepseek_profile(profile)
+        or is_dots_profile(profile)
+        or any(marker in identity for marker in ("gpt-5", "o3", "o4"))
     )
 
 
@@ -93,6 +100,10 @@ def apply_reasoning_controls(
         payload.pop("temperature", None)  # DeepSeek ignores sampling controls in thinking mode.
         payload["thinking"] = {"type": "enabled"}
         payload["reasoning_effort"] = "max" if effort == "very_high" else "high"
+        return payload
+    if is_dots_profile(profile):
+        # Dots 只有开/关两档（该模型固定 max 思考档），没有 reasoning_effort。
+        payload["chat_template_kwargs"] = {"enable_thinking": effort != "light"}
         return payload
     payload["reasoning_effort"] = {
         "light": "low",
@@ -190,10 +201,7 @@ class OpenAICompatibleClient:
         request = urllib.request.Request(
             endpoint,
             data=data,
-            headers={
-                "Authorization": f"Bearer {profile.api_key()}",
-                "Content-Type": "application/json",
-            },
+            headers=profile.auth_headers(),
             method="POST",
         )
         try:
@@ -295,11 +303,7 @@ class OpenAICompatibleClient:
         request = urllib.request.Request(
             endpoint,
             data=data,
-            headers={
-                "Authorization": f"Bearer {profile.api_key()}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
+            headers={**profile.auth_headers(), "Accept": "text/event-stream"},
             method="POST",
         )
         started_at = time.monotonic()
@@ -749,11 +753,7 @@ class OpenAICompatibleClient:
         request = urllib.request.Request(
             endpoint,
             data=data,
-            headers={
-                "Authorization": f"Bearer {profile.api_key()}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
+            headers={**profile.auth_headers(), "Accept": "text/event-stream"},
             method="POST",
         )
         try:
