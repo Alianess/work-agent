@@ -1160,7 +1160,7 @@ class ReActAgent:
             "必须提示用户先在网页“技能”页启用并开始新对话。需要技能专用工具时，"
             "用 sys_skill 的 show 查看参数，再用 sys_skill 的 call 执行。"
             "不要猜测或直接调用未出现在顶层 tools 中的技能工具名。"
-            "read_file、write_text_file、edit_text_file、apply_unified_patch、list_workspace_files 和 shell_exec "
+            "read_file（文件、图片、目录）、write_text_file、edit_text_file 和 shell_exec "
             "是常驻 core 能力，可以直接调用。外部 MCP 能力通过 mcporter 的 list/show/call 分层使用。\n\n"
             f"{self._workspace_context_block()}"
             f"{self._extra_system_context_block()}"

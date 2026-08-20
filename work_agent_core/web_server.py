@@ -3739,7 +3739,7 @@ def conversation_file_items(item: dict[str, Any]) -> list[dict[str, Any]]:
                 title = str(event.get("title") or "")
                 if (
                     project_sources_prefix
-                    and tool_name == "list_workspace_files"
+                    and tool_name in {"list_workspace_files", "read_file"}
                     and event.get("phase") == "observation"
                     and isinstance(event.get("detail"), str)
                 ):
@@ -6826,6 +6826,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 conversation_id,
                 conversation_runtime.log,
                 title=str(session.metadata.get("title") or conversation_id),
+                project_id=str(session.metadata.get("project_id") or ""),
             )
         except Exception as error:  # pragma: no cover - 后台维护不得影响主路径
             print(f"[recall] 本轮索引未能启动：{type(error).__name__}: {error}")
@@ -8045,7 +8046,7 @@ def format_chat_goal(
         "浏览器快照中遇到无文字的图标按钮时，不要把空文本 button 的点击当作已成功；"
         "聊天发送优先对已确认的 textbox 调用 browser_type，并传 submit: true。"
         "如果只是普通问答，可以不调用任何工具，直接用 content 给出最终答复。"
-        "修改现有文本文件时，小改优先使用 edit_text_file；跨多处或多文件改动优先使用 apply_unified_patch；"
+        "修改现有文本文件时，一律用 edit_text_file：小改传 old_text/new_text 精确替换，跨多处或多文件改动传 patch；"
         "只有创建完整新文件或确实需要重写成品时才用 write_text_file。\n\n"
         f"{skills_block}{summary_block}\n\n{transcript}{known_paths_block}{skill_instruction}\n\n"
         "请回答用户最后一条消息。"
@@ -8218,7 +8219,7 @@ def render_known_file_references(refs: list[dict[str, str]]) -> str:
         lines.append(f"- {path}（来源={source_label}{role}）")
 
     return (
-        "\n\n当前对话中已识别的本地文件引用（这是上下文编译结果，不需要再调用 list_workspace_files 确认）：\n"
+        "\n\n当前对话中已识别的本地文件引用（这是上下文编译结果，不需要再列目录确认）：\n"
         + "\n".join(lines)
     )
 

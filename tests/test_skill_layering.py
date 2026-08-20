@@ -24,9 +24,7 @@ PROFILE = ModelProfile(
     api_key_env="UNUSED",
 )
 CORE_MODEL_TOOLS = {
-    "apply_unified_patch",
     "edit_text_file",
-    "list_workspace_files",
     "mcporter",
     "read_file",
     "recall",
@@ -40,6 +38,9 @@ CORE_MODEL_TOOLS = {
 每加一个都是每轮固定成本，所以这张表是有意锁住的：改动它要先想清楚这项能力
 是否非常驻不可。recall / recall_expand 常驻，因为"要不要去找"只有模型判断得了；
 技能工具不常驻，因为它们经 sys_skill 按需展开。
+
+Pi 式归并之后文件工具只剩三个：read 吃文件/图片/目录，edit 吃精确替换和
+unified patch，write 只管整文件创建。
 """
 
 

@@ -99,7 +99,7 @@ class PromptTerminationContractTests(unittest.TestCase):
 
         self.assertIn("finish_reason=length", registry.get("write_text_file").description)
         self.assertIn("never through python or a terminal command", registry.get("read_file").description)
-        self.assertIn("smallest directory", registry.get("list_workspace_files").description)
+        self.assertIn("smallest one that can hold the answer", registry.get("read_file").description)
         self.assertNotIn("文件使用规则", self._prompt())
 
     def test_workspace_rules_moved_into_the_workspace_file(self) -> None:

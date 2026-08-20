@@ -93,6 +93,8 @@ class WorkspaceFiles:
 
     def read_text(self, args: dict[str, Any]) -> str:
         path = self.resolve(str(args["path"]))
+        if path.is_dir():
+            return self._list_directory(path, args)
         if not path.is_file():
             return f"没有这个文件：{args['path']}"
         image_result = self._read_image(path)
@@ -113,6 +115,20 @@ class WorkspaceFiles:
             note += f"; {remaining} remaining — read again with offset={next_offset}"
         note += "]"
         return window + note
+
+    def _list_directory(self, directory: Path, args: dict[str, Any]) -> str:
+        """目录也是 read 的一部分——和 Pi 一致：一个 read 吃文件、图片和目录。"""
+
+        max_files = int(args.get("max_files") or 80)
+        files: list[str] = []
+        for item in sorted(directory.rglob("*")):
+            if item.is_file():
+                files.append(self._display_path(item))
+            if len(files) >= max_files:
+                break
+        if not files:
+            return f"目录是空的：{args.get('path')}"
+        return "\n".join(files)
 
     def _read_image(self, path: Path) -> str | None:
         """图片走附件通道，不是这里的返回值。
@@ -159,6 +175,15 @@ class WorkspaceFiles:
         return f"Wrote {result}"
 
     def edit_text(self, args: dict[str, Any]) -> str:
+        # 一个 edit 吃两种改法：小改传 old_text/new_text 精确替换；
+        # 跨多处或多文件传 patch（unified diff）。和 Pi 的单 edit 一致，
+        # patch 只是我们保留的多文件原子改能力。
+        patch_arg = str(args.get("patch") or "")
+        if patch_arg.strip():
+            # 不 strip 原文：结尾换行是 patch 格式的一部分，裁掉 git apply 就报 corrupt。
+            return self.apply_unified_patch({"patch": patch_arg})
+        if not str(args.get("path") or "").strip():
+            raise ValueError("edit_text_file 需要 path + old_text + new_text，或者 patch。")
         path = self.resolve(str(args["path"]))
         encoding = str(args.get("encoding") or "utf-8")
         old_text = str(args["old_text"])
@@ -376,17 +401,6 @@ class WorkspaceFiles:
         except ValueError:
             return str(path)
 
-    def list_files(self, args: dict[str, Any]) -> str:
-        directory = self.resolve(str(args.get("path") or "meet_files"))
-        max_files = int(args.get("max_files") or 80)
-        files = []
-        for item in sorted(directory.rglob("*")):
-            if item.is_file():
-                files.append(str(item.relative_to(self.workspace_root)))
-            if len(files) >= max_files:
-                break
-        return "\n".join(files)
-
 
 def build_text_edit_preview(
     *,
@@ -505,13 +519,14 @@ def register_file_tools(
         Tool(
             name="read_file",
             description=(
-                "Read a file from the workspace. Text files come back as text; images (jpg, png, "
+                "Read a path from the workspace: text files come back as text, images (jpg, png, "
                 "gif, webp, bmp) are attached to the conversation and become visible on the next "
-                "step, with the tool result only confirming they loaded. "
+                "step, and directories return a listing of files under them (at most max_files). "
                 "For text, returns at most max_chars from offset; when more remains, the result "
                 "says how much and which offset to read next. "
                 "When the user message, an attachment, earlier conversation, or a previous tool result already "
-                "names an exact path, read that path directly instead of scanning the workspace to confirm it. "
+                "names an exact path, read that path directly instead of scanning the workspace to confirm it; "
+                "list a directory only when no exact path is known, and pick the smallest one that can hold the answer. "
                 "Reading, joining, tidying or rewriting plain text and Markdown always goes through the workspace "
                 "file tools, never through python or a terminal command."
             ),
@@ -525,6 +540,11 @@ def register_file_tools(
                         "default": 0,
                         "description": "Character offset to start from; use the value the previous read reported.",
                     },
+                    "max_files": {
+                        "type": "integer",
+                        "default": 80,
+                        "description": "Only for directories: maximum number of files to list.",
+                    },
                 },
                 "required": ["path"],
             },
@@ -536,7 +556,7 @@ def register_file_tools(
             name="write_text_file",
             description=(
                 "Write a complete UTF-8 text file under the workspace. "
-                "For small changes to existing files, prefer edit_text_file or apply_unified_patch so the model does not rewrite the whole file. "
+                "For changes to existing files, prefer edit_text_file (exact replacement or unified patch) so the model does not rewrite the whole file. "
                 "Do not resend a long script or long document through repeated whole-file writes; split it into smaller modules or "
                 "staged patches. If a tool result reports finish_reason=length or truncated arguments, immediately send less in one "
                 "call — that is a size problem, not a path/content nesting problem, so do not retry the same payload unchanged."
@@ -556,8 +576,10 @@ def register_file_tools(
         Tool(
             name="edit_text_file",
             description=(
-                "Make a precise exact-text replacement in an existing UTF-8 text file. "
-                "Use this for small edits to prompts, skills, configs, Markdown, or source code instead of rewriting the entire file."
+                "Edit UTF-8 text files. Two modes: pass path + old_text + new_text for a precise exact-text "
+                "replacement in one file (small edits to prompts, skills, configs, Markdown, or source code); "
+                "or pass patch (a standard unified diff with a/... and b/... paths) for multi-line or multi-file "
+                "changes. Never rewrite an existing file wholesale when one of these fits."
             ),
             parameters={
                 "type": "object",
@@ -567,48 +589,13 @@ def register_file_tools(
                     "new_text": {"type": "string"},
                     "expected_replacements": {"type": "integer", "default": 1},
                     "replace_all": {"type": "boolean", "default": False},
-                },
-                "required": ["path", "old_text", "new_text"],
-            },
-            handler=files.edit_text,
-        )
-    )
-    registry.register(
-        Tool(
-            name="apply_unified_patch",
-            description=(
-                "Apply a standard unified diff patch to workspace files. "
-                "Use for multi-line or multi-file code edits when exact replacement is awkward. Paths must stay inside the workspace."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
                     "patch": {
                         "type": "string",
-                        "description": "Unified diff text with a/... and b/... file paths.",
-                    }
+                        "description": "Unified diff text for multi-line or multi-file edits; when present, path/old_text/new_text are ignored.",
+                    },
                 },
-                "required": ["patch"],
+                "required": [],
             },
-            handler=files.apply_unified_patch,
-        )
-    )
-    registry.register(
-        Tool(
-            name="list_workspace_files",
-            description=(
-                "List files under a specific workspace directory. "
-                "Use only when no exact file path is available; prefer reading explicit paths from the user message, attachments, or prior tool output. "
-                "Narrow it to the smallest directory that can hold the answer, for example meet_files or meet_files/attachments. "
-                "Do not list the workspace root '.' unless the user explicitly asks to inspect the whole project."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "default": "meet_files"},
-                    "max_files": {"type": "integer", "default": 80},
-                },
-            },
-            handler=files.list_files,
+            handler=files.edit_text,
         )
     )
