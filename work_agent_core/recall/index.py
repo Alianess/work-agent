@@ -26,6 +26,21 @@ from .nodes import MemoryNode, MemoryTree
 SCHEMA_VERSION = 1
 
 
+@dataclass
+class UpsertReport:
+    """一次写入动了什么。unchanged 的那部分是省下来的 embedding 调用。"""
+
+    added: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    removed: int = 0
+    skipped: bool = False
+
+    @property
+    def touched(self) -> bool:
+        return bool(self.added or self.updated or self.removed)
+
+
 @dataclass(frozen=True)
 class NodeFilter:
     """元数据过滤先于语义：时间和归属是结构化条件，不该丢给向量去猜。"""
@@ -118,7 +133,8 @@ class RecallIndex:
                 occurred_at INTEGER NOT NULL DEFAULT 0,
                 is_leaf INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0,
-                ordinal INTEGER NOT NULL DEFAULT 0
+                ordinal INTEGER NOT NULL DEFAULT 0,
+                node_hash TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS recall_nodes_source_idx ON recall_nodes(source_id);
             CREATE INDEX IF NOT EXISTS recall_nodes_parent_idx ON recall_nodes(parent_id);
@@ -170,29 +186,93 @@ class RecallIndex:
         uri: str = "",
         digest: str = "",
         aliases_for: Any | None = None,
-    ) -> bool:
-        """写入一棵树。内容没变返回 False，整份跳过。
+    ) -> "UpsertReport":
+        """按节点增量写入。没变的节点原地不动，**它们的向量因此得以保留**。
 
-        `aliases_for(node)` 可以给某个节点补一段**只进检索、不进正文**的文本
-        （别名、纠正过的写法）。这对应 V5_dev 的 caption_aux：让它可被找到，
+        一次对话每加一轮就整份重写的话，全库向量作废重算——一天下来光 embedding
+        就是几十次重复调用。所以这里按 (id, 内容哈希) 求差：新增的插入、变了的
+        更新、没了的删除，其余一律不碰。
+
+        `aliases_for(node)` 可以给节点补一段**只进检索、不进正文**的文本
+        （别名、纠正过的写法）。对应 V5_dev 的 caption_aux：让它可被找到，
         但不出现在返回给模型的正文里。
         """
 
         root = tree.root()
         if root is None:
-            return False
+            return UpsertReport()
         body = "\n".join(node.text for node in tree.iter_depth_first())
         digest = digest or content_hash(body)
         if self.source_hash(tree.source_id) == digest:
-            return False
+            return UpsertReport(skipped=True)
 
+        incoming: dict[str, tuple[MemoryNode, int, str]] = {}
+        for ordinal, node in enumerate(tree.iter_depth_first()):
+            incoming[node.id] = (node, ordinal, content_hash(f"{ordinal}\x1f{node.searchable_body()}"))
+
+        report = UpsertReport()
         with self._connect() as connection:
-            self._delete_source(connection, tree.source_id)
+            existing = {
+                str(row["id"]): str(row["node_hash"])
+                for row in connection.execute(
+                    "SELECT id, node_hash FROM recall_nodes WHERE source_id = ?",
+                    (tree.source_id,),
+                ).fetchall()
+            }
+            for stale_id in set(existing) - set(incoming):
+                self._delete_node(connection, stale_id)
+                report.removed += 1
+
+            for node_id_value, (node, ordinal, node_hash) in incoming.items():
+                if existing.get(node_id_value) == node_hash:
+                    report.unchanged += 1
+                    continue
+                changed = node_id_value in existing
+                if changed:
+                    # 内容变了，旧向量不再对应这段文本，必须失效。
+                    self._delete_node(connection, node_id_value)
+                row = node.to_row()
+                row["ordinal"] = ordinal
+                row["node_hash"] = node_hash
+                connection.execute(
+                    """
+                    INSERT INTO recall_nodes
+                        (id, source_id, source_kind, parent_id, title, path, text,
+                         header, occurred_at, is_leaf, tokens, ordinal, node_hash)
+                    VALUES (:id, :source_id, :source_kind, :parent_id, :title, :path,
+                            :text, :header, :occurred_at, :is_leaf, :tokens, :ordinal,
+                            :node_hash)
+                    """,
+                    row,
+                )
+                if node.is_leaf:
+                    extra = ""
+                    if aliases_for is not None:
+                        try:
+                            extra = str(aliases_for(node) or "")
+                        except Exception:
+                            extra = ""
+                    connection.execute(
+                        "INSERT INTO recall_fts (node_id, search_text) VALUES (?, ?)",
+                        (node.id, self.build_search_text(node, extra)),
+                    )
+                if changed:
+                    report.updated += 1
+                else:
+                    report.added += 1
+
             connection.execute(
                 """
                 INSERT INTO recall_sources
                     (source_id, source_kind, uri, title, content_hash, occurred_at, indexed_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    source_kind = excluded.source_kind,
+                    uri = excluded.uri,
+                    title = excluded.title,
+                    content_hash = excluded.content_hash,
+                    occurred_at = excluded.occurred_at,
+                    indexed_at = excluded.indexed_at
                 """,
                 (
                     tree.source_id,
@@ -204,32 +284,14 @@ class RecallIndex:
                     int(time.time() * 1000),
                 ),
             )
-            for ordinal, node in enumerate(tree.iter_depth_first()):
-                row = node.to_row()
-                row["ordinal"] = ordinal
-                connection.execute(
-                    """
-                    INSERT OR REPLACE INTO recall_nodes
-                        (id, source_id, source_kind, parent_id, title, path, text,
-                         header, occurred_at, is_leaf, tokens, ordinal)
-                    VALUES (:id, :source_id, :source_kind, :parent_id, :title, :path,
-                            :text, :header, :occurred_at, :is_leaf, :tokens, :ordinal)
-                    """,
-                    row,
-                )
-                if not node.is_leaf:
-                    continue
-                extra = ""
-                if aliases_for is not None:
-                    try:
-                        extra = str(aliases_for(node) or "")
-                    except Exception:
-                        extra = ""
-                connection.execute(
-                    "INSERT INTO recall_fts (node_id, search_text) VALUES (?, ?)",
-                    (node.id, self.build_search_text(node, extra)),
-                )
-        return True
+        return report
+
+    @staticmethod
+    def _delete_node(connection: sqlite3.Connection, node_id_value: str) -> None:
+        connection.execute("DELETE FROM recall_fts WHERE node_id = ?", (node_id_value,))
+        connection.execute("DELETE FROM recall_vectors WHERE node_id = ?", (node_id_value,))
+        connection.execute("DELETE FROM recall_node_entities WHERE node_id = ?", (node_id_value,))
+        connection.execute("DELETE FROM recall_nodes WHERE id = ?", (node_id_value,))
 
     @staticmethod
     def build_search_text(node: MemoryNode, extra: str = "") -> str:

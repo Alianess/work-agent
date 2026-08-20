@@ -56,8 +56,8 @@ class IncrementalIndexTests(unittest.TestCase):
         index = fresh_index()
         tree = build_document_tree(source_id="doc:a", title="a", text=REPORT)
 
-        self.assertTrue(index.upsert_tree(tree))
-        self.assertFalse(index.upsert_tree(tree))
+        self.assertTrue(index.upsert_tree(tree).added)
+        self.assertTrue(index.upsert_tree(tree).skipped)
 
     def test_changed_content_replaces_the_source_instead_of_piling_up(self) -> None:
         index = fresh_index()
