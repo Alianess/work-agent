@@ -20,6 +20,7 @@ import json
 
 from .session_log import (
     ASSISTANT_MESSAGE,
+    CONTEXT_INJECTED,
     SESSION_CREATED,
     STEP_END,
     STEP_START,
@@ -34,7 +35,11 @@ from .session_log import (
     check_session_invariants,
 )
 from .session_log_store import SessionLogStore
-from .session_store import SessionStore, sanitize_runtime_message
+from .session_store import (
+    SessionStore,
+    is_turn_runtime_context_message,
+    sanitize_runtime_message,
+)
 
 
 SEED_TURN_PREFIX = "seed-turn"
@@ -58,6 +63,7 @@ def build_seed_log(
 
     turn_index = 0
     turn_open = False
+    pending_turn_contexts: list[dict[str, Any]] = []
 
     def close_turn() -> None:
         nonlocal turn_open
@@ -86,14 +92,39 @@ def build_seed_log(
         if not message:
             continue
         role = message.get("role")
+        if role == "system" and is_turn_runtime_context_message(message):
+            pending_turn_contexts.append(message)
+            continue
         if role == "user":
             close_turn()
             open_turn()
+            for context_message in pending_turn_contexts:
+                log.append(
+                    CONTEXT_INJECTED,
+                    {
+                        "kind": "turn_runtime_context",
+                        "role": "system",
+                        "content": context_message.get("content") or "",
+                        "seed": True,
+                    },
+                )
+            pending_turn_contexts.clear()
             log.append(USER_MESSAGE, {"content": message.get("content") or "", "seed": True})
             continue
         if not turn_open:
             # History that starts mid-conversation still needs an enclosure.
             open_turn()
+        if role == "system":
+            log.append(
+                CONTEXT_INJECTED,
+                {
+                    "kind": "system",
+                    "role": "system",
+                    "content": message.get("content") or "",
+                    "seed": True,
+                },
+            )
+            continue
         if role == "assistant":
             tool_calls = message.get("tool_calls") or []
             log.append(
@@ -123,6 +154,19 @@ def build_seed_log(
                     "call_id": str(message.get("tool_call_id") or ""),
                     "name": str(message.get("name") or ""),
                     "content": message.get("content") or "",
+                    "seed": True,
+                },
+            )
+    if pending_turn_contexts:
+        if not turn_open:
+            open_turn()
+        for context_message in pending_turn_contexts:
+            log.append(
+                CONTEXT_INJECTED,
+                {
+                    "kind": "turn_runtime_context",
+                    "role": "system",
+                    "content": context_message.get("content") or "",
                     "seed": True,
                 },
             )
@@ -216,4 +260,8 @@ def compare_derived_messages(
             differences.append(f"第 {index} 条 tool_calls 不同")
         if str(left.get("tool_call_id") or "") != str(right.get("tool_call_id") or ""):
             differences.append(f"第 {index} 条 tool_call_id 不同")
+        if str(left.get("reasoning_content") or "") != str(
+            right.get("reasoning_content") or ""
+        ):
+            differences.append(f"第 {index} 条 reasoning_content 不同")
     return differences

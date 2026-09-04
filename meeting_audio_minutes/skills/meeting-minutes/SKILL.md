@@ -85,8 +85,9 @@ Prefer this composable workflow:
 5. Draft the internal archive as Markdown and write it with `write_text_file`.
 6. Draft the work-submission version as conservative Markdown content and write it with `write_text_file`. This is an intermediate artifact, not completion.
 7. Perform the modular Word handoff for the canonical deliverable:
-   - Open `official-document` when the requested output is a formal `纪要`, carries formal issuing elements, or otherwise clearly involves official-document content. Let it decide between a full statutory document and a company public-document-style text material.
-   - Then open `docx` and use the complete Word workflow for creation, editing, comments, tracked changes, and structural validation. Do not convert or render the DOCX to PDF for routine preview: the Web file viewer handles DOCX rendering and the user performs visual acceptance. If the user explicitly requests PDF conversion or layout diagnosis, call the structured `docx_soffice` tool once with `input_path` and optional `output_path`; never pass raw LibreOffice arguments or retry unchanged calls. Pass the company document-format setting and any template without rewriting them in this skill.
+   - Open `official-document` when the requested output is a formal `纪要`, carries formal issuing elements, or otherwise clearly involves official-document content. Let it decide between a full statutory document and another unit's formal text material that refers to the national standard.
+   - Then open `docx` and use the complete Word workflow for creation, editing, comments, tracked changes, and structural validation. Do not convert or render the DOCX to PDF for routine preview: the Web file viewer handles DOCX rendering and the user performs visual acceptance. If the user explicitly requests PDF conversion or layout diagnosis, call the structured `docx_soffice` tool once with `input_path` and optional `output_path`; never pass raw LibreOffice arguments or retry unchanged calls. Pass the applicable GB/T 9704—2012 specification from `official-document` and any current-turn template without rewriting them in this skill.
+   - In Work Agent, skill tools are invoked through `sys_skill`: open `docx`, show the required tool schema, then call it through `sys_skill(op="call", skill_id="docx", ...)`. Do not probe Node/npm, global modules, system Python, or package directories, and do not use `shell_exec` to rediscover a Word path already exposed by the skill gateway.
 8. Write `manifest.json`, then read it back and verify the four canonical paths and DOCX structural validation before finalizing. Do not wait for or simulate human page-layout acceptance.
 9. Use `shell_exec` only when a skill instruction or deterministic script is needed; safe read-only commands may run directly, while script/write/install/long commands need user approval.
 
@@ -320,8 +321,8 @@ Hand the final Markdown and the following semantic roles to `official-document`
 when applicable and then to `docx`: document title, opening overview,
 conclusion-led paragraphs, ordinary body paragraphs, optional final
 recommendation, and confirmed attachment/issuer/date fields. The Word skill
-must apply the current company document-format setting or the selected official
-document specification, preserve all its read/create/edit/comment/redline
+must apply the selected GB/T 9704—2012 official-document specification,
+preserve all its read/create/edit/comment/redline
 capabilities, and validate the DOCX. Do not manually render a PDF for routine
 completion; the Web file viewer provides the preview and the user accepts the
 page layout. Render or convert only for an explicit PDF request or a reported

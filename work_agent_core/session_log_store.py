@@ -15,13 +15,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 import json
 import sqlite3
 import threading
 import time
 
 from .session_log import (
+    DEFAULT_SURFACE_OPS,
+    SURFACE_APPEND,
     freeze_json_value,
     snapshot_json_value,
     SessionEvent,
@@ -58,7 +60,7 @@ class SessionLogStore:
         self._ensure_schema()
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         """Open one connection, commit or roll back, then always close it.
 
         ``with sqlite3.connect(...)`` is a transaction scope, not a closing
@@ -71,10 +73,72 @@ class SessionLogStore:
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
-            with connection:
-                yield connection
+            if immediate:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    yield connection
+                except BaseException:
+                    connection.rollback()
+                    raise
+                else:
+                    connection.commit()
+            else:
+                with connection:
+                    yield connection
         finally:
             connection.close()
+
+    @staticmethod
+    def _next_seq_in(connection: sqlite3.Connection, session_id: str) -> int:
+        row = connection.execute(
+            "SELECT MAX(seq) AS max_seq FROM session_events WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        return 0 if row is None or row["max_seq"] is None else int(row["max_seq"]) + 1
+
+    @staticmethod
+    def _validate_batch(events: Sequence[SessionEvent], expected: int) -> None:
+        if events[0].seq != expected:
+            raise SessionLogError(
+                f"追加批次不连续：存储下一个 seq={expected}，批次首个 seq={events[0].seq}"
+            )
+        for offset, event in enumerate(events):
+            if event.seq != expected + offset:
+                raise SessionLogError(
+                    f"追加批次内部不连续：位置 {offset} 期望 seq={expected + offset}，实际 {event.seq}"
+                )
+
+    @staticmethod
+    def _insert_batch(
+        connection: sqlite3.Connection,
+        session_id: str,
+        events: Sequence[SessionEvent],
+    ) -> None:
+        rows = []
+        for event in events:
+            row = event.to_row()
+            rows.append(
+                (
+                    session_id,
+                    row["seq"],
+                    row["type"],
+                    row["ts_ms"],
+                    row["data"],
+                    row["source_event_seqs"],
+                    row["surface_op"],
+                )
+            )
+        connection.executemany(
+            "INSERT INTO session_events"
+            "(session_id, seq, type, ts_ms, data, source_event_seqs, surface_op)"
+            " VALUES(?,?,?,?,?,?,?)",
+            rows,
+        )
+        connection.execute(
+            "INSERT INTO session_headers(session_id, payload, updated_at_ms) VALUES(?,?,?)"
+            " ON CONFLICT(session_id) DO UPDATE SET updated_at_ms=excluded.updated_at_ms",
+            (session_id, json.dumps({"session_id": session_id}), _now_ms()),
+        )
 
     def _ensure_schema(self) -> None:
         with self._lock, self._transaction() as connection:
@@ -139,11 +203,7 @@ class SessionLogStore:
 
     def next_seq(self, session_id: str) -> int:
         with self._lock, self._transaction() as connection:
-            row = connection.execute(
-                "SELECT MAX(seq) AS max_seq FROM session_events WHERE session_id=?",
-                (session_id,),
-            ).fetchone()
-        return 0 if row is None or row["max_seq"] is None else int(row["max_seq"]) + 1
+            return self._next_seq_in(connection, session_id)
 
     def append(self, session_id: str, events: Sequence[SessionEvent]) -> int:
         """Append a contiguous batch. Returns the new next-seq.
@@ -154,44 +214,74 @@ class SessionLogStore:
 
         if not events:
             return self.next_seq(session_id)
-        with self._lock:
-            expected = self.next_seq(session_id)
-            if events[0].seq != expected:
-                raise SessionLogError(
-                    f"追加批次不连续：存储下一个 seq={expected}，批次首个 seq={events[0].seq}"
-                )
-            for offset, event in enumerate(events):
-                if event.seq != expected + offset:
-                    raise SessionLogError(
-                        f"追加批次内部不连续：位置 {offset} 期望 seq={expected + offset}，实际 {event.seq}"
-                    )
-            rows = []
-            for event in events:
-                row = event.to_row()
-                rows.append(
-                    (
-                        session_id,
-                        row["seq"],
-                        row["type"],
-                        row["ts_ms"],
-                        row["data"],
-                        row["source_event_seqs"],
-                        row["surface_op"],
-                    )
-                )
-            with self._transaction() as connection:
-                connection.executemany(
-                    "INSERT INTO session_events"
-                    "(session_id, seq, type, ts_ms, data, source_event_seqs, surface_op)"
-                    " VALUES(?,?,?,?,?,?,?)",
-                    rows,
-                )
-                connection.execute(
-                    "INSERT INTO session_headers(session_id, payload, updated_at_ms) VALUES(?,?,?)"
-                    " ON CONFLICT(session_id) DO UPDATE SET updated_at_ms=excluded.updated_at_ms",
-                    (session_id, json.dumps({"session_id": session_id}), _now_ms()),
-                )
+        with self._lock, self._transaction(immediate=True) as connection:
+            expected = self._next_seq_in(connection, session_id)
+            self._validate_batch(events, expected)
+            self._insert_batch(connection, session_id, events)
             return expected + len(events)
+
+    def append_at_tail(
+        self,
+        session_id: str,
+        build_events: Callable[[int], Sequence[SessionEvent]],
+    ) -> int:
+        """Build and append one batch against the locked durable tail.
+
+        A mirror cannot safely read ``next_seq`` and translate its local event
+        numbers in two separate operations: another legitimate writer may
+        append between them. The callback receives the tail while the SQLite
+        write lock is held, so numbering and insertion are one transaction.
+        """
+
+        with self._lock, self._transaction(immediate=True) as connection:
+            expected = self._next_seq_in(connection, session_id)
+            events = tuple(build_events(expected))
+            if not events:
+                return expected
+            self._validate_batch(events, expected)
+            self._insert_batch(connection, session_id, events)
+            return expected + len(events)
+
+    def append_event(
+        self,
+        session_id: str,
+        event_type: str,
+        data: dict | None = None,
+        *,
+        surface_op: str | None = None,
+        source_event_seqs: Sequence[int] = (),
+        ts_ms: int | None = None,
+    ) -> SessionEvent:
+        """Atomically append one typed fact without building a scratch log.
+
+        Scheduler, channel and delivery adapters use this path.  They publish
+        into the same conversation log as an interactive turn instead of
+        maintaining their own message-shaped storage.
+        """
+
+        built: list[SessionEvent] = []
+
+        def build(seq: int) -> Sequence[SessionEvent]:
+            snapshot = snapshot_json_value(dict(data or {}))
+            if snapshot is None:
+                raise SessionLogError(f"{event_type} 的 data 不是可持久化的 JSON 值。")
+            event = SessionEvent(
+                seq=seq,
+                type=str(event_type),
+                ts_ms=int(ts_ms if ts_ms is not None else _now_ms()),
+                data=freeze_json_value(snapshot),
+                source_event_seqs=tuple(int(item) for item in source_event_seqs),
+                surface_op=str(
+                    surface_op
+                    if surface_op is not None
+                    else DEFAULT_SURFACE_OPS.get(event_type, SURFACE_APPEND)
+                ),
+            )
+            built.append(event)
+            return [event]
+
+        self.append_at_tail(session_id, build)
+        return built[0]
 
     def read(self, session_id: str, *, from_seq: int = 0) -> list[SessionEvent]:
         with self._lock, self._transaction() as connection:
@@ -245,7 +335,7 @@ class SessionLogStore:
 
     # -- loading ---------------------------------------------------------
 
-    def load(self, session_id: str) -> SessionLog:
+    def load(self, session_id: str, *, recover_interrupted: bool = True) -> SessionLog:
         """Materialize a log, closing any turn that never received an end.
 
         Reload preserves an interrupted turn rather than truncating it, and the
@@ -255,11 +345,16 @@ class SessionLogStore:
 
         header = self.header(session_id) or SessionHeader(session_id=session_id)
         events = self.read(session_id)
-        recovered = synthesize_interrupted_turn_ends(events)
+        recovered = synthesize_interrupted_turn_ends(events) if recover_interrupted else []
         if recovered:
             self.append(session_id, recovered)
             events = events + recovered
         return SessionLog(header, events)
+
+    def load_live(self, session_id: str) -> SessionLog:
+        """Load without declaring a deliberately parked approval turn dead."""
+
+        return self.load(session_id, recover_interrupted=False)
 
 
 class SessionLogWriter:
@@ -415,7 +510,7 @@ class DurableTurnMirror:
         self.window_seconds = window_seconds
         self._prologue: list[tuple[str, dict]] = []
         self._pending: list[SessionEvent] = []
-        self._offset: int | None = None
+        self._durable_seq_by_local_seq: dict[int, int] = {}
         self._lock = threading.RLock()
         self.last_error: Exception | None = None
 
@@ -434,39 +529,64 @@ class DurableTurnMirror:
             self._pending.append(event)
 
     def flush(self) -> None:
-        """Write everything buffered. Never raises into the turn."""
+        """Write everything buffered or raise without discarding the batch.
+
+        Once the event log is the conversation authority, silently losing this
+        mirror is no longer "observability degradation"; it is data loss.  A
+        caller may report/retry the failure, while the retained batch makes the
+        retry safe.
+        """
         with self._lock:
             prologue = list(self._prologue)
             batch = list(self._pending)
-            self._prologue.clear()
-            self._pending.clear()
             if not prologue and not batch:
                 return
-            base = self.store.next_seq(self.conversation_id)
-            events: list[SessionEvent] = []
-            for index, (event_type, data) in enumerate(prologue):
-                events.append(
-                    SessionEvent(
-                        seq=base + index,
-                        type=event_type,
-                        ts_ms=_now_ms(),
-                        data=freeze_json_value(snapshot_json_value(data) or {}),
-                        surface_op="append",
+            mapped_this_batch: dict[int, int] = {}
+
+            def build_events(base: int) -> Sequence[SessionEvent]:
+                events: list[SessionEvent] = []
+                for index, (event_type, data) in enumerate(prologue):
+                    events.append(
+                        SessionEvent(
+                            seq=base + index,
+                            type=event_type,
+                            ts_ms=_now_ms(),
+                            data=freeze_json_value(snapshot_json_value(data) or {}),
+                            surface_op="append",
+                        )
                     )
-                )
-            if self._offset is None:
-                self._offset = base + len(prologue) - self.skip_before_seq
-            offset = self._offset
-            for event in batch:
-                sources = tuple(
-                    seq + offset
-                    for seq in event.source_event_seqs
-                    if seq >= self.skip_before_seq
-                )
-                events.append(replace(event, seq=event.seq + offset, source_event_seqs=sources))
-        try:
-            self.store.append(self.conversation_id, events)
-        except Exception as error:
-            # Durability is observability here, not the product. A failed
-            # mirror must not take down a turn that otherwise succeeded.
-            self.last_error = error
+                next_durable_seq = base + len(prologue)
+                for event in batch:
+                    mapped_this_batch[event.seq] = next_durable_seq
+                    next_durable_seq += 1
+                for event in batch:
+                    sources: list[int] = []
+                    for source_seq in event.source_event_seqs:
+                        if source_seq < self.skip_before_seq:
+                            continue
+                        durable_source = mapped_this_batch.get(source_seq)
+                        if durable_source is None:
+                            durable_source = self._durable_seq_by_local_seq.get(source_seq)
+                        if durable_source is None:
+                            raise SessionLogError(
+                                f"镜像事件引用了尚未持久化的本地 seq={source_seq}"
+                            )
+                        sources.append(durable_source)
+                    events.append(
+                        replace(
+                            event,
+                            seq=mapped_this_batch[event.seq],
+                            source_event_seqs=tuple(sources),
+                        )
+                    )
+                return events
+
+            try:
+                self.store.append_at_tail(self.conversation_id, build_events)
+            except Exception as error:
+                self.last_error = error
+                raise
+            self._durable_seq_by_local_seq.update(mapped_this_batch)
+            del self._prologue[: len(prologue)]
+            del self._pending[: len(batch)]
+            self.last_error = None

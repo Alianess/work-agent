@@ -13,7 +13,7 @@ from unittest.mock import patch
 from work_agent_core.config import ModelProfile
 from work_agent_core.llm import OpenAICompatibleClient, prepare_messages_for_profile
 from work_agent_core.react import assistant_message_for_history
-from work_agent_core.session_store import sanitize_runtime_message
+from work_agent_core.session_store import repair_runtime_message_sequence, sanitize_runtime_message
 
 
 class _StreamingResponse:
@@ -218,6 +218,10 @@ class ReasoningContentHistoryTests(unittest.TestCase):
                 os.environ[profile.api_key_env] = previous_key
 
         self.assertEqual(response.content, "final answer")
+        self.assertEqual(
+            response.raw["choices"][0]["message"]["reasoning_content"],
+            "thinking",
+        )
 
     def test_reasoning_only_stream_falls_back_to_streaming_response(self) -> None:
         profile = ModelProfile(
@@ -296,7 +300,9 @@ class ReasoningContentHistoryTests(unittest.TestCase):
 
         self.assertEqual(response.content, "recovered")
         self.assertEqual(response.raw["_work_agent"]["recovery"]["reasoning_effort"], "light")
-        self.assertEqual(urlopen.call_args_list[0].kwargs["timeout"], 45)
+        # Prompt prefill gets the profile's full start budget; the shorter
+        # raw-SSE idle lease is enforced by the ReAct watchdog after data starts.
+        self.assertEqual(urlopen.call_args_list[0].kwargs["timeout"], 120)
         recovery_payload = json.loads(urlopen.call_args_list[1].args[0].data.decode("utf-8"))
         self.assertEqual(recovery_payload["reasoning_effort"], "low")
         self.assertTrue(recovery_payload["stream"])
@@ -343,7 +349,8 @@ class ReasoningContentHistoryTests(unittest.TestCase):
 
         self.assertEqual(response.content, "recovered")
         self.assertEqual(statuses, ["recovery_started", "recovery_streaming"])
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 45)
+        # Cloud recovery remains bounded at its dedicated 60-second budget.
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 60)
         self.assertGreaterEqual(
             response.raw["_work_agent"]["recovery"]["primary_stream_elapsed_seconds"],
             198,
@@ -476,7 +483,7 @@ class ReasoningContentHistoryTests(unittest.TestCase):
             {"path": "notes.md"},
         )
 
-    def test_reasoning_without_tool_calls_is_not_persisted(self) -> None:
+    def test_reasoning_without_tool_calls_is_persisted(self) -> None:
         clean = sanitize_runtime_message(
             {
                 "role": "assistant",
@@ -484,7 +491,71 @@ class ReasoningContentHistoryTests(unittest.TestCase):
                 "reasoning_content": "private reasoning",
             }
         )
-        self.assertNotIn("reasoning_content", clean)
+        self.assertEqual(clean["reasoning_content"], "private reasoning")
+
+        history = assistant_message_for_history(
+            {
+                "role": "assistant",
+                "content": "done",
+                "reasoning_content": "private reasoning",
+            }
+        )
+        self.assertEqual(history["reasoning_content"], "private reasoning")
+
+    def test_legacy_invalid_tool_arguments_are_quarantined_on_load(self) -> None:
+        repaired = repair_runtime_message_sequence(
+            [
+                {
+                    "role": "assistant",
+                    "content": "准备检索。",
+                    "tool_calls": [
+                        {
+                            "id": "call_bad",
+                            "type": "function",
+                            "function": {
+                                "name": "sys_skill",
+                                "arguments": '{"query":"first""query":"second"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_bad",
+                    "name": "sys_skill",
+                    "content": "TOOL_ERROR: 参数无效",
+                },
+                {"role": "user", "content": "继续"},
+            ]
+        )
+
+        self.assertEqual(repaired[0], {"role": "assistant", "content": "准备检索。"})
+        self.assertEqual(repaired[1]["role"], "assistant")
+        self.assertIn("历史工具结果", repaired[1]["content"])
+        self.assertIn("TOOL_ERROR: 参数无效", repaired[1]["content"])
+        self.assertFalse(any(message.get("tool_calls") for message in repaired))
+
+    def test_qwen_history_sends_both_reasoning_aliases_without_mutating_storage(self) -> None:
+        profile = ModelProfile(
+            name="lmstudio-qwen3.8-27b",
+            provider="lm-studio",
+            base_url="http://example.invalid/v1",
+            model="qwen3.8-27b",
+            api_key_env="UNUSED",
+        )
+        original = [
+            {
+                "role": "assistant",
+                "content": "done",
+                "reasoning_content": "retained thinking",
+            }
+        ]
+
+        prepared = prepare_messages_for_profile(original, profile)
+
+        self.assertEqual(prepared[0]["reasoning_content"], "retained thinking")
+        self.assertEqual(prepared[0]["reasoning"], "retained thinking")
+        self.assertNotIn("reasoning", original[0])
 
     def test_legacy_deepseek_tool_call_gets_reasoning_placeholder(self) -> None:
         profile = ModelProfile(

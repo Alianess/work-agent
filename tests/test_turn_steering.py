@@ -167,6 +167,22 @@ class SteeringQueueTests(unittest.TestCase):
 
 
 class TurnInboxTests(unittest.TestCase):
+    def test_structured_inbox_is_not_removed_until_acknowledged(self) -> None:
+        store = TurnStore(tempfile.mkdtemp())
+        turn = store.create(conversation_id="c1")
+        store.enqueue_message(turn.id, "补充口径")
+
+        first = store.peek_message_events(turn.id)
+        second = store.peek_message_events(turn.id)
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["kind"], "user_followup")
+        self.assertEqual(first[0]["payload"]["content"], "补充口径")
+        self.assertEqual(len(store.load(turn.id).queued_messages), 1)
+
+        removed = store.ack_message_events(turn.id, [first[0]["event_id"]])
+        self.assertEqual(removed, 1)
+        self.assertEqual(store.peek_message_events(turn.id), [])
+
     def test_draining_is_exactly_once(self) -> None:
         store = TurnStore(tempfile.mkdtemp())
         turn = store.create(conversation_id="c1")

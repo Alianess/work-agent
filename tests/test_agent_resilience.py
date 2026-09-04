@@ -4,15 +4,19 @@ import time
 import threading
 import unittest
 import json
+import tempfile
+from pathlib import Path
 
 from work_agent_core.config import ModelProfile
 from work_agent_core.approval_review import ApprovalReview
 from work_agent_core.llm import LLMResponse, LLMStreamChunk
+from work_agent_core.memory import estimate_messages_tokens
 from work_agent_core.session_runtime import ConversationRuntime
 from work_agent_core.react import (
     NativeToolCall,
     ReActAgent,
     pending_tool_batch_state,
+    repeated_stream_span,
     tool_observation_failed,
 )
 from work_agent_core.tool_bus import LocalToolProvider, ToolBus
@@ -20,7 +24,9 @@ from work_agent_core.tools import Tool
 
 
 class _StalledClient:
-    def chat_tools_stream(self, *_args, on_delta=None, **_kwargs) -> LLMResponse:
+    def chat_tools_stream(self, *_args, on_delta=None, on_heartbeat=None, **_kwargs) -> LLMResponse:
+        if on_heartbeat:
+            on_heartbeat()
         if on_delta:
             on_delta(LLMStreamChunk(reasoning="partial"))
         time.sleep(2.0)
@@ -38,8 +44,10 @@ class _NoStreamClient:
 
 
 class _ActiveReasoningClient:
-    def chat_tools_stream(self, *_args, on_delta=None, **_kwargs) -> LLMResponse:
+    def chat_tools_stream(self, *_args, on_delta=None, on_heartbeat=None, **_kwargs) -> LLMResponse:
         for _ in range(9):
+            if on_heartbeat:
+                on_heartbeat()
             if on_delta:
                 on_delta(LLMStreamChunk(reasoning="still working"))
             time.sleep(0.15)
@@ -50,11 +58,15 @@ class _ActiveReasoningClient:
 
 
 class _RecoveryAfterActiveReasoningClient:
-    def chat_tools_stream(self, *_args, on_delta=None, **_kwargs) -> LLMResponse:
+    def chat_tools_stream(self, *_args, on_delta=None, on_heartbeat=None, **_kwargs) -> LLMResponse:
         for _ in range(4):
+            if on_heartbeat:
+                on_heartbeat()
             if on_delta:
                 on_delta(LLMStreamChunk(reasoning="still working"))
             time.sleep(0.15)
+        if on_heartbeat:
+            on_heartbeat()
         if on_delta:
             on_delta(LLMStreamChunk(status="recovery_started"))
         # The recovery phase may legitimately be quieter than the primary
@@ -67,7 +79,9 @@ class _RecoveryAfterActiveReasoningClient:
 
 
 class _PartialContentThenRecoveryClient:
-    def chat_tools_stream(self, *_args, on_delta=None, **_kwargs) -> LLMResponse:
+    def chat_tools_stream(self, *_args, on_delta=None, on_heartbeat=None, **_kwargs) -> LLMResponse:
+        if on_heartbeat:
+            on_heartbeat()
         if on_delta:
             on_delta(LLMStreamChunk(content="流"))
             time.sleep(0.3)
@@ -91,15 +105,80 @@ class _CancellableStalledClient:
         self,
         *_args,
         on_delta=None,
+        on_heartbeat=None,
         cancel_event=None,
         **_kwargs,
     ) -> LLMResponse:
+        if on_heartbeat:
+            on_heartbeat()
         if on_delta:
             on_delta(LLMStreamChunk(reasoning="partial"))
         if cancel_event is not None and cancel_event.wait(5):
             self.cancelled.set()
             raise RuntimeError("cancelled")
         raise RuntimeError("stream was not cancelled")
+
+
+class _RepeatingReasoningClient:
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+
+    def chat_tools_stream(
+        self,
+        *_args,
+        on_delta=None,
+        on_heartbeat=None,
+        cancel_event=None,
+        **_kwargs,
+    ) -> LLMResponse:
+        repeated = "".join(
+            f"第{index:04d}项依次核对会议人物、时间、地点、结论和待办事项。"
+            for index in range(100)
+        )
+        # 三份连发：前两片命中两次还不够(consecutive=2 才停)，第三片达阈值触发停止。
+        for fragment in (repeated, repeated, repeated):
+            if on_heartbeat:
+                on_heartbeat()
+            if on_delta:
+                on_delta(LLMStreamChunk(reasoning=fragment))
+        if cancel_event is not None and cancel_event.wait(5):
+            self.cancelled.set()
+            raise RuntimeError("cancelled repeated stream")
+        raise RuntimeError("repeated stream was not cancelled")
+
+
+class _AdvancingRepetitionClient:
+    """模拟长结构化生成：中间出现过一次重复但一直被新内容推进。
+
+    过去单次命中即判循环会误杀此类(反复引用同构 XML/模板仍在推进)。
+    连续命中门槛下，中间的新内容会清空计数，最终不应被停止。
+    """
+
+    def chat_tools_stream(
+        self,
+        *_args,
+        on_delta=None,
+        on_heartbeat=None,
+        cancel_event=None,
+        **_kwargs,
+    ) -> LLMResponse:
+        long_span = "".join(
+            f"第{index:04d}项依次核对会议人物、时间、地点、结论和待办事项。"
+            for index in range(100)
+        )
+        advance1 = "新增推进：逐条草拟合同条款。" * 30
+        advance2 = "新增推进：补充风险与退出章节。" * 30
+        for fragment in (advance1, long_span, long_span, advance2):
+            if on_heartbeat:
+                on_heartbeat()
+            if on_delta:
+                on_delta(LLMStreamChunk(reasoning=fragment))
+        if cancel_event is not None and cancel_event.wait(5):
+            raise RuntimeError("advancing stream was wrongly cancelled")
+        return LLMResponse(
+            content="推进完成",
+            raw={"choices": [{"message": {"role": "assistant", "content": "推进完成"}}]},
+        )
 
 
 class _ToolThenFinalClient:
@@ -142,9 +221,11 @@ class _StreamingToolContentThenFinalClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def chat_tools_stream(self, *_args, on_delta=None, **_kwargs) -> LLMResponse:
+    def chat_tools_stream(self, *_args, on_delta=None, on_heartbeat=None, **_kwargs) -> LLMResponse:
         self.calls += 1
         if self.calls == 1:
+            if on_heartbeat:
+                on_heartbeat()
             if on_delta:
                 on_delta(LLMStreamChunk(content="我先读取资料。"))
                 on_delta(LLMStreamChunk(tool_name="test_tool"))
@@ -214,7 +295,9 @@ class _ReportSaveThenNetworkFailureClient:
 
 
 class _StreamingFinalClient:
-    def chat_tools_stream(self, *_args, on_delta=None, **_kwargs) -> LLMResponse:
+    def chat_tools_stream(self, *_args, on_delta=None, on_heartbeat=None, **_kwargs) -> LLMResponse:
+        if on_heartbeat:
+            on_heartbeat()
         if on_delta:
             on_delta(LLMStreamChunk(reasoning="internal"))
             on_delta(LLMStreamChunk(content="你好"))
@@ -351,6 +434,95 @@ class _AlwaysLengthTruncatedClient:
         )
 
 
+class _MalformedToolThenValidClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.message_snapshots: list[list[dict]] = []
+
+    def chat_tools_stream(self, messages, *_args, **_kwargs) -> LLMResponse:
+        self.calls += 1
+        self.message_snapshots.append([dict(message) for message in messages])
+        if self.calls == 1:
+            return LLMResponse(
+                content="准备检索。",
+                raw={
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "准备检索。",
+                            "tool_calls": [{
+                                "id": "call_bad_json",
+                                "type": "function",
+                                "function": {
+                                    "name": "test_tool",
+                                    "arguments": '{"query":"first""query":"second"}',
+                                },
+                            }],
+                        },
+                    }],
+                },
+            )
+        if self.calls == 2:
+            return LLMResponse(
+                content="参数已缩小并修正。",
+                raw={
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "参数已缩小并修正。",
+                            "tool_calls": [{
+                                "id": "call_valid_json",
+                                "type": "function",
+                                "function": {
+                                    "name": "test_tool",
+                                    "arguments": '{"query":"fixed"}',
+                                },
+                            }],
+                        },
+                    }],
+                },
+            )
+        return LLMResponse(
+            content="done",
+            raw={
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "done"},
+                }],
+            },
+        )
+
+
+class _AlwaysMalformedToolClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat_tools_stream(self, *_args, **_kwargs) -> LLMResponse:
+        self.calls += 1
+        return LLMResponse(
+            content="retrying",
+            raw={
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "retrying",
+                        "tool_calls": [{
+                            "id": f"call_bad_{self.calls}",
+                            "type": "function",
+                            "function": {
+                                "name": "test_tool",
+                                "arguments": '{"query":"unterminated}',
+                            },
+                        }],
+                    },
+                }],
+            },
+        )
+
+
 class _ApprovalReviewerStub:
     def __init__(self, *, approve: bool) -> None:
         self.approve = approve
@@ -367,6 +539,59 @@ class _ApprovalReviewerStub:
 
 
 class AgentResilienceTests(unittest.TestCase):
+    def test_tool_result_records_structured_delivery_without_parsing_final_prose(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir)
+            report_path = workspace_root / "work_reports" / "demo.md"
+
+            def save_report(_arguments: dict) -> str:
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text("# demo\n", encoding="utf-8")
+                return json.dumps(
+                    {"ok": True, "content_path": "work_reports/demo.md"},
+                    ensure_ascii=False,
+                )
+
+            provider = LocalToolProvider("core")
+            provider.register(
+                Tool(
+                    name="test_tool",
+                    description="save a report",
+                    parameters={"type": "object", "properties": {}},
+                    handler=save_report,
+                )
+            )
+            tools = ToolBus()
+            tools.add_provider(provider)
+            profile = ModelProfile(
+                name="structured-artifact-test",
+                provider="openai-compatible",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+                api_key_env="UNUSED",
+            )
+            runtime = ConversationRuntime.from_messages(
+                [{"role": "user", "content": "save the report"}],
+                session_id="artifact-session",
+            )
+            agent = ReActAgent(
+                client=_ToolThenFinalClient(),  # type: ignore[arg-type]
+                profile=profile,
+                tools=tools,
+                workspace_root=workspace_root,
+            )
+
+            result = agent.run_messages(runtime)
+
+            self.assertEqual(result.final, "done")
+            self.assertNotIn("demo.md", result.final)
+            self.assertEqual(len(result.artifacts), 1)
+            artifact = result.artifacts[0]
+            self.assertEqual(artifact["path"], "work_reports/demo.md")
+            self.assertEqual(artifact["status"], "created")
+            self.assertTrue(artifact["delivery_ready"])
+            self.assertEqual(runtime.log.derive_artifacts(), result.artifacts)
+
     def test_model_profile_default_output_limit_is_16384(self) -> None:
         profile = ModelProfile(
             name="default-limit-test",
@@ -461,6 +686,86 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertIn("连续 3 次", result.final)
         self.assertIn("停止自动重试", result.final)
 
+    def test_malformed_native_tool_arguments_are_not_executed_or_replayed(self) -> None:
+        handler_calls: list[dict] = []
+        provider = LocalToolProvider("core")
+        provider.register(
+            Tool(
+                name="test_tool",
+                description="test",
+                parameters={"type": "object", "properties": {}},
+                handler=lambda arguments: handler_calls.append(arguments) or "ok",
+            )
+        )
+        tools = ToolBus()
+        tools.add_provider(provider)
+        client = _MalformedToolThenValidClient()
+        profile = ModelProfile(
+            name="invalid-tool-json-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(client=client, profile=profile, tools=tools)  # type: ignore[arg-type]
+
+        events = list(agent.iter_message_events([{"role": "user", "content": "search"}]))
+
+        self.assertEqual(handler_calls, [{"query": "fixed"}])
+        self.assertEqual(client.calls, 3)
+        second_request = client.message_snapshots[1]
+        repaired_call = next(
+            call
+            for message in second_request
+            for call in (message.get("tool_calls") or [])
+            if call.get("id") == "call_bad_json"
+        )
+        self.assertEqual(
+            json.loads(repaired_call["function"]["arguments"]),
+            {"_tool_arguments_invalid": True},
+        )
+        invalid_observation = next(
+            message["content"]
+            for message in second_request
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == "call_bad_json"
+        )
+        self.assertIn("ToolArgumentsInvalid", invalid_observation)
+        self.assertTrue(
+            any(event.get("activity_type") == "tool_arguments_invalid" for event in events)
+        )
+        self.assertTrue(any(event.get("event") == "final" for event in events))
+
+    def test_repeated_malformed_tool_arguments_open_circuit_after_three_attempts(self) -> None:
+        handler_calls: list[dict] = []
+        provider = LocalToolProvider("core")
+        provider.register(
+            Tool(
+                name="test_tool",
+                description="test",
+                parameters={"type": "object", "properties": {}},
+                handler=lambda arguments: handler_calls.append(arguments) or "ok",
+            )
+        )
+        tools = ToolBus()
+        tools.add_provider(provider)
+        client = _AlwaysMalformedToolClient()
+        profile = ModelProfile(
+            name="invalid-tool-json-circuit-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(client=client, profile=profile, tools=tools)  # type: ignore[arg-type]
+
+        result = agent.run_messages([{"role": "user", "content": "search"}])
+
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(handler_calls, [])
+        self.assertIn("连续 3 次", result.final)
+        self.assertIn("非法 JSON", result.final)
+
     def test_missing_required_tool_argument_is_reported_before_handler(self) -> None:
         calls: list[dict] = []
         provider = LocalToolProvider("core")
@@ -548,6 +853,67 @@ class AgentResilienceTests(unittest.TestCase):
 
         self.assertEqual(captured, [])
 
+    def test_active_runtime_uses_provider_prompt_tokens_as_its_token_anchor(self) -> None:
+        profile = ModelProfile(
+            name="usage-anchor-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(
+            client=object(),  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+        )
+        runtime = ConversationRuntime.from_messages(
+            [{"role": "user", "content": "很长的上下文" * 200}]
+        )
+        request_messages = agent._request_messages(runtime)
+        raw_estimated = estimate_messages_tokens(request_messages)
+
+        agent._record_response_usage(
+            {"usage": {"prompt_tokens": 321, "completion_tokens": 4}},
+            runtime,
+            request_messages=request_messages,
+        )
+
+        accounted, source, raw = agent._active_runtime_context_tokens(request_messages)
+        self.assertEqual(accounted, 321)
+        self.assertEqual(source, "provider_usage")
+        self.assertEqual(raw, raw_estimated)
+
+    def test_active_runtime_estimates_only_messages_added_after_provider_usage(self) -> None:
+        profile = ModelProfile(
+            name="usage-delta-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(
+            client=object(),  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+        )
+        runtime = ConversationRuntime.from_messages(
+            [{"role": "user", "content": "先读取材料"}]
+        )
+        anchor_messages = agent._request_messages(runtime)
+        anchor_estimated = estimate_messages_tokens(anchor_messages)
+        agent._record_response_usage(
+            {"usage": {"prompt_tokens": 50_000}},
+            runtime,
+            request_messages=anchor_messages,
+        )
+        runtime.record_assistant("已读取")
+        current_messages = agent._request_messages(runtime)
+        current_estimated = estimate_messages_tokens(current_messages)
+
+        accounted, source, _raw = agent._active_runtime_context_tokens(current_messages)
+        self.assertEqual(accounted, 50_000 + current_estimated - anchor_estimated)
+        self.assertEqual(source, "provider_usage_plus_estimated_delta")
+
     def test_dynamic_context_is_inserted_after_history_before_latest_user(self) -> None:
         profile = ModelProfile(
             name="prompt-cache-order-test",
@@ -578,6 +944,40 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertEqual([item["role"] for item in messages[3:-1]], ["system", "system"])
         self.assertIn("continue", str(messages[3]["content"]))
         self.assertEqual(messages[4]["content"], "dynamic time")
+
+    def test_lm_studio_merges_runtime_system_context_into_the_header(self) -> None:
+        profile = ModelProfile(
+            name="lm-studio-template-test",
+            provider="lm-studio",
+            base_url="http://127.0.0.1:1234/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        agent = ReActAgent(
+            client=object(),  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+            system_prompt="fixed system",
+            late_task_plan_context=False,
+        )
+        runtime = ConversationRuntime.from_messages([
+            {"role": "system", "content": "当前轮 runtime context：\ntime #1"},
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "system", "content": "当前轮 runtime context：\ntime #2"},
+            {"role": "user", "content": "second question"},
+        ])
+
+        messages = agent._request_messages(runtime)
+
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertIn("fixed system", messages[0]["content"])
+        self.assertIn("time #1", messages[0]["content"])
+        self.assertIn("time #2", messages[0]["content"])
+        self.assertEqual(messages[-1]["content"], "second question")
 
     def test_successful_report_save_finishes_without_another_model_request(self) -> None:
         client = _ReportSaveThenNetworkFailureClient()
@@ -616,6 +1016,7 @@ class AgentResilienceTests(unittest.TestCase):
         final = next(event for event in events if event.get("event") == "final")
         self.assertTrue(final["deterministic_tool_final"])
         self.assertIn("已完成并核验保存2026-07-09 日报", final["content"])
+        self.assertIn("## 交付文件", final["content"])
         self.assertIn("work_reports/daily/2026-07-09.md", final["content"])
         self.assertEqual(runtime.log.derive_messages()[-1]["role"], "assistant")
         self.assertTrue(
@@ -681,6 +1082,19 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertTrue(any(event.get("title") == "独立审查已批准" for event in events))
         self.assertTrue(any(event.get("event") == "final" and event.get("content") == "done" for event in events))
         self.assertFalse(any(event.get("waiting_approval") for event in events))
+
+    def test_auto_approval_off_returns_reviewable_command_to_human_approval(self) -> None:
+        agent, calls, reviewer = self._approval_agent(auto_approve=False, auto_approvable=True)
+
+        events = list(agent.iter_message_events([{"role": "user", "content": "test"}]))
+
+        self.assertEqual(agent.approval_reviewer, reviewer)
+        self.assertEqual(agent.profile.model, "test-model")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(reviewer.calls, 0)
+        final = next(event for event in events if event.get("event") == "final")
+        self.assertTrue(final["waiting_approval"])
+        self.assertFalse(final["pending_approval"]["auto_approve"])
 
     def test_auto_approval_keeps_high_risk_command_waiting(self) -> None:
         agent, calls, reviewer = self._approval_agent(auto_approve=True, auto_approvable=False)
@@ -818,7 +1232,7 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertTrue(any(event.get("event") == "error" for event in events))
         progress_updates = [event for event in events if event.get("event") == "activity_delta"]
         self.assertLessEqual(len(progress_updates), 2)
-        self.assertTrue(any("没有新内容" in str(event.get("content") or "") for event in progress_updates))
+        self.assertTrue(any("没有收到数据" in str(event.get("content") or "") for event in progress_updates))
 
     def test_active_reasoning_stream_can_finish_past_profile_timeout(self) -> None:
         profile = ModelProfile(
@@ -842,6 +1256,75 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertGreater(elapsed, profile.timeout_seconds)
         self.assertTrue(any(event.get("event") == "final" and event.get("content") == "done" for event in events))
         self.assertFalse(any(event.get("event") == "error" for event in events))
+
+    def test_long_exact_stream_replay_is_detected_but_short_repetition_is_not(self) -> None:
+        ordinary = "仍在核对。" * 20
+        long_span = "".join(
+            f"第{index:04d}项依次核对会议人物、时间、地点、结论和待办事项。"
+            for index in range(100)
+        )
+
+        self.assertEqual(repeated_stream_span(ordinary + ordinary), "")
+        self.assertEqual(repeated_stream_span(long_span), "")
+        self.assertTrue(repeated_stream_span(long_span + long_span))
+
+    def test_repeating_reasoning_stream_is_cancelled_automatically(self) -> None:
+        profile = ModelProfile(
+            name="repetition-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+            timeout_seconds=30,
+        )
+        client = _RepeatingReasoningClient()
+        agent = ReActAgent(
+            client=client,  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+        )
+
+        events = list(agent.iter_message_events([{"role": "user", "content": "test"}]))
+        progress = "\n".join(
+            str(event.get("content") or "")
+            for event in events
+            if event.get("event") == "activity_delta"
+        )
+
+        self.assertTrue(client.cancelled.wait(0.5))
+        self.assertIn("陷入循环重复", progress)
+        self.assertTrue(any(event.get("stream_status") == "repetition_stopped" for event in events))
+        error = next(event for event in events if event.get("event") == "error")
+        self.assertEqual(error.get("type"), "ModelStreamLoopStopped")
+        self.assertEqual(error.get("error_code"), "model_loop_stopped")
+        self.assertTrue(error.get("recoverable"))
+        self.assertNotIn("trace", error)
+
+    def test_advancing_repetition_is_not_stopped_by_single_hit(self) -> None:
+        profile = ModelProfile(
+            name="no-false-alarm",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+            timeout_seconds=30,
+        )
+        client = _AdvancingRepetitionClient()
+        agent = ReActAgent(
+            client=client,  # type: ignore[arg-type]
+            profile=profile,
+            tools=ToolBus(),
+        )
+
+        events = list(agent.iter_message_events([{"role": "user", "content": "test"}]))
+
+        # 虽然中间出现过一次重复命中，但被新推进内容打断，不构成连续循环。
+        self.assertFalse(
+            any(event.get("stream_status") == "repetition_stopped" for event in events)
+        )
+        self.assertTrue(
+            any(event.get("event") == "final" and event.get("content") == "推进完成" for event in events)
+        )
 
     def test_reasoning_is_streamed_in_activity_without_debug_request_noise(self) -> None:
         profile = ModelProfile(
@@ -867,7 +1350,11 @@ class AgentResilienceTests(unittest.TestCase):
 
         self.assertTrue(model_events)
         self.assertTrue(any("模型思考" in str(event.get("title") or "") for event in model_events))
-        self.assertTrue(any("internal" in str(event.get("content") or "") for event in model_events))
+        self.assertTrue(any("internal" in str(event.get("reasoning_content") or "") for event in model_events))
+        self.assertFalse(any("internal" in str(event.get("content") or "") for event in model_events))
+        final_model_event = model_events[-1]
+        self.assertEqual(final_model_event.get("reasoning_content"), "internal")
+        self.assertIn("最终答复已写入", str(final_model_event.get("content") or ""))
         self.assertFalse(any(event.get("activity_type") == "command" for event in model_events))
         self.assertFalse(any("LLM tool planning" in str(event) for event in model_events))
         self.assertFalse(any("--stream-idle-timeout" in str(event) for event in model_events))
@@ -989,6 +1476,63 @@ class AgentResilienceTests(unittest.TestCase):
         self.assertEqual(observation["input_summary"], '{"value": "ok"}')
         self.assertEqual(observation["result_summary"], "ok")
         self.assertTrue(any(event.get("event") == "final" and event.get("content") == "done" for event in events))
+
+    def test_tool_loaded_image_reaches_next_request_as_native_blocks(self) -> None:
+        from work_agent_core.progress import offer_tool_attachment
+
+        class CapturingClient(_ToolThenFinalClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.requests: list[list[dict]] = []
+
+            def chat_tools_stream(self, messages, **kwargs) -> LLMResponse:
+                self.requests.append(list(messages))
+                return super().chat_tools_stream(messages, **kwargs)
+
+        def load_image(_arguments: dict) -> str:
+            delivered = offer_tool_attachment(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,abc"},
+                }
+            )
+            return "loaded" if delivered else "not loaded"
+
+        profile = ModelProfile(
+            name="tool-image-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+        )
+        provider = LocalToolProvider("core")
+        provider.register(
+            Tool(
+                name="test_tool",
+                description="test",
+                parameters={"type": "object", "properties": {}},
+                handler=load_image,
+            )
+        )
+        tools = ToolBus()
+        tools.add_provider(provider)
+        client = CapturingClient()
+        agent = ReActAgent(client=client, profile=profile, tools=tools)
+
+        result = agent.run_messages([{"role": "user", "content": "read it"}])
+
+        image_message = next(
+            message
+            for message in client.requests[1]
+            if isinstance(message.get("content"), list)
+        )
+        self.assertEqual(image_message["content"][1]["type"], "image_url")
+        self.assertTrue(
+            image_message["content"][1]["image_url"]["url"].startswith(
+                "data:image/jpeg;base64,"
+            )
+        )
+        self.assertIsInstance(result.transcript[-2]["content"], list)
 
     def test_visible_content_alongside_native_tool_calls_streams_into_answer_draft(self) -> None:
         profile = ModelProfile(

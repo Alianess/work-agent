@@ -78,9 +78,16 @@ class RuntimeEnvironmentTests(unittest.TestCase):
         self.assertIn("complete Word workflow", skill_text)
         self.assertNotIn("create_docx_from_markdown", skill_text)
 
-    def test_blank_open_source_format_default(self) -> None:
-        default_format = web_server.DEFAULT_AGENT_SETTINGS["company_document_format"]
-        self.assertEqual(default_format, "")
+    def test_company_document_format_override_is_retired(self) -> None:
+        self.assertNotIn("company_document_format", web_server.DEFAULT_AGENT_SETTINGS)
+        skill_dir = self.workspace_root / "work_agent_skills" / "official-document"
+        skill_text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        format_text = (skill_dir / "references" / "format-standard.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("固定基线为 GB/T 9704—2012", skill_text)
+        self.assertIn("22 行、每行 28 字", format_text)
+        self.assertNotIn("上3.5厘米、下3.1厘米", format_text)
 
     def test_skill_without_dependency_declaration_is_not_reported_ready(self) -> None:
         payload = probe_skill_environment(self.workspace_root, skill_id="skill-creator")

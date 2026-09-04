@@ -4,12 +4,30 @@ export type ModelProfile = {
   base_url: string;
   model: string;
   api_key_env: string;
+  auth_header?: string;
+  auth_scheme?: string;
+  stream_idle_timeout_seconds?: number;
+  endpoint_id?: string;
+  endpoint_label?: string;
   temperature: number;
   max_tokens: number;
+  context_length?: number;
   timeout_seconds: number;
   supports_vision: boolean;
   default: boolean;
   api_key_configured: boolean;
+};
+
+export type ModelEndpoint = {
+  endpoint_id: string;
+  name: string;
+  label: string;
+  base_url: string;
+  provider: string;
+  profile_count: number;
+  default: boolean;
+  api_key_configured: boolean;
+  models: ModelProfile[];
 };
 
 export type ReasoningEffort = "light" | "medium" | "high" | "very_high";
@@ -19,6 +37,9 @@ export type ModelsPayload = {
   env_override: string | null;
   message?: string;
   profiles: ModelProfile[];
+  endpoints?: ModelEndpoint[];
+  total_profiles?: number;
+  total_endpoints?: number;
 };
 
 export type ToolInfo = {
@@ -71,8 +92,9 @@ export type AgentSettingsPayload = {
   occupation: string;
   details: string;
   memory_enabled: boolean;
+  auto_approve: boolean;
   work_background?: string;
-  company_document_format: string;
+  extra_read_roots: string[];
   message?: string;
 };
 
@@ -114,6 +136,8 @@ export type FridayNotification = {
   deliver_at: number;
   delivered_at: number;
   read_at: number;
+  dedup_key?: string;
+  conversation_id?: string;
 };
 
 export type FridayNotificationsPayload = {
@@ -273,9 +297,16 @@ export type CrossChatMemoriesPayload = {
     project_limit: number;
     minimum_user_turns: number;
     refresh_interval_user_turns: number;
-    history_recall: string;
+    recall: string;
   };
   project_id: string | null;
+};
+
+export type RememberedApprovalRule = {
+  id: string;
+  command: string;
+  risk_category: string;
+  created_at: number;
 };
 
 export type SkillInfo = {
@@ -596,9 +627,24 @@ export type AgentResult = {
   used_tools?: boolean;
 };
 
+export type DeliveryArtifact = {
+  artifact_id: string;
+  path: string;
+  title?: string;
+  kind?: string;
+  status?: string;
+  verified?: boolean;
+  size_bytes?: number;
+};
+
 export type ChatMessage = {
+  id?: string;
   role: "user" | "assistant";
   content: string;
+  channel?: string;
+  createdAt?: number;
+  read?: boolean;
+  artifacts?: DeliveryArtifact[];
 };
 
 export type AgentChatResult = {
@@ -619,6 +665,17 @@ export type AgentChatResult = {
   context_summary_message_count?: number;
   context_compacted?: boolean;
   context_estimated_tokens?: number;
+  context_pre_compaction_tokens?: number;
+  context_post_compaction_tokens?: number;
+  context_trigger_tokens?: number;
+  context_serialized_bytes?: number;
+  context_serialized_bytes_trigger?: number;
+  context_tool_result_chars?: number;
+  context_tool_result_chars_trigger?: number;
+  context_post_compaction_serialized_bytes?: number;
+  context_post_compaction_tool_result_chars?: number;
+  context_pressure_reasons?: string[];
+  context_token_count_source?: string;
 };
 
 export type ChatTitlePayload = {
@@ -628,6 +685,24 @@ export type ChatTitlePayload = {
 
 export type AgentActivityPhase = "thinking" | "action" | "observation" | "complete" | "error";
 export type AgentRuntimeStage = "checking" | "compacting" | "complete" | "error";
+// Activity types are backend-extensible metadata. Keep the known values for
+// editor completion, but do not make a newly introduced backend activity type
+// invalidate an otherwise readable archived conversation.
+export type AgentActivityType =
+  | "command"
+  | "file_edit"
+  | "work_note"
+  | "runtime_summary"
+  | "plan"
+  | "approval_review"
+  | "image_attached"
+  | "image_fallback"
+  | "runtime_compaction_fallback"
+  | "tool_arguments_truncated"
+  | "user_steering"
+  | "automatic_daily_report"
+  | "automatic_model_fallback"
+  | (string & {});
 
 export type AgentActivityEvent = {
   event: "activity";
@@ -638,9 +713,11 @@ export type AgentActivityEvent = {
   title: string;
   detail?: string;
   content?: string;
+  /** Model-emitted reasoning retained separately from transient status text. */
+  reasoning_content?: string;
   input_summary?: string;
   result_summary?: string;
-  activity_type?: "command" | "file_edit" | "work_note" | "runtime_summary" | "plan" | "approval_review";
+  activity_type?: AgentActivityType;
   plan?: Array<{ step: string; status: "pending" | "in_progress" | "completed" }>;
   plan_completed?: number;
   plan_total?: number;
@@ -675,7 +752,17 @@ export type AgentActivityEvent = {
   receipt_id?: string;
   runtime_stage?: AgentRuntimeStage;
   context_estimated_tokens?: number;
+  context_pre_compaction_tokens?: number;
+  context_post_compaction_tokens?: number;
   context_trigger_tokens?: number;
+  context_serialized_bytes?: number;
+  context_serialized_bytes_trigger?: number;
+  context_tool_result_chars?: number;
+  context_tool_result_chars_trigger?: number;
+  context_post_compaction_serialized_bytes?: number;
+  context_post_compaction_tool_result_chars?: number;
+  context_pressure_reasons?: string[];
+  context_token_count_source?: string;
 };
 
 export type AgentStreamEvent =
@@ -699,11 +786,13 @@ export type AgentStreamEvent =
       phase: AgentActivityPhase;
       title: string;
       content: string;
+      /** Latest retained model reasoning; replace updates must not discard it. */
+      reasoning_content?: string;
       append_mode?: "append" | "replace";
       detail?: string;
       input_summary?: string;
       result_summary?: string;
-      activity_type?: "command" | "file_edit" | "work_note" | "runtime_summary" | "plan" | "approval_review";
+      activity_type?: AgentActivityType;
       /** What the model stream is doing right now, when this delta reports on it. */
       stream_status?: "recovery_started" | "recovery_streaming" | "network_retry" | string;
       plan?: Array<{ step: string; status: "pending" | "in_progress" | "completed" }>;
@@ -740,7 +829,17 @@ export type AgentStreamEvent =
       receipt_id?: string;
       runtime_stage?: AgentRuntimeStage;
       context_estimated_tokens?: number;
+      context_pre_compaction_tokens?: number;
+      context_post_compaction_tokens?: number;
       context_trigger_tokens?: number;
+      context_serialized_bytes?: number;
+      context_serialized_bytes_trigger?: number;
+      context_tool_result_chars?: number;
+      context_tool_result_chars_trigger?: number;
+      context_post_compaction_serialized_bytes?: number;
+      context_post_compaction_tool_result_chars?: number;
+      context_pressure_reasons?: string[];
+      context_token_count_source?: string;
     }
   | {
       event: "delta";
@@ -778,10 +877,22 @@ export type AgentStreamEvent =
       context_summary_message_count?: number;
       context_compacted?: boolean;
       context_estimated_tokens?: number;
+      context_pre_compaction_tokens?: number;
+      context_post_compaction_tokens?: number;
+      context_trigger_tokens?: number;
+      context_serialized_bytes?: number;
+      context_serialized_bytes_trigger?: number;
+      context_tool_result_chars?: number;
+      context_tool_result_chars_trigger?: number;
+      context_post_compaction_serialized_bytes?: number;
+      context_post_compaction_tool_result_chars?: number;
+      context_pressure_reasons?: string[];
+      context_token_count_source?: string;
       elapsed_ms?: number;
       turn_id?: string;
       event_index?: number;
       waiting_approval?: boolean;
+      artifacts?: DeliveryArtifact[];
     }
   | {
       event: "error";
@@ -789,6 +900,9 @@ export type AgentStreamEvent =
       type?: string;
       detail?: string;
       trace?: string[];
+      error_code?: string;
+      recoverable?: boolean;
+      suggested_action?: string;
       elapsed_ms?: number;
       turn_id?: string;
       event_index?: number;

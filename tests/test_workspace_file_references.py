@@ -8,6 +8,7 @@ from unittest.mock import patch
 from work_agent_core.config import ModelProfile
 from work_agent_core import web_server
 from work_agent_core.web_server import (
+    dehydrate_model_messages,
     enrich_image_attachments_for_model,
     extract_workspace_file_references,
     extract_workspace_paths,
@@ -110,6 +111,45 @@ class WorkspaceFileReferenceTests(unittest.TestCase):
 
         self.assertIn("⚠️ 当前模型不支持图片识别。", content)
         self.assertTrue(content.endswith("继续处理文字。"))
+
+    def test_tool_loaded_image_is_request_only_and_never_persisted(self) -> None:
+        internal = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "以下是刚才用 read_file 载入的图片。"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,abc"},
+                },
+            ],
+        }
+        actual_user = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "请看附件"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,def"},
+                },
+            ],
+        }
+
+        self.assertEqual(
+            dehydrate_model_messages([internal, actual_user]),
+            [{"role": "user", "content": "请看附件"}],
+        )
+
+    def test_legacy_stringified_tool_image_is_removed(self) -> None:
+        legacy = {
+            "role": "user",
+            "content": (
+                "[{'type': 'text', 'text': '以下是刚才用 read_file 载入的图片。'}, "
+                "{'type': 'image_url', 'image_url': {'url': "
+                "'data:image/jpeg;base64,abc'}}]"
+            ),
+        }
+
+        self.assertEqual(dehydrate_model_messages([legacy]), [])
 
     def test_nul_separated_text_paths_are_extracted_individually(self) -> None:
         text = (

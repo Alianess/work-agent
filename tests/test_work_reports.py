@@ -361,8 +361,8 @@ class WorkReportStoreTests(unittest.TestCase):
 
         self.assertIn("supplementing an existing", skill_text)
         self.assertIn("collect_work_report_evidence(report_type='daily'", skill_text)
-        self.assertIn("Do not use `recall_chat_history(scope='compressed')`", skill_text)
-        self.assertIn("current-chat compressed miss as an account-wide miss", skill_text)
+        self.assertIn("Use the core `recall` tool only after the evidence collector", skill_text)
+        self.assertIn("current-chat miss as an account-wide miss", skill_text)
         self.assertIn("Never pass\n  `.docx`", skill_text)
 
     def test_report_prompts_require_manager_facing_business_language(self) -> None:
@@ -373,9 +373,6 @@ class WorkReportStoreTests(unittest.TestCase):
         writing_text = (
             root / "work_agent_skills/work-reports/references/report-writing.md"
         ).read_text(encoding="utf-8")
-        history_text = (root / "work_agent_core/history_recall.py").read_text(
-            encoding="utf-8"
-        )
         server_text = (root / "work_agent_core/web_server.py").read_text(encoding="utf-8")
         frontend_text = (root / "web_frontend/src/App.tsx").read_text(encoding="utf-8")
 
@@ -384,7 +381,8 @@ class WorkReportStoreTests(unittest.TestCase):
         self.assertIn("audio chunk counts", skill_text)
         self.assertIn("Manager-facing content filter", writing_text)
         self.assertIn("51/51", writing_text)
-        self.assertIn("工作汇报默认面向部门领导", history_text)
+        self.assertNotIn("工作汇报默认面向部门领导", server_text)
+        self.assertNotIn("collect_work_report_evidence按日期取证", server_text)
         self.assertIn("仅是取证和生产过程，不得写入日报", server_text)
         self.assertIn("按向部门领导提交的口径", frontend_text)
 

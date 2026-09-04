@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 import difflib
 import json
 import subprocess
@@ -78,18 +78,30 @@ class WorkspaceFiles:
         workspace_root: str | Path,
         *,
         on_file_changed: Callable[[Path], None] | None = None,
+        extra_read_roots: Iterable[str | Path] = (),
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.on_file_changed = on_file_changed
+        # 只读白名单：用户明确声明的工作区外目录（桌面、下载……）。读放行，
+        # 写一律不许——读一张截图几乎没有风险，写才有。不复制文件，原地读。
+        self.extra_read_roots = tuple(
+            Path(root).expanduser().resolve()
+            for root in extra_read_roots
+            if str(root or "").strip()
+        )
 
-    def resolve(self, raw_path: str) -> Path:
+    def resolve(self, raw_path: str, *, for_write: bool = False) -> Path:
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
             path = self.workspace_root / path
         resolved = path.resolve()
-        if self.workspace_root not in (resolved, *resolved.parents):
-            raise ValueError(f"Path is outside workspace: {raw_path}")
-        return resolved
+        if self.workspace_root in (resolved, *resolved.parents):
+            return resolved
+        if not for_write and any(
+            root in (resolved, *resolved.parents) for root in self.extra_read_roots
+        ):
+            return resolved
+        raise ValueError(f"Path is outside workspace: {raw_path}")
 
     def read_text(self, args: dict[str, Any]) -> str:
         path = self.resolve(str(args["path"]))
@@ -117,18 +129,37 @@ class WorkspaceFiles:
         return window + note
 
     def _list_directory(self, directory: Path, args: dict[str, Any]) -> str:
-        """目录也是 read 的一部分——和 Pi 一致：一个 read 吃文件、图片和目录。"""
+        """目录也是 read 的一部分——和 Pi 一致：一个 read 吃文件、图片和目录。
 
-        max_files = int(args.get("max_files") or 80)
-        files: list[str] = []
-        for item in sorted(directory.rglob("*")):
-            if item.is_file():
-                files.append(self._display_path(item))
-            if len(files) >= max_files:
-                break
-        if not files:
+        清单必须带摘要（总数 + 扩展名统计）和截断说明："有多少个 X"是目录
+        最常见的问法，一行统计就够，不必让模型去数几百行路径；而截断不给
+        说明的话，模型会把前 N 个当成全部，数出一个错误答案还以为自己对了。
+        """
+
+        from collections import Counter
+
+        max_files = max(1, int(args.get("max_files") or 80))
+        entries = sorted(item for item in directory.rglob("*") if item.is_file())
+        if not entries:
             return f"目录是空的：{args.get('path')}"
-        return "\n".join(files)
+        extension_counts = Counter(item.suffix.lower() or "(无扩展名)" for item in entries)
+        summary = (
+            f"共 {len(entries)} 个文件（递归含子目录）。按扩展名："
+            + "、".join(
+                f"{extension}×{count}"
+                for extension, count in extension_counts.most_common(12)
+            )
+        )
+        listing = "\n".join(self._display_path(item) for item in entries[:max_files])
+        if len(entries) > max_files:
+            hidden = len(entries) - max_files
+            return (
+                f"{summary}\n"
+                f"下面列出前 {max_files} 个，另有 {hidden} 个未列出"
+                "（计数类问题直接看上面的统计；要看全量就加大 max_files，"
+                f"或改读更具体的子目录）：\n{listing}"
+            )
+        return f"{summary}\n{listing}"
 
     def _read_image(self, path: Path) -> str | None:
         """图片走附件通道，不是这里的返回值。
@@ -162,7 +193,7 @@ class WorkspaceFiles:
         return f"已载入图片 {path.name}（{encoded_mime}），在下一步就能看到它。"
 
     def write_text(self, args: dict[str, Any]) -> str:
-        path = self.resolve(str(args["path"]))
+        path = self.resolve(str(args["path"]), for_write=True)
         content = str(args["content"])
         encoding = str(args.get("encoding") or "utf-8")
         result = self._write_text_with_activity(
@@ -184,7 +215,7 @@ class WorkspaceFiles:
             return self.apply_unified_patch({"patch": patch_arg})
         if not str(args.get("path") or "").strip():
             raise ValueError("edit_text_file 需要 path + old_text + new_text，或者 patch。")
-        path = self.resolve(str(args["path"]))
+        path = self.resolve(str(args["path"]), for_write=True)
         encoding = str(args.get("encoding") or "utf-8")
         old_text = str(args["old_text"])
         new_text = str(args.get("new_text") or "")
@@ -513,22 +544,19 @@ def register_file_tools(
     workspace_root: str | Path,
     *,
     on_file_changed: Callable[[Path], None] | None = None,
+    extra_read_roots: Iterable[str | Path] = (),
 ) -> None:
-    files = WorkspaceFiles(workspace_root, on_file_changed=on_file_changed)
+    files = WorkspaceFiles(
+        workspace_root,
+        on_file_changed=on_file_changed,
+        extra_read_roots=extra_read_roots,
+    )
     registry.register(
         Tool(
             name="read_file",
             description=(
-                "Read a path from the workspace: text files come back as text, images (jpg, png, "
-                "gif, webp, bmp) are attached to the conversation and become visible on the next "
-                "step, and directories return a listing of files under them (at most max_files). "
-                "For text, returns at most max_chars from offset; when more remains, the result "
-                "says how much and which offset to read next. "
-                "When the user message, an attachment, earlier conversation, or a previous tool result already "
-                "names an exact path, read that path directly instead of scanning the workspace to confirm it; "
-                "list a directory only when no exact path is known, and pick the smallest one that can hold the answer. "
-                "Reading, joining, tidying or rewriting plain text and Markdown always goes through the workspace "
-                "file tools, never through python or a terminal command."
+                "Read text or an image, or list a directory. Text supports offset/max_chars; "
+                "images are attached for the next model step. Extra read roots are read-only."
             ),
             parameters={
                 "type": "object",
@@ -538,12 +566,12 @@ def register_file_tools(
                     "offset": {
                         "type": "integer",
                         "default": 0,
-                        "description": "Character offset to start from; use the value the previous read reported.",
+                        "description": "Text character offset.",
                     },
                     "max_files": {
                         "type": "integer",
                         "default": 80,
-                        "description": "Only for directories: maximum number of files to list.",
+                        "description": "Directory listing limit.",
                     },
                 },
                 "required": ["path"],
@@ -554,13 +582,7 @@ def register_file_tools(
     registry.register(
         Tool(
             name="write_text_file",
-            description=(
-                "Write a complete UTF-8 text file under the workspace. "
-                "For changes to existing files, prefer edit_text_file (exact replacement or unified patch) so the model does not rewrite the whole file. "
-                "Do not resend a long script or long document through repeated whole-file writes; split it into smaller modules or "
-                "staged patches. If a tool result reports finish_reason=length or truncated arguments, immediately send less in one "
-                "call — that is a size problem, not a path/content nesting problem, so do not retry the same payload unchanged."
-            ),
+            description="Create or fully replace a UTF-8 text file in the workspace.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -576,22 +598,20 @@ def register_file_tools(
         Tool(
             name="edit_text_file",
             description=(
-                "Edit UTF-8 text files. Two modes: pass path + old_text + new_text for a precise exact-text "
-                "replacement in one file (small edits to prompts, skills, configs, Markdown, or source code); "
-                "or pass patch (a standard unified diff with a/... and b/... paths) for multi-line or multi-file "
-                "changes. Never rewrite an existing file wholesale when one of these fits."
+                "Edit existing UTF-8 text by exact replacement "
+                "(path/old_text/new_text) or unified diff (patch)."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "old_text": {"type": "string", "description": "Exact text to replace. Read the file first and copy the target block exactly."},
+                    "old_text": {"type": "string", "description": "Exact text to replace."},
                     "new_text": {"type": "string"},
                     "expected_replacements": {"type": "integer", "default": 1},
                     "replace_all": {"type": "boolean", "default": False},
                     "patch": {
                         "type": "string",
-                        "description": "Unified diff text for multi-line or multi-file edits; when present, path/old_text/new_text are ignored.",
+                        "description": "Unified diff; overrides replacement fields.",
                     },
                 },
                 "required": [],

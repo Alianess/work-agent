@@ -29,20 +29,21 @@ class SkillGateway:
         skill_providers: Iterable[ToolProvider],
         *,
         enabled_skill_ids: set[str] | None = None,
+        skill_contexts: dict[str, str] | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.runtime = SkillRuntime(self.workspace_root, enabled_skill_ids=enabled_skill_ids)
         self.skill_providers = list(skill_providers)
+        self.skill_contexts = {
+            str(skill_id): str(context).strip()
+            for skill_id, context in (skill_contexts or {}).items()
+            if str(skill_id).strip() and str(context).strip()
+        }
 
     def as_tool(self) -> Tool:
         return Tool(
             name="sys_skill",
-            description=(
-                "技能分层入口。领域任务先 open 对应技能读取说明，再用 show 查看某个技能工具的参数，"
-                "最后用 call 调用该技能工具。list 只返回技能名称和简介。具体技能工具不会常驻顶层 tools。"
-                "参数规则：open 必须带 skill_id；show 必须带 skill_id 和 tool_name；call 必须带 skill_id、tool_name 和 arguments。"
-                "通过 call 调用 run_skill_script 时，arguments 只传 script_path、arguments、timeout_seconds，skill_id 会由网关自动注入。"
-            ),
+            description="Skill gateway: list catalog, open manual, show tool schema, or call tool.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -50,9 +51,9 @@ class SkillGateway:
                         "type": "string",
                         "enum": ["list", "open", "show", "call"],
                     },
-                    "skill_id": {"type": "string", "description": "技能 id，例如 meeting-minutes、docx、anysearch。"},
-                    "tool_name": {"type": "string", "description": "show/call 时指定该技能下的工具名。"},
-                    "arguments": {"type": "object", "description": "call 时传给技能工具的参数。"},
+                    "skill_id": {"type": "string", "description": "Required for open/show/call."},
+                    "tool_name": {"type": "string", "description": "Required for show/call."},
+                    "arguments": {"type": "object", "description": "Tool arguments for call."},
                     "max_chars": {"type": "integer", "default": 30000},
                 },
                 "required": ["op"],
@@ -126,6 +127,13 @@ class SkillGateway:
             "read_file（文件、图片、目录）、write_text_file、edit_text_file、shell_exec "
             "属于常驻 core 工具，可直接调用。"
         )
+        runtime_context = self.skill_contexts.get(skill_id, "")
+        if runtime_context:
+            payload["instructions"] = (
+                str(payload.get("instructions") or "").rstrip()
+                + "\n\n"
+                + runtime_context
+            )
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _skill_tool(self, skill_id: str, raw_tool_name: Any) -> Tool:

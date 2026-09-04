@@ -43,6 +43,11 @@ IGNORED_PATH_PARTS = {
     "asr_full",
 }
 
+# Machine bookkeeping that sits beside deliverables. A manifest is the
+# current-draft registry, not a draft itself; counting it as one would make
+# every properly archived meeting look like version sprawl.
+IGNORED_BASENAMES = {"manifest.json", ".placeholder", ".ds_store"}
+
 
 @dataclass
 class Revision:
@@ -105,7 +110,9 @@ class WorkLedger:
 
 
 def _is_ignored(path: str) -> bool:
-    return any(part in path for part in IGNORED_PATH_PARTS)
+    if any(part in path for part in IGNORED_PATH_PARTS):
+        return True
+    return PurePosixPath(path).name.lower() in IGNORED_BASENAMES
 
 
 def _artifact_identity(path: str) -> tuple[str, str, str]:

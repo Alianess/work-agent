@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from work_agent_core import web_server
 from work_agent_core.cli import (
+    delete_model_endpoint,
     delete_model_profile,
+    update_model_endpoint,
     update_model_profile,
     update_model_profile_api_key_env,
 )
@@ -61,6 +63,29 @@ class ModelConfigurationTests(unittest.TestCase):
 
         self.assertFalse(deepseek.supports_vision)
         self.assertTrue(vision.supports_vision)
+
+    def test_deepseek_vision_variant_is_inferred_as_vision_capable(self) -> None:
+        profile = ModelProfile.from_dict({
+            "name": "opencode-go-deepseek-v4-flash-vision-exp",
+            "provider": "opencode-go",
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "model": "deepseek-v4-flash-vision-exp",
+            "api_key_env": "OPENCODE_GO_API_KEY",
+        })
+
+        self.assertTrue(profile.supports_vision)
+
+    def test_model_profile_keeps_the_serving_context_length(self) -> None:
+        profile = ModelProfile.from_dict({
+            "name": "lmstudio-qwen3.8-27b",
+            "provider": "lm-studio",
+            "base_url": "http://100.86.69.1:1234/v1",
+            "model": "qwen3.8-27b",
+            "api_key_env": "LM_STUDIO_API_KEY",
+            "context_length": 108032,
+        })
+
+        self.assertEqual(profile.context_length, 108032)
 
     def test_profile_key_names_are_stable_and_isolated(self) -> None:
         first = api_key_env_for_profile("gpt-5.6-luna")
@@ -190,6 +215,131 @@ class ModelConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "当前正在使用"):
                 delete_model_profile(config_path, "primary")
 
+    def test_endpoint_update_applies_to_all_members_and_delete_switches_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "model_profiles.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "default_profile": "shared-a",
+                        "profiles": [
+                            {
+                                "name": "shared-a",
+                                "provider": "openai-compatible",
+                                "base_url": "https://old.example.com/v1",
+                                "model": "model-a",
+                                "api_key_env": "SHARED_KEY",
+                                "endpoint_id": "shared",
+                            },
+                            {
+                                "name": "shared-b",
+                                "provider": "openai-compatible",
+                                "base_url": "https://old.example.com/v1",
+                                "model": "model-b",
+                                "api_key_env": "SHARED_KEY",
+                                "endpoint_id": "shared",
+                            },
+                            {
+                                "name": "standalone",
+                                "provider": "openai-compatible",
+                                "base_url": "https://standalone.example.com/v1",
+                                "model": "model-c",
+                                "api_key_env": "STANDALONE_KEY",
+                                "endpoint_id": "standalone",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            updated = update_model_endpoint(
+                config_path,
+                "shared",
+                {
+                    "endpoint_label": "Shared Endpoint",
+                    "base_url": "https://new.example.com/v1",
+                    "provider": "custom-provider",
+                },
+            )
+            self.assertEqual(updated, ["shared-a", "shared-b"])
+
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            shared_profiles = [
+                item for item in data["profiles"] if item["name"] in {"shared-a", "shared-b"}
+            ]
+            self.assertTrue(
+                all(item["base_url"] == "https://new.example.com/v1" for item in shared_profiles)
+            )
+            self.assertTrue(
+                all(item["endpoint_label"] == "Shared Endpoint" for item in shared_profiles)
+            )
+
+            removed = delete_model_endpoint(config_path, "shared")
+            self.assertEqual([item["name"] for item in removed], ["shared-a", "shared-b"])
+            remaining = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual([item["name"] for item in remaining["profiles"]], ["standalone"])
+            self.assertEqual(remaining["default_profile"], "standalone")
+
+    def test_models_payload_groups_profiles_by_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            config_dir = workspace / "config"
+            config_dir.mkdir()
+            (config_dir / "model_profiles.json").write_text(
+                json.dumps(
+                    {
+                        "default_profile": "sensenova-glm-5.2",
+                        "profiles": [
+                            {
+                                "name": "sensenova-glm-5.2",
+                                "provider": "openai-compatible",
+                                "base_url": "https://token.sensenova.cn/v1",
+                                "model": "glm-5.2",
+                                "api_key_env": "SENSENOVA_API_KEY",
+                                "endpoint_id": "sensenova",
+                                "endpoint_label": "商汤日日新",
+                            },
+                            {
+                                "name": "sensenova-flash-lite",
+                                "provider": "openai-compatible",
+                                "base_url": "https://token.sensenova.cn/v1",
+                                "model": "sensenova-6.8-flash-lite",
+                                "api_key_env": "SENSENOVA_API_KEY",
+                                "endpoint_id": "sensenova",
+                                "endpoint_label": "商汤日日新",
+                            },
+                            {
+                                "name": "opencode-go-qwen3.8-max",
+                                "provider": "opencode-go",
+                                "base_url": "https://opencode.ai/zen/go/v1",
+                                "model": "qwen3.8-max",
+                                "api_key_env": "OPENCODE_GO_API_KEY",
+                                "endpoint_id": "opencode-go",
+                                "endpoint_label": "Opencode Go",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(web_server, "WORKSPACE_ROOT", workspace):
+                payload = web_server.models_payload()
+
+            self.assertEqual(payload["total_profiles"], 3)
+            self.assertEqual(payload["total_endpoints"], 2)
+            endpoints = payload["endpoints"]
+            default_endpoint = next(item for item in endpoints if item["default"])
+            self.assertEqual(default_endpoint["endpoint_id"], "sensenova")
+            self.assertEqual(default_endpoint["profile_count"], 2)
+            opencode = next(item for item in endpoints if item["endpoint_id"] == "opencode-go")
+            self.assertEqual(opencode["label"], "Opencode Go")
+            self.assertEqual(
+                [profile["name"] for profile in opencode["models"]],
+                ["opencode-go-qwen3.8-max"],
+            )
+
     def test_delete_env_value_removes_only_selected_secret(self) -> None:
         key = "WORK_AGENT_MODEL_DELETE_ME_API_KEY"
         with tempfile.TemporaryDirectory() as directory:
@@ -256,6 +406,58 @@ class ModelConfigurationTests(unittest.TestCase):
         self.assertEqual(open_request.call_args.kwargs["profile"].provider, "deepseek")
         self.assertEqual(open_request.call_args.kwargs["timeout"], 12)
         urlopen.assert_not_called()
+
+    def test_import_endpoint_models_adds_missing_and_skips_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "config").mkdir()
+            config_path = workspace / "config" / "model_profiles.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "default_profile": "shared-model-a",
+                        "profiles": [
+                            {
+                                "name": "shared-model-a",
+                                "provider": "openai-compatible",
+                                "base_url": "https://api.example.com/v1",
+                                "model": "model-a",
+                                "api_key_env": "SHARED_KEY",
+                                "endpoint_id": "shared",
+                                "endpoint_label": "Shared",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.environ["SHARED_KEY"] = "secret"
+            self.addCleanup(os.environ.pop, "SHARED_KEY", None)
+
+            models_response = FakeResponse(
+                {"data": [{"id": "model-a"}, {"id": "model-b"}, {"id": "model-c"}]}
+            )
+            with (
+                patch.object(web_server, "WORKSPACE_ROOT", workspace),
+                patch.object(web_server, "CONFIG_PATH", config_path.relative_to(workspace)),
+                patch.object(
+                    web_server.OpenAICompatibleClient,
+                    "_open_request",
+                    return_value=models_response,
+                ),
+            ):
+                result = web_server.import_endpoint_models_payload({"endpoint_id": "shared"})
+
+            self.assertEqual(result["imported"], ["model-b", "model-c"])
+            self.assertEqual(result["skipped"], ["model-a"])
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            names = [item["name"] for item in data["profiles"]]
+            self.assertIn("shared-model-b", names)
+            self.assertIn("shared-model-c", names)
+            self.assertEqual(len(names), 3)
+            new_profile = next(item for item in data["profiles"] if item["name"] == "shared-model-b")
+            self.assertEqual(new_profile["api_key_env"], "SHARED_KEY")
+            self.assertEqual(new_profile["endpoint_id"], "shared")
 
 
 class ProviderAuthTests(unittest.TestCase):

@@ -23,6 +23,7 @@ class NotificationStore:
                 item
                 for item in self._read()
                 if item.get("kind") == "reminder" and int(item.get("delivered_at") or 0) > 0
+                and not item.get("dismissed_at")
             ]
         return sorted(
             items,
@@ -62,6 +63,101 @@ class NotificationStore:
             items.append(item)
             self._write(items[-500:])
         return item
+
+    def sync_reminders(
+        self,
+        *,
+        source: str,
+        reminders: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Keep one current reminder per stable key for a derived source.
+
+        Background observers describe current state rather than an append-only
+        event stream.  Re-running one must update the existing reminder, and a
+        reminder must disappear once its underlying condition is gone.
+        Read state is preserved while the condition remains active.
+        """
+
+        normalized_source = str(source or "").strip()
+        if not normalized_source:
+            raise ValueError("提醒来源不能为空。")
+        normalized: list[dict[str, str]] = []
+        seen_keys: set[str] = set()
+        for reminder in reminders:
+            key = str(reminder.get("key") or "").strip()
+            body = str(reminder.get("body") or "").strip()
+            if not key or not body or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            normalized.append(
+                {
+                    "key": key,
+                    "title": str(reminder.get("title") or "").strip() or "Friday 提醒",
+                    "body": body,
+                    "conversation_id": str(reminder.get("conversation_id") or "").strip(),
+                }
+            )
+
+        now = int(time.time())
+        created: list[dict[str, Any]] = []
+        removed = 0
+        changed = False
+        with _NOTIFICATION_LOCK:
+            items = self._read()
+            existing = {
+                str(item.get("dedup_key") or ""): item
+                for item in items
+                if item.get("kind") == "reminder"
+                and str(item.get("source") or "") == normalized_source
+                and str(item.get("dedup_key") or "")
+            }
+            active_keys = {item["key"] for item in normalized}
+            kept: list[dict[str, Any]] = []
+            for item in items:
+                managed = (
+                    item.get("kind") == "reminder"
+                    and str(item.get("source") or "") == normalized_source
+                    and str(item.get("dedup_key") or "")
+                )
+                if managed and str(item.get("dedup_key") or "") not in active_keys:
+                    removed += 1
+                    changed = True
+                    continue
+                kept.append(item)
+
+            for reminder in normalized:
+                current = existing.get(reminder["key"])
+                if current is not None and current in kept:
+                    if (
+                        current.get("title") != reminder["title"]
+                        or current.get("body") != reminder["body"]
+                        or current.get("conversation_id") != reminder["conversation_id"]
+                    ):
+                        changed = True
+                    current["title"] = reminder["title"]
+                    current["body"] = reminder["body"]
+                    current["conversation_id"] = reminder["conversation_id"]
+                    continue
+                item = {
+                    "id": f"notice-{uuid.uuid4().hex}",
+                    "kind": "reminder",
+                    "title": reminder["title"],
+                    "body": reminder["body"],
+                    "source": normalized_source,
+                    "dedup_key": reminder["key"],
+                    "conversation_id": reminder["conversation_id"],
+                    "created_at": now,
+                    "deliver_at": now,
+                    "delivered_at": now,
+                    "read_at": 0,
+                }
+                kept.append(item)
+                created.append(dict(item))
+                changed = True
+
+            if changed:
+                self._write(kept[-500:])
+        return {"created": created, "removed": removed, **self.payload()}
 
     def claim_due(self, *, now: int | None = None, kind: str | None = None) -> list[dict[str, Any]]:
         current = int(now or time.time())
@@ -136,6 +232,14 @@ class NotificationStore:
             return False
         with _NOTIFICATION_LOCK:
             items = self._read()
+            for item in items:
+                if str(item.get("id") or "") != target_id:
+                    continue
+                if item.get("kind") == "reminder" and item.get("dedup_key"):
+                    item["dismissed_at"] = int(time.time())
+                    item["read_at"] = int(item.get("read_at") or time.time())
+                    self._write(items)
+                    return True
             remaining = [item for item in items if str(item.get("id") or "") != target_id]
             if len(remaining) == len(items):
                 return False

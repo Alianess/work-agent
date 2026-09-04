@@ -1,0 +1,154 @@
+{
+  "generated_at": "2026-08-21 00:28:16",
+  "cases": 15,
+  "summary": {
+    "hybrid": {
+      "count": 15,
+      "hit@1": 0.4666666666666667,
+      "hit@3": 0.6,
+      "hit@6": 0.7333333333333333,
+      "source_hit@topk": 0.7333333333333333,
+      "mrr": 0.5444444444444444,
+      "avg_latency_ms": 1533.0712636311848
+    }
+  },
+  "details": {
+    "hybrid": [
+      {
+        "id": "jingjiagong-equipment-count",
+        "query": "精加工平台的设备一共有多少台",
+        "rank_info": 1,
+        "rank_source": 3,
+        "latency_ms": 2220.2,
+        "top1_path": "精加工平台运营及具身智能合作沟通会_会议沟通内容整理_ASR转写稿_Qwen3.md / Qwen3-ASR 分块转写 ",
+        "degraded": false
+      },
+      {
+        "id": "jingjiagong-fee-first-year",
+        "query": "设备使用费第一年打算怎么收",
+        "rank_info": 3,
+        "rank_source": 4,
+        "latency_ms": 1505.6,
+        "top1_path": "20260731-071556-新录音 20_会议沟通内容整理_ASR转写稿_Qwen3.txt",
+        "degraded": false
+      },
+      {
+        "id": "jingjiagong-wuzhou-repair",
+        "query": "五轴加工中心当时出了什么问题",
+        "rank_info": 4,
+        "rank_source": 4,
+        "latency_ms": 1506.4,
+        "top1_path": "精加工平台运营及具身智能合作沟通会_会议沟通内容整理_ASR转写稿_Qwen3.md / Qwen3-ASR 分块转写 ",
+        "degraded": false
+      },
+      {
+        "id": "jingjiagong-acceptance-month",
+        "query": "竣工验收安排在几月份做",
+        "rank_info": 4,
+        "rank_source": 4,
+        "latency_ms": 1386.5,
+        "top1_path": "20260731-071556-新录音 20_会议沟通内容整理_ASR转写稿_Qwen3.txt",
+        "degraded": false
+      },
+      {
+        "id": "jingjiagong-pilot-platform-mode",
+        "query": "试运营效果不好之后运营模式打算怎么调",
+        "rank_info": 1,
+        "rank_source": 1,
+        "latency_ms": 1513.1,
+        "top1_path": "精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md / 精加工平台运营及具身智能合作交流会议纪要",
+        "degraded": false
+      },
+      {
+        "id": "innovation-center-agreement",
+        "query": "具身智能创新中心是跟哪家单位签的协议",
+        "rank_info": 3,
+        "rank_source": 3,
+        "latency_ms": 1432.3,
+        "top1_path": "合肥具身智能产业发展问题与建议材料内部讨论会_会议沟通内容整理_内部留档版.md / 合肥具身智能产业发展问题与建议材料",
+        "degraded": false
+      },
+      {
+        "id": "innovation-center-directions",
+        "query": "创新中心落地以后打算围绕哪些方向干活",
+        "rank_info": 1,
+        "rank_source": 1,
+        "latency_ms": 1418.0,
+        "top1_path": "精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md / 精加工平台运营及具身智能合作交流会议纪要",
+        "degraded": false
+      },
+      {
+        "id": "didong-special-bond",
+        "query": "低空经济专项债的盘子有多大",
+        "rank_info": null,
+        "rank_source": null,
+        "latency_ms": 1397.5,
+        "top1_path": "庐江科创_会议沟通内容整理_ASR转写稿_Qwen3.md / Qwen3-ASR 分块转写 / 正文 / 片段 6（0",
+        "degraded": false
+      },
+      {
+        "id": "suwei-criticism",
+        "query": "苏伟主任当时提了哪几条意见",
+        "rank_info": 1,
+        "rank_source": 1,
+        "latency_ms": 1609.8,
+        "top1_path": "精加工平台运营及具身智能合作沟通会_会议沟通内容整理_内部留档版.md / 精加工平台运营及具身智能合作沟通会 · 内部",
+        "degraded": false
+      },
+      {
+        "id": "baohe-base-plan",
+        "query": "包河区那边下一步想建什么东西",
+        "rank_info": null,
+        "rank_source": null,
+        "latency_ms": 1429.0,
+        "top1_path": "20260731-071556-新录音 20_会议沟通内容整理_ASR转写稿_Qwen3.txt",
+        "degraded": false
+      },
+      {
+        "id": "shengu-kangyang-robot",
+        "query": "中科深谷的康养机器人准备怎么落地",
+        "rank_info": 1,
+        "rank_source": 1,
+        "latency_ms": 1346.8,
+        "top1_path": "中科深谷会谈_会议纪要_工作提交版.md / 中科深谷会谈会议纪要",
+        "degraded": false
+      },
+      {
+        "id": "longcanguan-review",
+        "query": "龙餐馆那部电影观众评价怎么样",
+        "rank_info": null,
+        "rank_source": null,
+        "latency_ms": 1555.2,
+        "top1_path": "机器人9N中心_会议沟通内容整理_ASR转写稿_Qwen3.txt",
+        "degraded": false
+      },
+      {
+        "id": "longcanguan-boxoffice",
+        "query": "龙餐馆上映后票房表现如何",
+        "rank_info": null,
+        "rank_source": null,
+        "latency_ms": 1497.7,
+        "top1_path": "20260817-172802-新录音 32_会议沟通内容整理_ASR转写稿_Qwen3.md / Qwen3-ASR ",
+        "degraded": false
+      },
+      {
+        "id": "dianziting-trainees",
+        "query": "跟上海电子厅的合作要培养多少人",
+        "rank_info": 1,
+        "rank_source": 1,
+        "latency_ms": 1626.0,
+        "top1_path": "产学研合作思路交流会_会议沟通内容整理_ASR转写稿_Qwen3.md / Qwen3-ASR 分块转写 / 正文 / ",
+        "degraded": false
+      },
+      {
+        "id": "zhongke-shenggu",
+        "query": "中科声谷这家公司是干什么的",
+        "rank_info": 1,
+        "rank_source": 3,
+        "latency_ms": 1551.9,
+        "top1_path": "产学研合作思路交流会_会议沟通内容整理_ASR转写稿_Qwen3.txt",
+        "degraded": false
+      }
+    ]
+  }
+}

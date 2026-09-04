@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 from work_agent_core.config import ModelProfile
 from work_agent_core.file_reference_index import PersistentFileReferenceIndex
-from work_agent_core.session_store import ConversationSession
 from work_agent_core import web_server
 
 
@@ -158,65 +157,47 @@ class HistoricalVisionContextTests(unittest.TestCase):
             self.assertTrue(first_content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
             self.assertEqual(prepared.messages[2], messages[2])
 
-    def test_compacted_history_rehydrates_persisted_conversation_image(self) -> None:
+    def test_compacted_history_does_not_rehydrate_conversation_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             image = root / "meet_files" / "attachments" / "history.png"
             image.parent.mkdir(parents=True)
             image.write_bytes(b"png")
-            session = ConversationSession(
-                id="vision-context",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": "图片\n\n参考附件：\n- [图片] history.png: meet_files/attachments/history.png",
-                    },
-                    {"role": "assistant", "content": "已经看到了。"},
-                ],
-            )
-
-            retained = web_server.refresh_conversation_image_paths(
-                session,
-                workspace_root=root,
-            )
             prepared = web_server.enrich_image_attachments_for_model(
                 [{"role": "user", "content": "右下角的小图标是什么？"}],
                 self.profile(),
                 workspace_root=root,
-                conversation_image_paths=retained,
             )
 
-            self.assertEqual(
-                session.metadata[web_server.CONVERSATION_IMAGE_PATHS_KEY],
-                ["meet_files/attachments/history.png"],
-            )
-            current_content = prepared.messages[0]["content"]
-            self.assertIsInstance(current_content, list)
-            self.assertIn("持续视觉上下文", current_content[1]["text"])
-            self.assertTrue(current_content[2]["image_url"]["url"].startswith("data:image/png;base64,"))
-            self.assertEqual(prepared.attached_count, 1)
+            self.assertEqual(prepared.messages[0]["content"], "右下角的小图标是什么？")
+            self.assertEqual(prepared.attached_count, 0)
 
-    def test_a_typed_path_does_not_become_persistent_visual_context(self) -> None:
-        # 手打的路径不进「持续视觉上下文」——那是附件才有的待遇。
+    def test_an_uncompressed_old_image_stays_on_its_original_message(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            image = root / "meet_files" / "attachments" / "typed.png"
+            image = root / "meet_files" / "attachments" / "history.png"
             image.parent.mkdir(parents=True)
             image.write_bytes(b"png")
-            session = ConversationSession(
-                id="typed-path",
-                messages=[
-                    {"role": "user", "content": "看看 meet_files/attachments/typed.png"},
-                ],
-            )
-
-            retained = web_server.refresh_conversation_image_paths(
-                session,
+            messages = [
+                {
+                    "role": "user",
+                    "content": "图片\n\n参考附件：\n- [图片] history.png: meet_files/attachments/history.png",
+                },
+                {"role": "assistant", "content": "已经看到了。"},
+                {"role": "user", "content": "第二轮"},
+                {"role": "assistant", "content": "好。"},
+                {"role": "user", "content": "第三轮继续。"},
+            ]
+            prepared = web_server.enrich_image_attachments_for_model(
+                messages,
+                self.profile(),
                 workspace_root=root,
             )
 
-            self.assertEqual(retained, [])
-            self.assertEqual(session.metadata[web_server.CONVERSATION_IMAGE_PATHS_KEY], [])
+            self.assertIsInstance(prepared.messages[0]["content"], list)
+            self.assertEqual(prepared.messages[0]["content"][1]["type"], "image_url")
+            self.assertEqual(prepared.messages[-1], messages[-1])
+            self.assertEqual(prepared.attached_count, 1)
 
     def test_plain_text_history_does_not_touch_the_file_index(self) -> None:
         messages = [
@@ -319,11 +300,6 @@ class ImagePayloadTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             self.assertIn("没有这个文件", WorkspaceFiles(Path(directory)).read_text({"path": "nope.md"}))
-
-    def test_only_recent_user_turns_carry_their_images(self) -> None:
-        self.assertGreaterEqual(web_server.IMAGE_ATTACH_RECENT_USER_TURNS, 1)
-        self.assertLessEqual(web_server.IMAGE_ATTACH_RECENT_USER_TURNS, 3)
-
 
 if __name__ == "__main__":
     unittest.main()

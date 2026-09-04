@@ -12,19 +12,25 @@ import traceback
 from pathlib import Path
 
 from .approval_review import ApprovalReview, ApprovalReviewer
+from .artifact_ledger import ToolArtifactCollector
 from .config import ModelProfile
 from .debug_trace import compact_message_summary
 from .llm import (
-    RECOVERY_REQUEST_TIMEOUT_SECONDS,
     Message,
     OpenAICompatibleClient,
+    build_chat_tools_payload,
     normalize_reasoning_effort,
+    recovery_request_timeout_seconds,
+    stream_start_timeout_seconds,
 )
 from .memory import (
-    ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS,
     ContextCompactionError,
+    estimate_context_tokens,
     estimate_messages_tokens,
+    message_pressure_metrics,
+    profile_context_trigger_tokens,
     summarize_active_react_checkpoint,
+    token_count_source_label,
 )
 from .session_log import ASSISTANT_MESSAGE, TURN_END_ABORTED, TURN_END_COMPLETED, TURN_END_FAILED
 from .session_runtime import ConversationRuntime
@@ -40,16 +46,61 @@ from .tool_bus import ToolBus
 
 
 DEFAULT_MAX_STEPS = 50
-MODEL_STREAM_IDLE_TIMEOUT_SECONDS = 45
+MODEL_STREAM_IDLE_TIMEOUT_SECONDS = 30
 MODEL_STREAM_MAX_MULTIPLIER = 4
 MODEL_STREAM_MAX_EXTENSION_SECONDS = 60
 MODEL_RECOVERY_TIMEOUT_GRACE_SECONDS = 5
 MODEL_RECOVERY_MAX_MULTIPLIER = 4
 MAX_CONSECUTIVE_TOOL_LENGTH_TRUNCATIONS = 3
+MAX_CONSECUTIVE_INVALID_TOOL_ARGUMENTS = 3
+MODEL_STREAM_REPETITION_WINDOW_CHARS = 1200
+ACTIVE_REACT_CHECKPOINT_SERIALIZED_BYTES = 4 * 1024 * 1024
+ACTIVE_REACT_CHECKPOINT_TOOL_RESULT_CHARS = 4 * 1024 * 1024
 
 
 class AgentCancelled(RuntimeError):
     """Raised when the current single-agent turn is cancelled by runtime state."""
+
+
+class ModelStreamLoopStopped(RuntimeError):
+    """The current model request was stopped after entering a long output loop."""
+
+
+def merge_system_messages_at_start(messages: list[Message]) -> list[Message]:
+    """Return a provider-safe projection with one leading system message.
+
+    Some local chat templates require every system instruction at the very
+    beginning. Merge their text in original order and leave non-system history
+    messages untouched, including tool-call protocol messages.
+    """
+
+    system_parts = [
+        str(message.get("content") or "").strip()
+        for message in messages
+        if message.get("role") == "system" and str(message.get("content") or "").strip()
+    ]
+    if len(system_parts) <= 1:
+        return messages
+    return [
+        {"role": "system", "content": "\n\n".join(system_parts)},
+        *(dict(message) for message in messages if message.get("role") != "system"),
+    ]
+
+
+def repeated_stream_span(text: str, *, window_chars: int = MODEL_STREAM_REPETITION_WINDOW_CHARS) -> str:
+    """Return a repeated long suffix, or an empty string for ordinary streaming text.
+
+    Heartbeats prove that a transport is alive, but not that generation is making
+    progress. An exact, whitespace-normalized 1200-character replay is a
+    deliberately conservative signal: it catches decoding loops without treating
+    short rhetorical repetition or a recurring heading as a stuck model.
+    """
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().casefold()
+    span_size = max(1, int(window_chars))
+    if len(normalized) < span_size * 2:
+        return ""
+    suffix = normalized[-span_size:]
+    return suffix if suffix in normalized[:-span_size] else ""
 
 
 @dataclass(frozen=True)
@@ -62,6 +113,18 @@ class AgentResult:
     # Append-origin history: what actually happened, before any compaction
     # replacement shadowed part of it for the model.
     transcript: list[Message] | None = None
+    artifacts: list[dict[str, Any]] | None = None
+
+
+@dataclass(frozen=True)
+class ActiveRuntimePressure:
+    estimated_tokens: int
+    token_count_source: str
+    raw_estimated_tokens: int
+    serialized_request_bytes: int
+    tool_result_chars: int
+    context_trigger_tokens: int
+    reasons: tuple[str, ...]
 
 
 @dataclass
@@ -169,15 +232,17 @@ class ReActAgent:
         debug_trace: Any | None = None,
         cancel_check: Callable[[], bool] | None = None,
         pending_messages: Callable[[], list[str]] | None = None,
+        pending_messages_committed: Callable[[list[str]], None] | None = None,
         request_transform: Callable[[list[Message]], list[Message]] | None = None,
         hooks: LoopHooks | None = None,
         workspace_root: str | Path | None = None,
         reasoning_effort: str = "medium",
-        auto_approve: bool = False,
+        auto_approve: bool = True,
         approval_reviewer: ApprovalReviewer | None = None,
         plan_update_callback: Callable[[list[dict[str, str]], str], None] | None = None,
         usage_callback: Callable[[dict[str, Any], list[Message]], None] | None = None,
         initial_task_plan: list[dict[str, str]] | None = None,
+        late_task_plan_context: bool = True,
     ) -> None:
         self.client = client
         self.profile = profile
@@ -194,13 +259,21 @@ class ReActAgent:
         # a queue lets the user add to the work instead of killing it, which is
         # what makes an early wrap-up recoverable without restarting the turn.
         self.pending_messages = pending_messages
+        self.pending_messages_committed = pending_messages_committed
         # 只在装配请求那一刻改写消息，改写结果不回写日志。图片附件走这条路：
         # 日志里留人可读的路径，base64 只活在这一次请求里。
         self.request_transform = request_transform
         self.hooks = hooks or LoopHooks()
         # 工具在本轮交回来的多模态内容块，等着被注入成一条用户消息。
         self._tool_attachments: list[dict[str, Any]] = []
+        # Structured product state collected from tool progress and results.
+        # Final prose may mention a file, but prose is never the source of truth
+        # for whether an artifact exists or can be delivered.
+        self.artifact_collector = ToolArtifactCollector(self.workspace_root)
         self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+        # The runtime policy is caller-controlled: when disabled, reviewable
+        # actions go straight to the human approval card instead of the model
+        # reviewer.
         self.auto_approve = bool(auto_approve)
         self.approval_reviewer = approval_reviewer or ApprovalReviewer(
             client=client,
@@ -209,11 +282,17 @@ class ReActAgent:
         self.plan_update_callback = plan_update_callback
         self.usage_callback = usage_callback
         self.active_runtime_was_compacted = False
+        # Provider usage is authoritative for the request that just completed.
+        # Keep it as an in-turn anchor; only messages added afterwards need a
+        # local delta estimate before the next request is sent.
+        self._active_provider_prompt_tokens = 0
+        self._active_provider_anchor_estimated_tokens = 0
         self.task_plan = [
             {"step": str(item.get("step") or ""), "status": str(item.get("status") or "pending")}
             for item in (initial_task_plan or [])
             if isinstance(item, dict) and str(item.get("step") or "").strip()
         ]
+        self.late_task_plan_context = bool(late_task_plan_context)
 
     def run(self, goal: str) -> AgentResult:
         return self.run_messages([{"role": "user", "content": goal}])
@@ -251,6 +330,7 @@ class ReActAgent:
             used_tools=used_tools,
             messages=runtime.log.derive_messages(),
             transcript=runtime.log.derive_transcript(),
+            artifacts=runtime.log.derive_artifacts(),
         )
 
     def iter_events(self, goal: str) -> Iterator[dict[str, Any]]:
@@ -264,12 +344,17 @@ class ReActAgent:
     ) -> Iterator[dict[str, Any]]:
         runtime = as_conversation_runtime(conversation)
         self.active_runtime_was_compacted = False
+        self._active_provider_prompt_tokens = 0
+        self._active_provider_anchor_estimated_tokens = 0
+        self.artifact_collector.reset()
         messages: list[Message] = self._request_messages(runtime, system_context=system_context)
         tool_schemas = self._tool_schemas()
         used_tools = False
         visible_content_parts: list[str] = []
         last_truncation_signature: tuple[str, ...] = ()
         consecutive_truncations = 0
+        last_invalid_arguments_signature: tuple[str, ...] = ()
+        consecutive_invalid_arguments = 0
         self._trace(
             "agent_start",
             mode="stream",
@@ -290,31 +375,73 @@ class ReActAgent:
         for step in range(1, self.max_steps + 1):
             self._raise_if_cancelled()
             messages = self._request_messages(runtime, system_context=system_context)
+            pressure = self._active_runtime_pressure(
+                messages,
+                tool_schemas=tool_schemas,
+            )
+            if pressure.reasons and len(runtime.active_turn_surface_seqs()) >= 2:
+                source_label = token_count_source_label(pressure.token_count_source)
+                reason_text = "、".join(
+                    {
+                        "tokens": "token 达到 85% 安全线",
+                        "serialized_bytes": "请求体达到进程保护线",
+                        "tool_results": "工具结果达到进程保护线",
+                    }.get(reason, reason)
+                    for reason in pressure.reasons
+                )
+                self._trace(
+                    "active_runtime_compaction_started",
+                    step=step,
+                    estimated_tokens=pressure.estimated_tokens,
+                    token_count_source=pressure.token_count_source,
+                    raw_estimated_tokens=pressure.raw_estimated_tokens,
+                    serialized_request_bytes=pressure.serialized_request_bytes,
+                    tool_result_chars=pressure.tool_result_chars,
+                    context_trigger_tokens=pressure.context_trigger_tokens,
+                    pressure_reasons=list(pressure.reasons),
+                )
+                yield {
+                    "event": "activity",
+                    "phase": "thinking",
+                    "title": "正在压缩运行上下文",
+                    "detail": (
+                        f"触发项：{reason_text}；当前约 {pressure.estimated_tokens:,}/"
+                        f"{pressure.context_trigger_tokens:,} tokens；依据：{source_label}。"
+                        "正在生成续作检查点，原始轨迹不会删除。"
+                    ),
+                    "activity_type": "runtime_compaction_started",
+                    "step": step,
+                }
+            checkpoint_event = None
             try:
                 checkpoint_event = self._maybe_compact_active_runtime(
-                    runtime, messages, step=step
+                    runtime,
+                    messages,
+                    tool_schemas=tool_schemas,
+                    step=step,
+                    pressure=pressure,
                 )
             except ContextCompactionError as error:
-                fallback_count = self._compact_active_runtime_locally(runtime)
                 self._trace(
                     "active_runtime_compaction_failed",
                     step=step,
                     error=str(error),
-                    fallback="local_tail_compaction",
-                    fallback_message_count=fallback_count,
+                    fallback="none",
                     traceback=traceback.format_exc().splitlines()[-16:],
                 )
                 yield {
                     "event": "activity",
-                    "phase": "observation",
-                    "title": "上下文已本地降级整理",
+                    "phase": "error",
+                    "title": "运行上下文整理失败",
                     "detail": (
-                        "模型压缩服务暂时不可用，已保留当前请求、任务计划和最近工具结果，"
-                        "继续执行本轮；完整原始轨迹仍保留。"
+                        f"{error} 完整原始轨迹仍保留；本轮已停止，"
+                        "不会改写工作上下文、切换模型或隐式重试。"
                     ),
-                    "activity_type": "runtime_compaction_fallback",
+                    "activity_type": "runtime_compaction_failed",
+                    "command_status": "error",
                     "step": step,
                 }
+                raise
             if checkpoint_event is not None:
                 yield checkpoint_event
                 messages = self._request_messages(runtime, system_context=system_context)
@@ -354,10 +481,28 @@ class ReActAgent:
                     step=step,
                     draft_prefix=visible_react_draft_prefix(visible_content_parts),
                 )
-                self._record_response_usage(response.raw, runtime)
+                self._record_response_usage(
+                    response.raw,
+                    runtime,
+                    request_messages=messages,
+                )
             except AgentCancelled:
                 self._trace("agent_cancelled", step=step)
                 raise
+            except ModelStreamLoopStopped as error:
+                # This is a deliberate safety stop, not an unexpected Python
+                # failure. Keep the technical trace in debug telemetry and send
+                # the UI a recoverable state with a clear next action.
+                yield {
+                    "event": "error",
+                    "message": str(error),
+                    "type": type(error).__name__,
+                    "detail": str(error),
+                    "error_code": "model_loop_stopped",
+                    "recoverable": True,
+                    "suggested_action": "continue",
+                }
+                return
             except Exception as error:
                 trace_lines = traceback.format_exc().splitlines()
                 yield {
@@ -435,6 +580,71 @@ class ReActAgent:
             last_truncation_signature = ()
             consecutive_truncations = 0
 
+            invalid_argument_calls = [
+                tool_call for tool_call in tool_calls if tool_call.arguments_error
+            ]
+            if invalid_argument_calls:
+                signature = tuple(call.name for call in tool_calls)
+                consecutive_invalid_arguments = (
+                    consecutive_invalid_arguments + 1
+                    if signature == last_invalid_arguments_signature
+                    else 1
+                )
+                last_invalid_arguments_signature = signature
+                used_tools = True
+                assistant_history, tool_messages = invalid_tool_call_messages(
+                    tool_calls,
+                    attempt=consecutive_invalid_arguments,
+                )
+                runtime.append_message(assistant_history)
+                for tool_message in tool_messages:
+                    runtime.append_message(tool_message)
+                invalid_names = [call.name for call in invalid_argument_calls]
+                self._trace(
+                    "tool_arguments_invalid",
+                    step=step,
+                    consecutive_count=consecutive_invalid_arguments,
+                    tool_names=list(signature),
+                    invalid_tool_names=invalid_names,
+                    errors=[call.arguments_error for call in invalid_argument_calls],
+                )
+                detail = str(tool_messages[0].get("content") or "")
+                yield {
+                    "event": "activity",
+                    "phase": "error",
+                    "title": "工具参数不是有效 JSON",
+                    "detail": detail,
+                    "activity_type": "tool_arguments_invalid",
+                    "command_status": "error",
+                    "step": step,
+                }
+                if consecutive_invalid_arguments >= MAX_CONSECUTIVE_INVALID_TOOL_ARGUMENTS:
+                    final = repeated_invalid_tool_arguments_final(
+                        signature,
+                        attempts=consecutive_invalid_arguments,
+                    )
+                    final_message: Message = {"role": "assistant", "content": final}
+                    runtime.append_message(final_message)
+                    display_final = merge_visible_react_content(visible_content_parts, final)
+                    self._trace(
+                        "invalid_tool_arguments_circuit_open",
+                        step=step,
+                        attempts=consecutive_invalid_arguments,
+                        tool_names=list(signature),
+                    )
+                    yield {
+                        "event": "final",
+                        "content": display_final,
+                        "steps_used": step,
+                        "model_profile": self.profile.name,
+                        "used_tools": True,
+                        "invalid_tool_arguments_circuit_open": True,
+                    }
+                    return
+                continue
+            last_invalid_arguments_signature = ()
+            consecutive_invalid_arguments = 0
+
             # ReAct state transition is determined only by whether a tool call
             # can be parsed from this assistant message. Content may contain
             # user-visible preamble before tool calls, so content presence is
@@ -466,10 +676,8 @@ class ReActAgent:
                         "detail": "模型请求已经结束，但没有可写入对话气泡的正文或工具调用。",
                     }
                     return
-                final_message: Message = {
-                    "role": "assistant",
-                    "content": final,
-                }
+                final_message = assistant_message_for_history(assistant_message)
+                final_message["content"] = final
                 runtime.append_message(final_message)
                 # The agent would stop here. Anything the user queued while it
                 # was working is a reason to keep going instead — no prompt
@@ -593,7 +801,7 @@ class ReActAgent:
                     yield {
                         "event": "activity",
                         "phase": "thinking",
-                        "title": "独立审查智能体正在审批",
+                        "title": "安全策略正在审查",
                         "detail": "仅审查当前精确动作；固定安全边界不会交给模型改写。",
                         "content": str(approval_payload.get("preview") or ""),
                         "activity_type": "approval_review",
@@ -759,6 +967,13 @@ class ReActAgent:
                 }
                 runtime.append_message(tool_message)
                 completed_tool_messages.append(tool_message)
+                self.artifact_collector.record_tool_result(
+                    runtime,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    observation=observation,
+                    step=step,
+                )
 
                 terminal_text = deterministic_tool_success_final(
                     tool_name,
@@ -989,7 +1204,7 @@ class ReActAgent:
                 yield {
                     "event": "activity",
                     "phase": "thinking",
-                    "title": "独立审查智能体正在审批",
+                    "title": "安全策略正在审查",
                     "detail": "仅审查当前精确动作；固定安全边界不会交给模型改写。",
                     "activity_type": "approval_review",
                     "command": str(approval_payload.get("command") or ""),
@@ -1110,6 +1325,7 @@ class ReActAgent:
         # The approved batch is now structurally complete: assistant(tool_calls)
         # is followed by one tool message per tool_call_id. Continue normal
         # ReAct from that state and force used_tools=true on the final event.
+        runtime.end_step(step)
         for event in self.iter_message_events(runtime, system_context=system_context):
             if event.get("event") == "draft_reset":
                 event["content"] = (
@@ -1155,11 +1371,9 @@ class ReActAgent:
             # turn's 实施路径, so it is the only way that panel gets written.
             "在需要多步工具的工作中，如果你形成了会影响后续理解的路线选择、范围判断或关键发现，"
             "请在发起 tool_calls 的同一条 assistant content 中先写一小段自然语言工作说明。\n\n"
-            "技能分层规则：领域任务先根据系统提示中的技能索引判断是否已有对应技能。"
-            "匹配时先调用 sys_skill 的 open 读取该技能说明；关闭的技能不能在对话中 activate，"
-            "必须提示用户先在网页“技能”页启用并开始新对话。需要技能专用工具时，"
-            "用 sys_skill 的 show 查看参数，再用 sys_skill 的 call 执行。"
-            "不要猜测或直接调用未出现在顶层 tools 中的技能工具名。"
+            "技能分层规则：任务明确匹配常驻技能目录时直接 sys_skill.open；"
+            "无法判断对应技能时再调用 sys_skill.list。读取技能说明后按需 show / call，"
+            "不得猜测技能工具名或参数。"
             "read_file（文件、图片、目录）、write_text_file、edit_text_file 和 shell_exec "
             "是常驻 core 能力，可以直接调用。外部 MCP 能力通过 mcporter 的 list/show/call 分层使用。\n\n"
             f"{self._workspace_context_block()}"
@@ -1188,7 +1402,7 @@ class ReActAgent:
     def _late_system_blocks(self, system_context: str) -> list[Message]:
         """Per-request context that is re-rendered every step, not history."""
         blocks: list[Message] = []
-        if self.task_plan:
+        if self.task_plan and self.late_task_plan_context:
             blocks.append(
                 {
                     "role": "system",
@@ -1219,6 +1433,11 @@ class ReActAgent:
         messages = runtime.build_request_messages(
             self.system_prompt, self._late_system_blocks(system_context)
         )
+        # LM Studio's Qwen chat template rejects every system message except
+        # the opening one. Runtime context remains append-only in the durable
+        # log, but the provider projection must be template-compatible.
+        if self.profile.provider == "lm-studio":
+            messages = merge_system_messages_at_start(messages)
         if self.request_transform is None:
             return messages
         try:
@@ -1230,6 +1449,7 @@ class ReActAgent:
                 traceback=traceback.format_exc().splitlines()[-8:],
             )
             return messages
+
 
     def _trace(self, event: str, **payload: Any) -> None:
         tracer = self.debug_trace
@@ -1281,6 +1501,12 @@ class ReActAgent:
 
         for text in texts:
             runtime.append_message({"role": "user", "content": text})
+        # A steering inbox is acknowledged only after the same durable log
+        # contains the injected user messages.  If flushing fails, the inbox
+        # stays intact and the next safe point can retry without data loss.
+        runtime.flush()
+        if self.pending_messages_committed is not None:
+            self.pending_messages_committed(texts)
         self._trace("pending_messages_injected", step=step, count=len(texts))
         yield {
             "event": "activity",
@@ -1334,25 +1560,16 @@ class ReActAgent:
                 "function": {
                     "name": "update_plan",
                     "description": (
-                        "Create or update a short living execution plan for a genuinely complex task. "
-                        "Do not use for simple questions, a single read, a small one-file edit, or "
-                        "anything verifiable in one step. Use it when the task has three or more "
-                        "dependent actions, spans several files or documents, needs research before "
-                        "producing something, carries real uncertainty, or will take a while: then "
-                        "call update_plan with 2 to 7 outcome-shaped steps before continuing with the "
-                        "real tools. A plan is not the final answer and is not a DAG: at most one step "
-                        "is in_progress at a time; mark a step completed only once it is done and "
-                        "verified, then move on. Revise the plan only when new evidence invalidates the "
-                        "route, never to show progress. Before finishing a complex task, mark every "
-                        "finished step completed; leave genuinely blocked steps pending and say why in "
-                        "the final answer."
+                        "Track complex work in 2-7 outcome-shaped steps. Use when multiple dependent "
+                        "actions benefit from visible progress; keep at most one step in_progress and "
+                        "update statuses as work completes."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "explanation": {
                                 "type": "string",
-                                "description": "Only explain a material plan change; otherwise keep empty.",
+                                "description": "Reason for a material plan change.",
                             },
                             "plan": {
                                 "type": "array",
@@ -1491,10 +1708,15 @@ class ReActAgent:
         runtime: ConversationRuntime,
         messages: list[Message],
         *,
+        tool_schemas: list[dict[str, Any]] | None = None,
         step: int,
+        pressure: ActiveRuntimePressure | None = None,
     ) -> dict[str, Any] | None:
-        estimated = estimate_messages_tokens(messages)
-        if estimated < ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS:
+        measured = pressure or self._active_runtime_pressure(
+            messages,
+            tool_schemas=tool_schemas,
+        )
+        if not measured.reasons:
             return None
         folded_seqs = runtime.active_turn_surface_seqs()
         # A user prompt by itself has no completed implementation path to fold.
@@ -1517,10 +1739,18 @@ class ReActAgent:
             "它不是最终答复：\n\n" + checkpoint,
         )
         self.active_runtime_was_compacted = True
+        self._active_provider_prompt_tokens = 0
+        self._active_provider_anchor_estimated_tokens = 0
         self._trace(
             "active_runtime_compacted",
             step=step,
-            estimated_tokens=estimated,
+            estimated_tokens=measured.estimated_tokens,
+            token_count_source=measured.token_count_source,
+            raw_estimated_tokens=measured.raw_estimated_tokens,
+            serialized_request_bytes=measured.serialized_request_bytes,
+            tool_result_chars=measured.tool_result_chars,
+            context_trigger_tokens=measured.context_trigger_tokens,
+            pressure_reasons=list(measured.reasons),
             original_message_count=len(folded_seqs),
             checkpoint_chars=len(checkpoint),
         )
@@ -1529,37 +1759,124 @@ class ReActAgent:
             "phase": "thinking",
             "title": "压缩运行上下文",
             "detail": (
-                f"本轮约 {estimated} tokens；已将 {len(folded_seqs)} 条正在执行的 ReAct 消息整理为检查点，"
+                f"本轮工作集已达整理阈值；已将 {len(folded_seqs)} 条正在执行的 ReAct 消息整理为检查点，"
                 "完整原始轨迹仍保留在事件日志中。"
             ),
             "activity_type": "runtime_summary",
             "step": step,
         }
 
-    def _compact_active_runtime_locally(self, runtime: ConversationRuntime) -> int:
-        """Bound a large active run without spending another model request."""
-        folded_seqs = runtime.active_turn_surface_seqs()
-        if len(folded_seqs) < 2:
-            return 0
-        kept = runtime.log.derive_messages()[-4:]
-        digest = "\n\n".join(
-            f"[{item.get('role')}] {truncate_text(str(item.get('content') or ''), 2000)}"
-            for item in kept
+    def _active_runtime_pressure(
+        self,
+        messages: list[Message],
+        *,
+        tool_schemas: list[dict[str, Any]] | None = None,
+    ) -> ActiveRuntimePressure:
+        resolved_tools = tool_schemas if tool_schemas is not None else self._tool_schemas()
+        estimated, token_count_source, raw_estimated = self._active_runtime_context_tokens(
+            messages,
+            tool_schemas=resolved_tools,
         )
-        runtime.record_compaction(
-            folded_seqs,
-            "本轮运行上下文已本地降级整理（模型压缩不可用）。以下保留最近的执行片段：\n\n" + digest,
+        request_payload = build_chat_tools_payload(
+            messages,
+            profile=self.profile,
+            tools=resolved_tools,
+            tool_choice="auto",
+            reasoning_effort=self.reasoning_effort,
+            request_usage=True,
         )
-        self.active_runtime_was_compacted = True
-        return len(folded_seqs)
+        serialized_request_bytes = len(
+            json.dumps(
+                request_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        _message_bytes, tool_result_chars = message_pressure_metrics(messages)
+        context_trigger = profile_context_trigger_tokens(self.profile)
+        reasons: list[str] = []
+        if estimated >= context_trigger:
+            reasons.append("tokens")
+        if serialized_request_bytes >= ACTIVE_REACT_CHECKPOINT_SERIALIZED_BYTES:
+            reasons.append("serialized_bytes")
+        if tool_result_chars >= ACTIVE_REACT_CHECKPOINT_TOOL_RESULT_CHARS:
+            reasons.append("tool_results")
+        return ActiveRuntimePressure(
+            estimated_tokens=estimated,
+            token_count_source=token_count_source,
+            raw_estimated_tokens=raw_estimated,
+            serialized_request_bytes=serialized_request_bytes,
+            tool_result_chars=tool_result_chars,
+            context_trigger_tokens=context_trigger,
+            reasons=tuple(reasons),
+        )
 
-    def _record_response_usage(self, raw: dict[str, Any], runtime: ConversationRuntime) -> None:
-        if self.usage_callback is None or self.active_runtime_was_compacted:
-            return
+    def _active_runtime_context_tokens(
+        self,
+        messages: list[Message],
+        *,
+        tool_schemas: list[dict[str, Any]] | None = None,
+    ) -> tuple[int, str, int]:
+        """Count the full request and use sane provider usage as an anchor."""
+
+        raw_estimated = estimate_messages_tokens(messages)
+        request_payload = build_chat_tools_payload(
+            messages,
+            profile=self.profile,
+            tools=tool_schemas if tool_schemas is not None else self._tool_schemas(),
+            tool_choice="auto",
+            reasoning_effort=self.reasoning_effort,
+            request_usage=True,
+        )
+        serialized_request = json.dumps(
+            request_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        full_request_estimated = estimate_context_tokens(serialized_request)
+        prompt_tokens = max(0, int(self._active_provider_prompt_tokens or 0))
+        anchor_estimated = max(
+            0,
+            int(self._active_provider_anchor_estimated_tokens or 0),
+        )
+        if prompt_tokens <= 0 or raw_estimated < anchor_estimated:
+            return full_request_estimated, "estimated_full_request", raw_estimated
+        delta = raw_estimated - anchor_estimated
+        source = "provider_usage" if delta == 0 else "provider_usage_plus_estimated_delta"
+        return prompt_tokens + delta, source, raw_estimated
+
+    def _record_response_usage(
+        self,
+        raw: dict[str, Any],
+        runtime: ConversationRuntime,
+        *,
+        request_messages: list[Message] | None = None,
+    ) -> None:
         usage = raw.get("usage") if isinstance(raw, dict) else None
         if not isinstance(usage, dict):
             return
-        if int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0) <= 0:
+        prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        if prompt_tokens <= 0:
+            return
+        completion_tokens = int(
+            usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        )
+        if request_messages is not None:
+            self._active_provider_prompt_tokens = prompt_tokens
+            self._active_provider_anchor_estimated_tokens = estimate_messages_tokens(
+                request_messages
+            )
+            self._trace(
+                "active_provider_usage_recorded",
+                usage_scope="single_request",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=int(
+                    usage.get("total_tokens") or (prompt_tokens + completion_tokens)
+                ),
+                anchor_estimated_tokens=self._active_provider_anchor_estimated_tokens,
+            )
+        if self.usage_callback is None or self.active_runtime_was_compacted:
             return
         try:
             self.usage_callback(dict(usage), runtime.log.derive_messages())
@@ -1631,6 +1948,7 @@ class ReActAgent:
             try:
                 event = progress_queue.get(timeout=0.2)
                 progress_seen = True
+                self.artifact_collector.capture_progress(event, tool_name=tool_name, step=step)
                 yield event
             except queue.Empty:
                 pass
@@ -1659,6 +1977,7 @@ class ReActAgent:
                     except queue.Empty:
                         break
                     progress_seen = True
+                    self.artifact_collector.capture_progress(event, tool_name=tool_name, step=step)
                     yield event
                 return observation
 
@@ -1676,7 +1995,10 @@ class ReActAgent:
         last_stream_at: float | None = None
         recovery_started_at: float | None = None
         recovery_last_stream_at: float | None = None
+        last_heartbeat_at: float | None = None
+        recovery_last_heartbeat_at: float | None = None
         request_cancel_event = threading.Event()
+        stream_start_timeout = stream_start_timeout_seconds(self.profile)
         stream_idle_timeout = max(
             1,
             min(self.profile.timeout_seconds, MODEL_STREAM_IDLE_TIMEOUT_SECONDS),
@@ -1685,15 +2007,24 @@ class ReActAgent:
             self.profile.timeout_seconds * MODEL_STREAM_MAX_MULTIPLIER,
             self.profile.timeout_seconds + MODEL_STREAM_MAX_EXTENSION_SECONDS,
         )
-        recovery_timeout = max(
-            10,
-            min(RECOVERY_REQUEST_TIMEOUT_SECONDS, self.profile.timeout_seconds),
-        )
+        recovery_timeout = recovery_request_timeout_seconds(self.profile)
         recovery_active_max_timeout = max(
             recovery_timeout * MODEL_RECOVERY_MAX_MULTIPLIER,
             recovery_timeout + MODEL_STREAM_MAX_EXTENSION_SECONDS,
         )
         request_id = f"model-plan-{step}-{int(started_at * 1000)}"
+        request_payload = build_chat_tools_payload(
+            messages,
+            profile=self.profile,
+            tools=tool_schemas,
+            tool_choice="auto",
+            reasoning_effort=self.reasoning_effort,
+            request_usage=True,
+        )
+        serialized_request_bytes = len(
+            json.dumps(request_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        _message_bytes, request_tool_result_chars = message_pressure_metrics(messages)
         self._trace(
             "llm_start",
             step=step,
@@ -1702,7 +2033,9 @@ class ReActAgent:
             model=self.profile.model,
             message_count=len(messages),
             tool_schema_count=len(tool_schemas),
-            start_timeout_seconds=self.profile.timeout_seconds,
+            serialized_request_bytes=serialized_request_bytes,
+            tool_result_chars=request_tool_result_chars,
+            start_timeout_seconds=stream_start_timeout,
             stream_idle_timeout_seconds=stream_idle_timeout,
             active_stream_max_seconds=active_stream_max_timeout,
             recovery_start_timeout_seconds=recovery_timeout,
@@ -1729,8 +2062,15 @@ class ReActAgent:
                             "tool_arguments": str(getattr(chunk, "tool_arguments", "") or ""),
                             "status": status,
                             "status_detail": status_detail,
-                        }
+                         }
                     )
+
+                def on_heartbeat() -> None:
+                    nonlocal last_heartbeat_at, recovery_last_heartbeat_at
+                    if recovery_started_at is not None:
+                        recovery_last_heartbeat_at = time.monotonic()
+                    else:
+                        last_heartbeat_at = time.monotonic()
 
                 response = self.client.chat_tools_stream(
                     messages,
@@ -1740,6 +2080,7 @@ class ReActAgent:
                     tool_choice="auto",
                     on_delta=on_delta,
                     cancel_event=request_cancel_event,
+                    on_heartbeat=on_heartbeat,
                 )
                 result_queue.put((True, response))
             except Exception as error:
@@ -1778,6 +2119,11 @@ class ReActAgent:
         last_preview = ""
         draft_content_chars = 0
         last_stream_signature: tuple[int, int, int, int, str, str] | None = None
+        # 循环重复只在“连续多个数据块都命中同一重复尾段”时才判死循环。
+        # 单次命中无法区分真死循环与长结构化生成(反复引用同构 XML/模板后仍在推进)。
+        # 这项计数在每轮 while 内重置，任何未命中(新内容出现)都会清零。
+        consecutive_repetition_hits = 0
+        REPETITION_HITS_TO_STOP = 2
         while True:
             if self._cancel_requested():
                 request_cancel_event.set()
@@ -1807,6 +2153,47 @@ class ReActAgent:
                 stream_status_detail = delta.get("status_detail") or stream_status_detail
                 stream_seen = True
                 stream_updated = True
+                repeated_channel = ""
+                if repeated_stream_span(reasoning_buffer):
+                    repeated_channel = "模型思考"
+                elif repeated_stream_span(content_buffer):
+                    repeated_channel = "回答草稿"
+                if repeated_channel:
+                    consecutive_repetition_hits += 1
+                else:
+                    consecutive_repetition_hits = 0
+                if consecutive_repetition_hits >= REPETITION_HITS_TO_STOP:
+                    request_cancel_event.set()
+                    thread.join(timeout=0.25)
+                    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                    error = ModelStreamLoopStopped(
+                        f"检测到{repeated_channel}陷入循环重复，系统已停止当前模型请求，"
+                        "避免继续空转。已完成的操作和文件会保留，但任务尚未完成。"
+                    )
+                    self._trace(
+                        "llm_stream_repetition",
+                        step=step,
+                        request_id=request_id,
+                        channel=repeated_channel,
+                        repeated_span_chars=MODEL_STREAM_REPETITION_WINDOW_CHARS,
+                        consecutive_hits=consecutive_repetition_hits,
+                        hits_required=REPETITION_HITS_TO_STOP,
+                        elapsed_ms=elapsed_ms,
+                        worker_stopped=not thread.is_alive(),
+                    )
+                    yield {
+                        "event": "activity_delta",
+                        "id": request_id,
+                        "phase": "error",
+                        "title": f"第 {step} 轮 · 模型陷入循环重复，已停止",
+                        "content": str(error),
+                        "reasoning_content": compact_reasoning_preview(reasoning_buffer),
+                        "append_mode": "replace",
+                        "activity_type": "model_loop_stopped",
+                        "stream_status": "repetition_stopped",
+                        "step": step,
+                    }
+                    raise error
             now = time.monotonic()
             stream_signature = (
                 len(content_buffer),
@@ -1836,6 +2223,7 @@ class ReActAgent:
                         "phase": "thinking",
                         "title": f"第 {step} 轮 · 模型思考",
                         "content": preview,
+                        "reasoning_content": compact_reasoning_preview(reasoning_buffer),
                         "append_mode": "replace",
                         # Carried as a field so the UI never has to pattern-match
                         # the preview text to know what the stream is doing.
@@ -1860,7 +2248,7 @@ class ReActAgent:
                 if recovery_started_at is not None:
                     recovery_elapsed = now - recovery_started_at
                     if (
-                        recovery_last_stream_at is None
+                        recovery_last_heartbeat_at is None
                         and recovery_elapsed
                         >= recovery_timeout + MODEL_RECOVERY_TIMEOUT_GRACE_SECONDS
                     ):
@@ -1870,16 +2258,16 @@ class ReActAgent:
                             "系统已停止等待；本轮已完成的工具结果仍会保留。"
                         )
                     elif (
-                        recovery_last_stream_at is not None
-                        and now - recovery_last_stream_at >= stream_idle_timeout
+                        recovery_last_heartbeat_at is not None
+                        and now - recovery_last_heartbeat_at >= stream_idle_timeout
                     ):
                         timeout_kind = "recovery_idle"
                         value = RuntimeError(
-                            f"模型恢复流已连续 {stream_idle_timeout} 秒没有新内容，系统已停止等待；"
+                            f"模型恢复流已连续 {stream_idle_timeout} 秒没有收到数据，系统已停止等待；"
                             "本轮已完成的工具结果仍会保留。"
                         )
                     elif (
-                        recovery_last_stream_at is not None
+                        recovery_last_heartbeat_at is not None
                         and recovery_elapsed >= recovery_active_max_timeout
                     ):
                         timeout_kind = "recovery_max_active"
@@ -1887,19 +2275,19 @@ class ReActAgent:
                             f"模型恢复流虽持续返回，但已达到 {recovery_active_max_timeout} 秒安全上限，"
                             "本轮已完成的工具结果仍会保留。"
                         )
-                elif last_stream_at is None and elapsed >= self.profile.timeout_seconds:
+                elif last_heartbeat_at is None and elapsed >= stream_start_timeout:
                     timeout_kind = "start"
                     value = RuntimeError(
-                        f"模型在 {self.profile.timeout_seconds} 秒内没有开始返回有效流，系统已停止等待；"
+                        f"模型在 {stream_start_timeout} 秒内没有开始返回有效流，系统已停止等待；"
                         "本轮已完成的工具结果仍会保留。"
                     )
-                elif last_stream_at is not None and now - last_stream_at >= stream_idle_timeout:
+                elif last_heartbeat_at is not None and now - last_heartbeat_at >= stream_idle_timeout:
                     timeout_kind = "idle"
                     value = RuntimeError(
-                        f"模型流已连续 {stream_idle_timeout} 秒没有新内容，系统已停止等待；"
+                        f"模型流已连续 {stream_idle_timeout} 秒没有收到数据，系统已停止等待；"
                         "本轮已完成的工具结果仍会保留。"
                     )
-                elif last_stream_at is not None and elapsed >= active_stream_max_timeout:
+                elif last_heartbeat_at is not None and elapsed >= active_stream_max_timeout:
                     timeout_kind = "max_active"
                     value = RuntimeError(
                         f"模型虽持续返回流，但单次请求已达到 {active_stream_max_timeout} 秒安全上限，"
@@ -1917,8 +2305,8 @@ class ReActAgent:
                         timeout_kind=timeout_kind,
                         elapsed_ms=int(elapsed * 1000),
                         idle_ms=(
-                            int((now - last_stream_at) * 1000)
-                            if last_stream_at is not None
+                            int((now - last_heartbeat_at) * 1000)
+                            if last_heartbeat_at is not None
                             else None
                         ),
                         recovery_elapsed_ms=(
@@ -1927,8 +2315,8 @@ class ReActAgent:
                             else None
                         ),
                         recovery_idle_ms=(
-                            int((now - recovery_last_stream_at) * 1000)
-                            if recovery_last_stream_at is not None
+                            int((now - recovery_last_heartbeat_at) * 1000)
+                            if recovery_last_heartbeat_at is not None
                             else None
                         ),
                         worker_stopped=not thread.is_alive(),
@@ -2005,6 +2393,7 @@ class ReActAgent:
                         "phase": "thinking",
                         "title": f"第 {step} 轮 · 模型思考",
                         "content": preview,
+                        "reasoning_content": compact_reasoning_preview(reasoning_buffer),
                         "append_mode": "replace",
                         # Carried as a field so the UI never has to pattern-match
                         # the preview text to know what the stream is doing.
@@ -2028,6 +2417,12 @@ class ReActAgent:
                 parsed_tool_calls = normalize_tool_calls(parsed_message)
                 final_answer_without_tools = not parsed_tool_calls
                 final_content = str(parsed_message.get("content") or value.content or "")
+                final_reasoning = str(
+                    parsed_message.get("reasoning_content")
+                    or parsed_message.get("reasoning")
+                    or reasoning_buffer
+                    or ""
+                )
                 self._trace(
                     "llm_end",
                     step=step,
@@ -2043,6 +2438,7 @@ class ReActAgent:
                         "phase": "error",
                         "title": f"第 {step} 轮 · 模型思考失败",
                         "content": f"✕ {failure_message}",
+                        "reasoning_content": compact_reasoning_preview(final_reasoning),
                         "append_mode": "replace",
                         "step": step,
                     }
@@ -2080,6 +2476,7 @@ class ReActAgent:
                     "phase": "thinking",
                     "title": f"第 {step} 轮 · 模型思考",
                     "content": success_content,
+                    "reasoning_content": compact_reasoning_preview(final_reasoning),
                     "append_mode": "replace",
                     "step": step,
                 }
@@ -2091,6 +2488,7 @@ class ReActAgent:
                 "phase": "error",
                 "title": f"第 {step} 轮 · 模型思考失败",
                 "content": f"\n\n✗ 模型规划失败：{type(value).__name__}: {value}\n",
+                "reasoning_content": compact_reasoning_preview(reasoning_buffer),
                 "step": step,
             }
             raise value
@@ -2126,15 +2524,6 @@ def model_stream_preview(
         lines.append("当前请求未形成完整决策，系统正在自动恢复；已完成的工具结果会继续保留。")
         if status_detail:
             lines.append(f"主流结束信息：{status_detail}")
-
-    if reasoning:
-        lines.extend(
-            [
-                "",
-                "--- 模型思考 ---",
-                compact_reasoning_preview(reasoning),
-            ]
-        )
 
     if tool_arguments:
         preview_text, field_name = preview_tool_arguments_text(tool_arguments)
@@ -2287,6 +2676,7 @@ class NativeToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    arguments_error: str = ""
 
 
 def response_message(raw: dict[str, Any]) -> dict[str, Any]:
@@ -2355,6 +2745,78 @@ def truncated_tool_call_messages(
         "tool_calls": compact_calls,
     }
     return assistant_message, tool_messages
+
+
+def invalid_tool_call_messages(
+    tool_calls: list[NativeToolCall],
+    *,
+    attempt: int,
+) -> tuple[Message, list[Message]]:
+    """Keep malformed model arguments out of durable/provider history.
+
+    A native tool call is still part of the provider protocol even when its
+    ``function.arguments`` string is broken.  Replaying that raw string makes
+    the entire next request fail with HTTP 400 before the model can repair it.
+    Store a small valid sentinel call instead, pair every call in the batch
+    with a tool result, and do not execute any handler from the malformed batch.
+    """
+
+    compact_calls: list[dict[str, Any]] = []
+    tool_messages: list[Message] = []
+    for index, tool_call in enumerate(tool_calls):
+        call_id = tool_call.id or f"call_invalid_{index}"
+        compact_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.name,
+                    "arguments": json.dumps(
+                        {"_tool_arguments_invalid": True},
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        )
+        if tool_call.arguments_error:
+            detail = truncate_text(tool_call.arguments_error, 360)
+            content = (
+                "TOOL_ERROR: ToolArgumentsInvalid: 模型返回的 function.arguments "
+                f"不是有效 JSON 对象，因此系统没有执行 {tool_call.name}。"
+                f"解析信息：{detail}。请只重试这一小步，并用原生 tool calling "
+                "返回完整、严格的 JSON 参数；不要把 arguments 再包一层。"
+                f"这是相同工具组合连续第 {attempt} 次格式错误。"
+            )
+        else:
+            content = (
+                "TOOL_ERROR: ToolBatchSkipped: 同一批次中另一个工具的参数不是有效 JSON，"
+                f"为避免部分执行，系统没有执行 {tool_call.name}。请重新提交这一批工具调用。"
+            )
+        tool_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": tool_call.name,
+                "content": content,
+            }
+        )
+    return (
+        {"role": "assistant", "content": "", "tool_calls": compact_calls},
+        tool_messages,
+    )
+
+
+def repeated_invalid_tool_arguments_final(
+    tool_names: tuple[str, ...],
+    *,
+    attempts: int,
+) -> str:
+    names = "、".join(tool_names) or "工具调用"
+    return (
+        f"{names} 连续 {attempts} 次返回了非法 JSON 工具参数。"
+        "系统已停止自动重试，并且没有执行这些调用，避免污染会话历史或产生部分写入。"
+        "请缩小这一步的参数后再继续。"
+    )
 
 
 def repeated_tool_truncation_final(
@@ -2427,12 +2889,15 @@ def normalize_tool_calls(message: dict[str, Any]) -> list[NativeToolCall]:
             name = str(function.get("name") or raw_call.get("name") or "").strip()
             if not name:
                 continue
-            arguments = parse_tool_arguments(function.get("arguments") or raw_call.get("arguments") or {})
+            arguments, arguments_error = parse_tool_arguments_result(
+                function.get("arguments") or raw_call.get("arguments") or {}
+            )
             calls.append(
                 NativeToolCall(
                     id=str(raw_call.get("id") or f"call_{index}"),
                     name=name,
                     arguments=arguments,
+                    arguments_error=arguments_error,
                 )
             )
     if calls:
@@ -2496,11 +2961,13 @@ def parse_text_tool_calls(content: str) -> list[NativeToolCall]:
             close_index = close_match.start() if close_match else -1
             if close_index > match.end():
                 raw_arguments = html.unescape(strip_xmlish_tags(text[match.end() : close_index]).strip())
+        arguments, arguments_error = parse_tool_arguments_result(raw_arguments)
         calls.append(
             NativeToolCall(
                 id=(attrs.get("tool_call_id") or attrs.get("id") or f"call_text_{index}").strip(),
                 name=name,
-                arguments=parse_tool_arguments(raw_arguments),
+                arguments=arguments,
+                arguments_error=arguments_error,
             )
         )
     return calls
@@ -2587,10 +3054,12 @@ def assistant_message_for_history(
         "role": "assistant",
         "content": assistant_visible_content(message) if tool_calls else (message.get("content") or ""),
     }
-    raw_tool_calls = message.get("tool_calls")
-    if raw_tool_calls:
-        clean["tool_calls"] = raw_tool_calls
-    elif tool_calls:
+    normalized_calls = tool_calls
+    if normalized_calls is None and message.get("tool_calls"):
+        candidate_calls = normalize_tool_calls(message)
+        if candidate_calls and not any(call.arguments_error for call in candidate_calls):
+            normalized_calls = candidate_calls
+    if normalized_calls:
         clean["tool_calls"] = [
             {
                 "id": tool_call.id or f"call_{index}",
@@ -2600,10 +3069,10 @@ def assistant_message_for_history(
                     "arguments": json.dumps(tool_call.arguments, ensure_ascii=False),
                 },
             }
-            for index, tool_call in enumerate(tool_calls)
+            for index, tool_call in enumerate(normalized_calls)
         ]
-    reasoning_content = str(message.get("reasoning_content") or "")
-    if clean.get("tool_calls") and reasoning_content:
+    reasoning_content = str(message.get("reasoning_content") or message.get("reasoning") or "")
+    if reasoning_content:
         clean["reasoning_content"] = reasoning_content
     return clean
 
@@ -2623,26 +3092,38 @@ def text_tool_call_repair_messages() -> tuple[Message, Message]:
 
 
 def parse_tool_arguments(value: Any) -> dict[str, Any]:
+    parsed, error = parse_tool_arguments_result(value)
+    if not error:
+        return parsed
+    return {"value": str(value or "").strip()}
+
+
+def parse_tool_arguments_result(value: Any) -> tuple[dict[str, Any], str]:
     if isinstance(value, dict):
-        return value
+        return value, ""
     if value is None:
-        return {}
+        return {}, ""
     text = str(value or "").strip()
     if not text:
-        return {}
+        return {}, ""
+    last_error: Exception | None = None
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as error:
+        last_error = error
         try:
             parsed = json.loads(escape_raw_control_chars_in_strings(text))
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            last_error = error
             try:
                 parsed = parse_react_json(text)
-            except ValueError:
-                return {"value": text}
+            except ValueError as error:
+                last_error = error
+                preview = truncate_text(text.replace("\n", "\\n"), 240)
+                return {}, f"{last_error}; preview={preview}"
     if isinstance(parsed, dict):
-        return parsed
-    return {"value": parsed}
+        return parsed, ""
+    return {}, f"JSON root must be an object, got {type(parsed).__name__}"
 
 
 def parse_shell_approval_required_observation(tool_name: str, observation: str) -> dict[str, Any] | None:
@@ -2713,7 +3194,7 @@ def pending_tool_batch_state(
     extra_system_context: str,
     approval_payload: dict[str, Any],
     reasoning_effort: str = "medium",
-    auto_approve: bool = False,
+    auto_approve: bool = True,
     visible_content_parts: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -3213,12 +3694,14 @@ def deterministic_tool_success_final(
     coverage_labels = {"full": "完整", "partial": "部分", "external_gap": "存在外部工作缺口"}
     coverage = coverage_labels.get(str(payload.get("source_coverage") or "").strip(), "未标注")
 
-    lines = [f"已完成并核验保存{date_text + ' ' if date_text else ''}{report_label}。"]
-    if path:
-        lines.append(f"文件：`{path}`")
-    lines.append(f"证据覆盖：{coverage}。")
+    lines = [
+        f"已完成并核验保存{date_text + ' ' if date_text else ''}{report_label}。",
+        f"证据覆盖：{coverage}。",
+    ]
     if payload.get("needs_user_input") is True:
         lines.append("当前版本已保存；仍有线下或外部工作信息需要补充。")
+    if path:
+        lines.append(f"## 交付文件\n\n- `{path}`")
     return "\n\n".join(lines)
 
 

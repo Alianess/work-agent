@@ -48,6 +48,14 @@ alianess-site/
 /*.docx
 /*.png
 
+# Agent runtime artifacts: machine-generated snapshots, unpack dirs, traces,
+# the recall index DB, and the agent home cache. Rebuildable, never source.
+/.work-agent-home/
+/.workbuddy/
+/debug_traces/
+/office_workspace/
+/recall/
+
 # Local launchd registrations embed machine-specific absolute paths.
 launchd/*.plist
 !launchd/*.plist.template

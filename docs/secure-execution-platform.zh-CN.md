@@ -30,7 +30,7 @@
 | 进程取消与资源限制 | 已实现 | ReAct Turn 的取消信号已传到执行进程组；后续宿主能力服务需要共享同一 Lease/取消协议。 |
 | 会议实时 ASR → 纪要/新聊天 | 已实现复用链路 | 实时文本先保存为标准会议转写，再直接调用现有 `meeting-minutes` Skill；不重新转写、不复制纪要生成逻辑。 |
 | Office、ASR、麦克风宿主能力网关 | 进行中 | 现有业务能力仍在受控的既有 Skill 路径；下一阶段将替换为统一 HostCapabilityGateway。 |
-| 网络代理与凭据代理 | 未启用，失败关闭 | 请求域名权限会持久化；没有受控代理时返回 `NETWORK_BROKER_UNAVAILABLE`，不会开放普通网络。 |
+| 网络代理与凭据代理 | 受限临时代理 | 仅为声明的域名 capability 启动一次性本地 HTTPS CONNECT 代理；任务结束自动销毁，不开放普通网络。 |
 
 ## 2. 核心产品决策
 
@@ -926,7 +926,7 @@ class ApplyChangesRequest:
 
 ### 14.1 基本策略
 
-当前实施阶段，原生 Seatbelt 后端保持网络完全关闭。若任务请求 `domain_allowlist`，系统仍会生成并持久化精确的权限请求；用户同意后，如受控代理尚未部署，任务以 `NETWORK_BROKER_UNAVAILABLE` 明确失败，绝不放宽为宿主或任意网络访问。以下 Broker 协议是后续启用联网执行前必须满足的实现契约。
+原生 Seatbelt 后端默认保持网络关闭。若任务获得 `domain_allowlist` capability，执行环境会启动一次性本地 HTTPS CONNECT 代理，并只允许 capability 中列出的域名；代理在任务结束时销毁。解析到私网、回环、链路本地或其他非公网地址的目标会被拒绝，系统绝不放宽为宿主或任意网络访问。
 
 - 隔离环境没有直接外网路由；
 - HTTP/HTTPS 只能经过每个执行独立的认证代理；

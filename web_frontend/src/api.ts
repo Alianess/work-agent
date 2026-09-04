@@ -11,6 +11,7 @@ import type {
   ChatTitlePayload,
   CrossChatMemoriesPayload,
   CrossChatMemory,
+  RememberedApprovalRule,
   FilePayload,
   FileItem,
   FilesPayload,
@@ -233,7 +234,7 @@ export const api = {
     ),
   approveAgentTurn: (
     turnId: string,
-    payload: { conversation_id?: string },
+    payload: { conversation_id?: string; remember?: boolean },
     onEvent: (event: AgentStreamEvent) => void,
     options?: { signal?: AbortSignal }
   ) =>
@@ -313,6 +314,29 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
+  updateEndpoint: (payload: Record<string, unknown>) =>
+    requestJson<ModelsPayload>("/api/models/endpoint/update", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  deleteEndpoint: (endpointId: string) =>
+    requestJson<ModelsPayload>("/api/models/endpoint/delete", {
+      method: "POST",
+      body: JSON.stringify({ endpoint_id: endpointId })
+    }),
+  importEndpointModels: (endpointId: string, apiKey?: string) =>
+    requestJson<ModelsPayload & {
+      imported: string[];
+      imported_count: number;
+      skipped: string[];
+      skipped_count: number;
+      latency_ms: number;
+    }>("/api/models/endpoint/import", {
+      method: "POST",
+      body: JSON.stringify(
+        apiKey ? { endpoint_id: endpointId, api_key: apiKey } : { endpoint_id: endpointId }
+      )
+    }),
   saveAsrSettings: (payload: {
     profile: string;
     model_id: string;
@@ -346,6 +370,13 @@ export const api = {
     requestJson<{ ok: boolean; message: string }>("/api/memories/delete", {
       method: "POST",
       body: JSON.stringify({ id })
+    }),
+  approvalRules: () =>
+    requestJson<{ items: RememberedApprovalRule[]; count: number }>("/api/approvals/rules"),
+  deleteApprovalRule: (command: string) =>
+    requestJson<{ ok: boolean; message: string }>("/api/approvals/rules/delete", {
+      method: "POST",
+      body: JSON.stringify({ command })
     }),
   runAgent: (payload: { goal: string; profile: string; max_steps: number }) =>
     requestJson<{ result: AgentResult }>("/api/agent/run", {
@@ -391,7 +422,21 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
-  conversations: () => requestJson<{ items: unknown[]; revision: number }>("/api/conversations"),
+  conversations: (sinceRevision?: number) =>
+    requestJson<{
+      items: unknown[];
+      deleted_ids?: string[];
+      revision: number;
+      unchanged?: boolean;
+    }>(
+      sinceRevision === undefined
+        ? "/api/conversations"
+        : `/api/conversations?since_revision=${sinceRevision}`
+    ),
+  conversation: (conversationId: string) =>
+    requestJson<{ item: unknown; revision: number }>(
+      `/api/conversations/${encodeURIComponent(conversationId)}`
+    ),
   conversationFiles: (conversationId: string) =>
     requestJson<{ conversation_id: string; title: string; files: FileItem[] }>(
       `/api/conversations/${encodeURIComponent(conversationId)}/files`
@@ -412,6 +457,23 @@ export const api = {
     }>("/api/conversations/save", {
       method: "POST",
       body: JSON.stringify(payload)
+    }),
+  deleteConversations: (conversationIds: string[]) =>
+    requestJson<{
+      ok: boolean;
+      deleted_ids: string[];
+      revision: number;
+      count: number;
+      cleanup: {
+        sessions: number;
+        memories: number;
+        pending_turns: number;
+        log_events: number;
+        recall_sources: number;
+      };
+    }>("/api/conversations/delete", {
+      method: "POST",
+      body: JSON.stringify({ conversation_ids: conversationIds })
     }),
   moveConversationToProject: (conversationId: string, projectId: string | null) =>
     requestJson<{

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from work_agent_core.cross_chat_memory import CrossChatMemoryStore
+from work_agent_core.cross_chat_memory import CrossChatMemoryStore, register_memory_tools
+from work_agent_core.recall.tools import register_recall_tools
 from work_agent_core.session_store import SessionStore
+from work_agent_core.tools import ToolRegistry
 from work_agent_core.web_server import explicit_memory_content
 
 
@@ -176,6 +179,94 @@ class CrossChatMemoryTests(unittest.TestCase):
             "我长期偏好先核验原始材料，再给结论",
         )
         self.assertEqual(explicit_memory_content("你记住我的要求了吗？"), "")
+
+
+class MemoryToolTests(unittest.TestCase):
+    """remember/forget：模型自己的记忆之手，护栏照常生效。"""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.session_store = SessionStore(root, session_dir=root / "conversation_history" / "sessions")
+        self.store = CrossChatMemoryStore(self.session_store)
+        self.registry = ToolRegistry()
+        register_memory_tools(
+            self.registry,
+            session_store=self.session_store,
+            conversation_id="conv-1",
+            conversation_title="对话一",
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _remember(self, **args: str) -> dict:
+        payload = self.registry.get("remember").handler(args)
+        return json.loads(payload)
+
+    def test_recall_attaches_relevant_memories(self) -> None:
+        """检索命中连带相关核心记忆——模型不必再为记忆另开一问。"""
+
+        self._remember(
+            content="用户报告永远用业务员口吻写作。",
+            kind="preference",
+            source_excerpt="以后报告都按业务员的口吻写",
+        )
+        recall_registry = ToolRegistry()
+        register_recall_tools(
+            recall_registry,
+            Path(self.temp_dir.name) / "recall_root",
+            session_store=self.session_store,
+        )
+        outcome = json.loads(
+            recall_registry.get("recall").handler({"query": "报告用什么口吻写"})
+        )
+        self.assertTrue(outcome.get("memory_results"))
+        self.assertIn("业务员口吻", outcome["memory_results"][0]["content"])
+        # 无关查询不带记忆，避免每轮都拖着不相关条目。
+        quiet = json.loads(
+            recall_registry.get("recall").handler({"query": "量子计算原理"})
+        )
+        self.assertFalse(quiet.get("memory_results"))
+
+    def test_remember_writes_explicit_memory(self) -> None:
+        outcome = self._remember(
+            content="用户报告永远用业务员口吻写作。",
+            kind="preference",
+            source_excerpt="以后报告都按业务员的口吻写",
+        )
+        self.assertTrue(outcome["saved"])
+        items = self.store.list()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["state"], "explicit")
+        self.assertEqual(items[0]["source_excerpt"], "以后报告都按业务员的口吻写")
+
+    def test_remember_rejects_paths_and_transient_state(self) -> None:
+        rejected = self._remember(content="材料都放在 meet_files/材料 目录下。")
+        self.assertFalse(rejected["saved"])
+        self.assertIn("路径", rejected["reason"])
+        transient = self._remember(content="本次会议纪要初稿已经生成。")
+        self.assertFalse(transient["saved"])
+        too_short = self._remember(content="太短")
+        self.assertFalse(too_short["saved"])
+
+    def test_remember_deduplicates_identical_content(self) -> None:
+        self._remember(content="用户报告永远用业务员口吻写作。")
+        again = self._remember(content="用户报告永远用业务员口吻写作。")
+        self.assertFalse(again["saved"])
+        self.assertEqual(len(self.store.list()), 1)
+
+    def test_remember_rejects_unknown_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            self._remember(content="用户长期偏好先给结论再给依据。", kind="mood")
+
+    def test_forget_removes_the_closest_match(self) -> None:
+        self._remember(content="用户报告永远用业务员口吻写作。")
+        outcome = json.loads(
+            self.registry.get("forget").handler({"content": "报告用业务员口吻"})
+        )
+        self.assertTrue(outcome["deleted"])
+        self.assertEqual(self.store.list(), [])
 
 
 if __name__ == "__main__":

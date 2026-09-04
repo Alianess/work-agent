@@ -8,8 +8,17 @@ from pathlib import Path
 from work_agent_core.session_log import (
     ABORTED_BEFORE_DISPATCH,
     ASSISTANT_MESSAGE,
+    ARTIFACT_CREATED,
+    ARTIFACT_VERIFIED,
     COMPACTION_REPLACEMENT,
     CONTEXT_INJECTED,
+    DELIVERY_UPDATED,
+    EXTERNAL_EVENT_CONSUMED,
+    EXTERNAL_EVENT_QUEUED,
+    MESSAGE_READ,
+    PROACTIVE_MESSAGE,
+    SESSION_CHECKPOINT,
+    SESSION_METADATA_UPDATED,
     SessionHeader,
     SessionLog,
     SessionLogError,
@@ -90,6 +99,84 @@ class SessionLogProjectionTests(unittest.TestCase):
         first = log.derive_messages()
         first[0]["content"] = "改掉"
         self.assertEqual(log.derive_messages()[0]["content"], "你好")
+
+    def test_plain_assistant_reasoning_survives_log_projection(self) -> None:
+        log = new_log()
+        open_turn(log)
+        log.append(
+            ASSISTANT_MESSAGE,
+            {"content": "最终答复", "reasoning_content": "保留的模型思考"},
+        )
+
+        self.assertEqual(
+            log.derive_messages()[0]["reasoning_content"],
+            "保留的模型思考",
+        )
+
+    def test_human_timeline_includes_proactive_message_but_model_view_does_not(self) -> None:
+        log = new_log()
+        log.append(USER_MESSAGE, {"content": "今天有什么事"})
+        log.append(ASSISTANT_MESSAGE, {"content": "暂时没有。"})
+        log.append(
+            PROACTIVE_MESSAGE,
+            {
+                "message_id": "notice-1",
+                "content": "报市材料明天到期。",
+                "channel": "friday",
+                "unread": True,
+            },
+        )
+        log.append(MESSAGE_READ, {"message_id": "notice-1", "read": True})
+
+        self.assertEqual(
+            [item["content"] for item in log.derive_messages()],
+            ["今天有什么事", "暂时没有。"],
+        )
+        timeline = log.derive_timeline()
+        self.assertEqual([item["content"] for item in timeline], ["今天有什么事", "暂时没有。", "报市材料明天到期。"])
+        self.assertEqual(timeline[-1]["channel"], "friday")
+        self.assertTrue(timeline[-1]["read"])
+
+    def test_artifact_events_fold_into_one_structured_ledger(self) -> None:
+        log = new_log()
+        log.append(
+            ARTIFACT_CREATED,
+            {
+                "artifact_id": "report-1",
+                "path": "work_reports/biweekly/report.docx",
+                "kind": "docx",
+                "title": "双周报",
+            },
+        )
+        log.append(
+            ARTIFACT_VERIFIED,
+            {"artifact_id": "report-1", "verified": True, "verification": "rendered"},
+        )
+        log.append(
+            DELIVERY_UPDATED,
+            {"artifact_id": "report-1", "status": "available", "channel": "chat"},
+        )
+
+        self.assertEqual(log.derive_messages(), [])
+        artifact = log.derive_artifacts()[0]
+        self.assertEqual(artifact["path"], "work_reports/biweekly/report.docx")
+        self.assertEqual(artifact["status"], "verified")
+        self.assertEqual(artifact["delivery_status"], "available")
+
+    def test_checkpoint_metadata_and_external_queue_are_log_projections(self) -> None:
+        log = new_log()
+        log.append(SESSION_METADATA_UPDATED, {"values": {"project_id": "p1", "title": "行动方案"}})
+        log.append(SESSION_METADATA_UPDATED, {"values": {"title": "新标题"}, "removed": ["project_id"]})
+        log.append(SESSION_CHECKPOINT, {"summary": "已完成检索", "covered_message_count": 8})
+        log.append(
+            EXTERNAL_EVENT_QUEUED,
+            {"event_id": "timer-1", "kind": "timer", "payload": {"task": "提醒"}},
+        )
+        log.append(EXTERNAL_EVENT_CONSUMED, {"event_id": "timer-1", "turn_id": "turn-1"})
+
+        self.assertEqual(log.derive_metadata(), {"title": "新标题"})
+        self.assertEqual(log.latest_checkpoint()["covered_message_count"], 8)
+        self.assertEqual(log.pending_external_events(), [])
 
     def _closed(self, log: SessionLog) -> SessionLog:
         log.append(STEP_END, {"step": 1})
@@ -252,6 +339,33 @@ class SessionLogStoreTests(unittest.TestCase):
             self.assertEqual(before.next_seq, 0)
             self.assertEqual(after.next_seq, 1)
             self.assertNotEqual(before, after)
+
+    def test_adapters_can_append_business_event_to_the_same_log(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            store = SessionLogStore(Path(root) / "log.sqlite3")
+            event = store.append_event(
+                "friday-main",
+                PROACTIVE_MESSAGE,
+                {"message_id": "m1", "content": "明天到期", "unread": True},
+            )
+            self.assertEqual(event.seq, 0)
+            loaded = store.load_live("friday-main")
+            self.assertEqual(loaded.derive_timeline()[0]["content"], "明天到期")
+            self.assertEqual(loaded.derive_messages(), [])
+
+    def test_live_load_does_not_interrupt_a_parked_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            store = SessionLogStore(Path(root) / "log.sqlite3")
+            log = new_log()
+            open_turn(log)
+            store.append("conv-1", log.events)
+
+            live = store.load_live("conv-1")
+            self.assertEqual(live.seq, 2)
+            self.assertIsNone(live.latest(TURN_END))
+
+            recovered = store.load("conv-1")
+            self.assertEqual(recovered.events[-1].type, TURN_END)
 
 
 class SessionLogWriterTests(unittest.TestCase):

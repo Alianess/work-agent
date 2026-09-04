@@ -5,7 +5,7 @@ from datetime import date, datetime
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import parse_qs, quote, urlparse
 import urllib.error
 import urllib.request
@@ -33,13 +33,22 @@ import uuid
 import wave
 
 from .auth import AuthStore, AuthUser, SESSION_TTL_SECONDS
+from .approval_rules import (
+    forget_command_approval,
+    load_remembered_approvals,
+    remember_command_approval,
+    remembered_approvals_path,
+)
 from .cli import (
     add_model_profile,
     build_default_tools,
+    delete_model_endpoint,
     delete_model_profile,
     set_default_profile,
+    update_model_endpoint,
     update_model_profile,
     update_model_profile_api_key_env,
+    write_model_config,
 )
 from .audio_metadata import probe_audio_metadata
 from .config import (
@@ -55,6 +64,7 @@ from .config import (
 from .debug_trace import DebugTrace, list_debug_traces
 from .execution.store import ExecutionRecord, ExecutionStore
 from .execution.workspace import WorkspaceManager
+from .external_event_inbox import ExternalEventInboxAdapter
 from .images import IMAGE_MAX_EDGE_PIXELS, encode_image_for_model
 from .execution.backends import SeatbeltBackend
 from .cross_chat_memory import CrossChatMemoryStore
@@ -65,26 +75,36 @@ from .file_reference_index import (
 from .llm import OpenAICompatibleClient, chat_completions_endpoint, normalize_reasoning_effort
 from .memory import (
     CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
-    CHAT_SUMMARY_TRIGGER_TOKENS,
+    CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES,
+    CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS,
     PROVIDER_USAGE_BASELINE_KEY,
     ContextCompactionCancelled,
     ContextCompactionError,
+    context_pressure_reasons,
     estimate_context_tokens,
     estimate_messages_tokens,
     extract_recent_visible_turns,
     inspect_session_memory,
     prepare_session_memory,
+    profile_context_trigger_tokens,
     provider_usage_baseline_payload,
+    token_count_source_label,
 )
 from .message_channel import ChannelMessage, ChannelReply
 from .notifications import NotificationStore
-from .history_recall import delete_conversation_index, render_history_recall_system_context
+from .conversation_repository import ConversationRepository
 from .host_services.apple_pim import ApplePimService
 from .office_preview import OFFICE_TO_PDF_EXTENSIONS, convert_office_to_pdf
 from .office_workspace import merge_pdfs, relative_workspace_path, save_pdf_input
-from .session_log import TURN_END_ABORTED, TURN_END_COMPLETED, TURN_END_FAILED
+from .session_log import (
+    MESSAGE_READ,
+    PROACTIVE_MESSAGE,
+    TURN_END_ABORTED,
+    TURN_END_COMPLETED,
+    TURN_END_FAILED,
+)
 from .session_log_store import DurableTurnMirror, SessionLogStore
-from .attention import ObserverContext, SpokenLedger, compose_message, select_observations
+from .attention import ObserverContext, compose_message, select_observations
 from .observers import build_default_registry
 from .work_ledger import build_work_ledger, merge_ledgers
 from .recall.tools import (
@@ -109,7 +129,12 @@ from .runtime_env import (
     project_agent_python,
     runtime_contract_status,
 )
-from .session_store import SessionStore, repair_runtime_message_sequence, sanitize_conversation_id
+from .session_store import (
+    SessionStore,
+    is_turn_runtime_context_message,
+    repair_runtime_message_sequence,
+    sanitize_conversation_id,
+)
 from .skills.meeting_minutes import MeetingMinutesSkill
 from .skill_runtime import load_skill_manifests
 from .tools import set_default_file_change_handler, WorkspaceFiles
@@ -155,8 +180,12 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     "occupation": "",
     "details": "",
     "memory_enabled": True,
+    # 开启时常规风险命令由当前模型独立审查；关闭后一律回到人工确认。
+    "auto_approve": True,
     "work_background": "",
-    "company_document_format": "",
+    # 工作区外的只读目录：智能体可以原地读（含读图），写仍限工作区，
+    # 不复制、不导入，磁盘不会被读操作越用越大。
+    "extra_read_roots": ["~/Desktop", "~/Downloads"],
 }
 # All installed skills are available by default. Users can still turn off
 # individual skills from the Skills page; missing credentials or external
@@ -169,6 +198,7 @@ USER_STORES_LOCK = threading.RLock()
 PROJECTS_LOCK = threading.RLock()
 ATTACHMENT_INDEX_LOCK = threading.RLock()
 USER_SESSION_STORES: dict[int, SessionStore] = {}
+USER_CONVERSATION_REPOSITORIES: dict[int, ConversationRepository] = {}
 USER_TURN_STORES: dict[int, TurnStore] = {}
 TEMP_SYNC_LOCK = threading.RLock()
 TEMP_SYNC_FILE_TTL_SECONDS = 60 * 60
@@ -232,6 +262,24 @@ def user_data_dir(user: AuthUser | None = None) -> Path:
 
 def user_conversation_dir(user: AuthUser | None = None) -> Path:
     return user_data_dir(user) / "conversation_history"
+
+
+def reconcile_interrupted_turns(users: list[AuthUser]) -> int:
+    """Startup sweep: retire turns still marked running from a previous process.
+
+    A restart can kill chat streams mid-flight; their turn files say ``running``
+    forever on disk, and the UI waits on a stream nobody will continue. The
+    chat route reconciles per conversation, but only when the next message
+    arrives—this runs before the port opens so a reload alone recovers.
+    """
+
+    retired = 0
+    for user in users:
+        turn_dir = user_conversation_dir(user) / "turns"
+        if not turn_dir.is_dir():
+            continue
+        retired += TurnStore(WORKSPACE_ROOT, turn_dir=turn_dir).fail_interrupted_running_all()
+    return retired
 
 
 def user_agent_settings_path(user: AuthUser | None = None) -> Path:
@@ -310,11 +358,13 @@ def get_session_log_store() -> SessionLogStore:
     """
 
     user = current_auth_user()
+    expected_path = user_conversation_dir(user) / "session_log.sqlite3"
     with USER_STORES_LOCK:
-        return USER_LOG_STORES.setdefault(
-            user.id,
-            SessionLogStore(user_conversation_dir(user) / "session_log.sqlite3"),
-        )
+        store = USER_LOG_STORES.get(user.id)
+        if store is None or store.db_path != expected_path:
+            store = SessionLogStore(expected_path)
+            USER_LOG_STORES[user.id] = store
+        return store
 
 
 def get_session_store() -> SessionStore:
@@ -324,6 +374,38 @@ def get_session_store() -> SessionStore:
             user.id,
             SessionStore(WORKSPACE_ROOT, session_dir=user_conversation_dir(user) / "sessions"),
         )
+
+
+def get_conversation_repository() -> ConversationRepository:
+    """Account-scoped authority for conversation history and checkpoints."""
+
+    try:
+        user = current_auth_user()
+    except RuntimeError:
+        # Archive maintenance tests and one-time offline repair commands can
+        # supply account-scoped paths without starting the HTTP auth layer.
+        # They still get the same repository semantics, just no process cache.
+        return ConversationRepository(
+            WORKSPACE_ROOT,
+            session_store=get_session_store(),
+            log_store=SessionLogStore(user_conversation_dir() / "session_log.sqlite3"),
+        )
+    session_store = get_session_store()
+    log_store = get_session_log_store()
+    with USER_STORES_LOCK:
+        repository = USER_CONVERSATION_REPOSITORIES.get(user.id)
+        if (
+            repository is None
+            or repository.session_store is not session_store
+            or repository.log_store is not log_store
+        ):
+            repository = ConversationRepository(
+                WORKSPACE_ROOT,
+                session_store=session_store,
+                log_store=log_store,
+            )
+            USER_CONVERSATION_REPOSITORIES[user.id] = repository
+        return repository
 
 
 def get_turn_store() -> TurnStore:
@@ -420,10 +502,24 @@ def work_report_day_payload(target_date: str) -> dict[str, Any]:
 
 def mark_notifications_read_payload(payload: dict[str, Any]) -> dict[str, Any]:
     store = NotificationStore(user_notification_path())
+    target_id = str(payload.get("id") or "").strip()
+    all_items = bool(payload.get("all"))
+    message_ids = [
+        str(item.get("id") or "")
+        for item in store.list(limit=500)
+        if all_items or str(item.get("id") or "") == target_id
+    ]
     store.mark_read(
-        str(payload.get("id") or "").strip(),
-        all_items=bool(payload.get("all")),
+        target_id,
+        all_items=all_items,
     )
+    for message_id in message_ids:
+        if message_id:
+            get_session_log_store().append_event(
+                "friday-main",
+                MESSAGE_READ,
+                {"message_id": message_id, "read": True},
+            )
     return store.payload()
 
 
@@ -570,7 +666,10 @@ def friday_scheduler_loop() -> None:
                     schedule_automatic_daily_reports(user, audit)
                 notification_store.claim_due(kind="reminder")
                 for item in notification_store.due_conversations():
-                    append_friday_proactive_message(str(item.get("body") or ""))
+                    append_friday_proactive_message(
+                        str(item.get("body") or ""),
+                        message_id=str(item.get("id") or ""),
+                    )
                     notification_store.mark_delivered(str(item.get("id") or ""))
                 run_attention_pass(user)
                 run_recall_maintenance(user)
@@ -619,12 +718,15 @@ ATTENTION_LAST_RUN: dict[int, float] = {}
 # correction outlives the conversation it was made in — which is the whole
 # reason to record it here rather than re-deciding every time.
 # This is a seed: the entity layer should own it once that exists.
-ATTENTION_ALIAS_GROUPS: dict[str, list[str]] = {
-    "零次方": ["燃气方", "云智方", "平次方"],
-    "逐际动力": ["足力动力", "徐东岭"],
-    "罍街": ["雷街"],
-    "国先中心": ["国平中心", "中国平中心"],
-    "柔性科天": ["水性科天"],
+# ASR 同音字属于不可避免的原始记录噪声，不在提醒中心主动纠错。
+# 纪要生成阶段会结合用户确认信息、工作背景和补充材料校准专名。
+ATTENTION_ALIAS_GROUPS: dict[str, list[str]] = {}
+
+ATTENTION_NOTIFICATION_TITLES = {
+    "unprocessed-recording": "待整理录音",
+    "entity-spelling": "专名需要核对",
+    "material-versions": "材料版本需要确认",
+    "version-family": "材料版本关系需要确认",
 }
 
 
@@ -632,7 +734,10 @@ def account_work_ledger(user: AuthUser):
     """Project everything this account's assistant produced, from the log."""
     store = get_session_log_store()
     return merge_ledgers(
-        build_work_ledger(store.load(conversation_id))
+        # The attention scheduler is an observer, not a crash-recovery boundary.
+        # Loading an actively written turn with recovery enabled durably appends a
+        # synthetic ``interrupted`` end while the real turn is still running.
+        build_work_ledger(store.load_live(conversation_id))
         for conversation_id in store.list_sessions()
     )
 
@@ -662,16 +767,36 @@ def run_attention_pass(user: AuthUser) -> None:
         ledger=account_work_ledger(user),
     )
     registry = build_default_registry(alias_groups=ATTENTION_ALIAS_GROUPS)
-    ledger = SpokenLedger(user_data_dir(user) / "meet_files" / "attention_spoken.json")
-    unsaid = ledger.filter_unsaid(registry.run(context))
-    selected = select_observations(unsaid)
-    if not selected:
-        return
-    message = compose_message(selected)
-    if not message:
-        return
-    append_friday_proactive_message(message)
-    ledger.mark_spoken(selected)
+    # The bell is a quiet inbox, so it may retain every current actionable
+    # item.  The proactive conversation message stays capped at three to avoid
+    # interrupting the user with a wall of text.
+    current = select_observations(registry.run(context), limit=100)
+    notification_store = NotificationStore(user_notification_path(user))
+    synced = notification_store.sync_reminders(
+        source="attention",
+        reminders=[
+            {
+                "key": observation.dedup_key(),
+                "title": ATTENTION_NOTIFICATION_TITLES.get(observation.source, "Friday 提醒"),
+                "body": (
+                    observation.summary
+                    if not observation.detail
+                    else f"{observation.summary}\n{observation.detail}"
+                ),
+                "conversation_id": FRIDAY_CONVERSATION_ID,
+            }
+            for observation in current
+        ],
+    )
+    created_keys = {
+        str(item.get("dedup_key") or "")
+        for item in synced.get("created", [])
+        if isinstance(item, dict)
+    }
+    newly_visible = [item for item in current if item.dedup_key() in created_keys]
+    message = compose_message(select_observations(newly_visible))
+    if message:
+        append_friday_proactive_message(message)
 
 
 def schedule_automatic_daily_reports(user: AuthUser, audit: dict[str, Any]) -> None:
@@ -928,14 +1053,23 @@ def work_report_gap_message(audit: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def append_friday_proactive_message(text: str) -> None:
+def append_friday_proactive_message(text: str, *, message_id: str = "") -> str:
     content = str(text or "").strip()
     if not content:
         raise ValueError("主动会话内容不能为空。")
-    store = get_session_store()
-    session = store.load("friday-main")
-    session.messages.append({"role": "assistant", "content": content})
-    store.save(session)
+    resolved_message_id = str(message_id or f"friday-{uuid.uuid4().hex}")
+    get_session_log_store().append_event(
+        "friday-main",
+        PROACTIVE_MESSAGE,
+        {
+            "message_id": resolved_message_id,
+            "content": content,
+            "channel": "friday",
+            "unread": True,
+            "source": "assistant",
+        },
+    )
+    timeline = get_conversation_repository().timeline("friday-main")
     with CONVERSATION_ARCHIVE_LOCK:
         payload = load_conversations_payload()
         items = payload.get("items") if isinstance(payload.get("items"), list) else []
@@ -957,18 +1091,17 @@ def append_friday_proactive_message(text: str) -> None:
                 "contextSummaryMessageCount": 0,
             }
             items.insert(0, target)
-        messages = target.get("messages")
-        if not isinstance(messages, list):
-            messages = []
-            target["messages"] = messages
-        messages.append(
+        target["messages"] = [
             {
-                "role": "assistant",
-                "content": content,
-                "channel": "friday",
-                "createdAt": int(time.time() * 1000),
+                "id": str(item.get("id") or ""),
+                "role": str(item.get("role") or "assistant"),
+                "content": item.get("content") or "",
+                "channel": str(item.get("channel") or "chat"),
+                "createdAt": int(item.get("created_at") or 0),
+                "read": bool(item.get("read", True)),
             }
-        )
+            for item in timeline
+        ]
         save_result = save_conversations_payload(
             {
                 "base_revision": payload.get("revision", 0),
@@ -977,6 +1110,7 @@ def append_friday_proactive_message(text: str) -> None:
         )
         if not save_result.get("ok"):
             raise RuntimeError("保存 Friday 主动消息时归档版本发生变化。")
+    return resolved_message_id
 
 
 def handle_weixin_channel_message(user_id: int, message: ChannelMessage) -> ChannelReply:
@@ -1447,6 +1581,10 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                     )
                 )
                 return
+            if parsed.path == "/api/approvals/rules":
+                items = load_remembered_approvals(remembered_approvals_path(user_data_dir()))
+                self._send_json({"items": items, "count": len(items)})
+                return
             if parsed.path == "/api/tools":
                 self._send_json(tools_payload())
                 return
@@ -1512,13 +1650,29 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 self._send_json(realtime_transcript_session_payload(first(params, "session_id", "")))
                 return
             if parsed.path == "/api/conversations":
-                self._send_json(load_conversations_payload())
+                params = parse_qs(parsed.query)
+                since_revision = first(params, "since_revision", "")
+                self._send_json(
+                    load_conversation_index_payload(
+                        int(since_revision) if since_revision.isdigit() else None
+                    )
+                )
                 return
             conversation_files_match = re.fullmatch(r"/api/conversations/([^/]+)/files", parsed.path)
             if conversation_files_match:
                 self._send_json(
                     conversation_files_payload(decode_uri_path(conversation_files_match.group(1)))
                 )
+                return
+            conversation_match = re.fullmatch(r"/api/conversations/([^/]+)", parsed.path)
+            if conversation_match:
+                payload = load_conversation_detail_payload(
+                    decode_uri_path(conversation_match.group(1))
+                )
+                if payload is None:
+                    self._send_json({"error": "对话不存在或已删除"}, status=404)
+                else:
+                    self._send_json(payload)
                 return
             if parsed.path == "/api/projects":
                 self._send_json(list_projects_payload())
@@ -1666,13 +1820,30 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 name = required_string(payload, "name")
                 if name in load_registry().names():
                     raise ValueError(f"模型配置已存在：{name}")
+                registry = load_registry()
                 source_name = str(payload.get("source_name") or "").strip()
                 api_key = str(payload.get("api_key") or "").strip()
+                endpoint_id = str(payload.get("endpoint_id") or "").strip()
+                endpoint_members = (
+                    [
+                        registry.get(candidate)
+                        for candidate in registry.names()
+                        if registry.get(candidate).endpoint_key == endpoint_id
+                    ]
+                    if endpoint_id
+                    else []
+                )
                 if api_key:
-                    api_key_env = api_key_env_for_profile(name)
+                    api_key_env = (
+                        endpoint_members[0].api_key_env
+                        if endpoint_members
+                        else api_key_env_for_profile(name)
+                    )
                     save_env_value(WORKSPACE_ROOT / ".env", api_key_env, api_key)
                 elif source_name:
-                    api_key_env = load_registry().get(source_name).api_key_env
+                    api_key_env = registry.get(source_name).api_key_env
+                elif endpoint_members:
+                    api_key_env = endpoint_members[0].api_key_env
                 else:
                     raise ValueError("API 密钥不能为空。")
                 profile_data = validated_model_profile_data(
@@ -1702,6 +1873,7 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                     payload,
                     name=name,
                     api_key_env=api_key_env,
+                    existing=existing,
                 )
                 update_model_profile(WORKSPACE_ROOT / CONFIG_PATH, name, profile_data)
                 if bool(payload.get("set_default")):
@@ -1730,6 +1902,60 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 if not self._require_admin():
                     return
                 self._send_json(discover_models_payload(payload))
+                return
+            if parsed.path == "/api/models/endpoint/import":
+                if not self._require_admin():
+                    return
+                self._send_json(import_endpoint_models_payload(payload))
+                return
+            if parsed.path == "/api/models/endpoint/update":
+                if not self._require_admin():
+                    return
+                endpoint_id = required_string(payload, "endpoint_id")
+                update_data: dict[str, Any] = {}
+                if "endpoint_label" in payload:
+                    update_data["endpoint_label"] = payload.get("endpoint_label")
+                if payload.get("base_url"):
+                    update_data["base_url"] = payload["base_url"]
+                if payload.get("provider"):
+                    update_data["provider"] = payload["provider"]
+                updated_names = update_model_endpoint(
+                    WORKSPACE_ROOT / CONFIG_PATH,
+                    endpoint_id,
+                    update_data,
+                )
+                api_key = str(payload.get("api_key") or "").strip()
+                if api_key:
+                    registry = load_registry()
+                    api_key_env = registry.get(updated_names[0]).api_key_env
+                    save_env_value(WORKSPACE_ROOT / ".env", api_key_env, api_key)
+                self._send_json(
+                    models_payload(
+                        message=f"{len(updated_names)} 个模型已更新：端点 {endpoint_id}"
+                    )
+                )
+                return
+            if parsed.path == "/api/models/endpoint/delete":
+                if not self._require_admin():
+                    return
+                endpoint_id = required_string(payload, "endpoint_id")
+                removed_profiles = delete_model_endpoint(
+                    WORKSPACE_ROOT / CONFIG_PATH,
+                    endpoint_id,
+                )
+                removed_envs = {
+                    str(profile.get("api_key_env") or "")
+                    for profile in removed_profiles
+                    if str(profile.get("api_key_env") or "").startswith("WORK_AGENT_MODEL_")
+                }
+                for env_key in removed_envs:
+                    if not model_api_key_env_in_use(env_key):
+                        delete_env_value(WORKSPACE_ROOT / ".env", env_key)
+                self._send_json(
+                    models_payload(
+                        message=f"端点 {endpoint_id} 及其 {len(removed_profiles)} 个模型已删除"
+                    )
+                )
                 return
             if parsed.path == "/api/settings/asr":
                 if not self._require_admin():
@@ -1772,6 +1998,18 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/memories/delete":
                 self._send_json(delete_cross_chat_memory_payload(payload))
+                return
+            if parsed.path == "/api/approvals/rules/delete":
+                removed = forget_command_approval(
+                    remembered_approvals_path(user_data_dir()),
+                    str(payload.get("command") or ""),
+                )
+                message = (
+                    "已删除这条记住的审批，下次会重新询问。"
+                    if removed
+                    else "没有找到这条记住的审批。"
+                )
+                self._send_json({"ok": removed, "message": message})
                 return
             if parsed.path == "/api/agent/run":
                 self._send_json(run_agent_payload(payload))
@@ -1843,6 +2081,9 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/conversations/save":
                 self._send_json(save_conversations_payload(payload))
+                return
+            if parsed.path == "/api/conversations/delete":
+                self._send_json(delete_conversations_payload(payload))
                 return
             if parsed.path == "/api/conversations/move-project":
                 self._send_json(move_conversation_to_project_payload(payload))
@@ -2093,8 +2334,7 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
                     pass
 
     def _send_workspace_file(self, path: str, *, as_attachment: bool = False) -> None:
-        workspace = WorkspaceFiles(account_workspace_root())
-        file_path = workspace.resolve(path)
+        file_path, _storage_root = resolve_user_visible_file(path)
         if not file_path.is_file():
             raise ValueError(f"Not a file: {path}")
         stat = file_path.stat()
@@ -2128,11 +2368,19 @@ class WorkAgentHandler(SimpleHTTPRequestHandler):
 
     def _write_sse_event(self, payload: dict[str, Any]) -> None:
         event_name = str(payload.get("event") or "message")
-        data = json.dumps(payload, ensure_ascii=False)
+        # SSE records are delimited only by CR/LF.  ``str.splitlines()`` also
+        # treats Unicode U+2028/U+2029 as line boundaries; ASR transcripts can
+        # contain U+2029, so splitting a JSON string that way injects a literal
+        # newline into a quoted value and the browser fails with
+        # ``Bad control character in string literal``.  Keep every event on one
+        # physical data line and escape the two Unicode separators explicitly.
+        data = (
+            json.dumps(payload, ensure_ascii=False)
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
+        )
         self.wfile.write(f"event: {event_name}\n".encode("utf-8"))
-        for line in data.splitlines() or ["{}"]:
-            self.wfile.write(f"data: {line}\n".encode("utf-8"))
-        self.wfile.write(b"\n")
+        self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
         self.wfile.flush()
 
     def _send_error(self, error: Exception) -> None:
@@ -2257,6 +2505,7 @@ def profile_payload(profile: ModelProfile, default_profile: str) -> dict[str, An
 
 def models_payload(message: str | None = None) -> dict[str, Any]:
     registry = load_registry()
+    endpoints = model_endpoints_payload(registry)
     payload = {
         "default_profile": registry.default_profile,
         "env_override": os.getenv("WORK_AGENT_MODEL_PROFILE"),
@@ -2264,10 +2513,47 @@ def models_payload(message: str | None = None) -> dict[str, Any]:
             profile_payload(registry.get(name), registry.default_profile)
             for name in registry.names()
         ],
+        "endpoints": endpoints,
+        "total_profiles": len(registry.names()),
+        "total_endpoints": len(endpoints),
     }
     if message:
         payload["message"] = message
     return payload
+
+
+def model_endpoints_payload(registry: ModelRegistry) -> list[dict[str, Any]]:
+    groups: dict[str, list[ModelProfile]] = {}
+    for name in registry.names():
+        profile = registry.get(name)
+        groups.setdefault(profile.endpoint_key, []).append(profile)
+
+    endpoints: list[dict[str, Any]] = []
+    for endpoint_id, members in groups.items():
+        members.sort(key=lambda profile: profile.name)
+        representative = members[0]
+        endpoints.append(
+            {
+                "endpoint_id": endpoint_id,
+                "name": representative.display_endpoint_label,
+                "label": representative.display_endpoint_label,
+                "base_url": representative.base_url,
+                "provider": representative.provider,
+                "profile_count": len(members),
+                "default": any(
+                    profile.name == registry.default_profile for profile in members
+                ),
+                "api_key_configured": any(
+                    bool(os.getenv(profile.api_key_env)) for profile in members
+                ),
+                "models": [
+                    profile_payload(profile, registry.default_profile)
+                    for profile in members
+                ],
+            }
+        )
+    endpoints.sort(key=lambda item: (not item["default"], item["name"].lower()))
+    return endpoints
 
 
 def validated_model_profile_data(
@@ -2275,6 +2561,7 @@ def validated_model_profile_data(
     *,
     name: str,
     api_key_env: str,
+    existing: ModelProfile | None = None,
 ) -> dict[str, Any]:
     base_url = required_string(payload, "base_url").rstrip("/")
     parsed = urlparse(base_url)
@@ -2286,6 +2573,11 @@ def validated_model_profile_data(
     max_tokens = int(
         payload["max_tokens"] if payload.get("max_tokens") is not None else 16384
     )
+    context_length = int(
+        payload["context_length"]
+        if payload.get("context_length") is not None
+        else (existing.context_length if existing else 256000)
+    )
     timeout_seconds = int(
         payload["timeout_seconds"] if payload.get("timeout_seconds") is not None else 180
     )
@@ -2293,6 +2585,10 @@ def validated_model_profile_data(
         raise ValueError("温度必须在 0 到 2 之间。")
     if not 1 <= max_tokens <= 262144:
         raise ValueError("最大输出必须在 1 到 262144 之间。")
+    if not 4096 <= context_length <= 1000000:
+        raise ValueError("上下文长度必须在 4096 到 1000000 之间。")
+    if max_tokens >= context_length:
+        raise ValueError("最大输出必须小于上下文长度。")
     if not 10 <= timeout_seconds <= 3600:
         raise ValueError("超时时间必须在 10 到 3600 秒之间。")
     return {
@@ -2303,12 +2599,32 @@ def validated_model_profile_data(
         "api_key_env": api_key_env,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "context_length": context_length,
         "timeout_seconds": timeout_seconds,
         "supports_vision": (
             bool(payload["supports_vision"])
             if isinstance(payload.get("supports_vision"), bool)
             else infer_model_vision_support(payload)
         ),
+        "auth_header": str(
+            payload.get("auth_header") or (existing.auth_header if existing else "Authorization")
+        ).strip(),
+        "auth_scheme": str(
+            payload.get("auth_scheme")
+            if payload.get("auth_scheme") is not None
+            else (existing.auth_scheme if existing else "Bearer")
+        ).strip(),
+        "stream_idle_timeout_seconds": int(
+            payload.get("stream_idle_timeout_seconds")
+            if payload.get("stream_idle_timeout_seconds") is not None
+            else (existing.stream_idle_timeout_seconds if existing else 0)
+        ),
+        "endpoint_id": str(
+            payload.get("endpoint_id") or (existing.endpoint_id if existing else "")
+        ).strip(),
+        "endpoint_label": str(
+            payload.get("endpoint_label") or (existing.endpoint_label if existing else "")
+        ).strip(),
     }
 
 
@@ -2464,12 +2780,133 @@ def discover_models_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def models_endpoint_for_base_url(base_url: str) -> str:
+    """向后兼容包装：保留旧签名。真正的 URL 拼接在 _models_endpoint_url。"""
+    return _models_endpoint_url(base_url)
+
+
+def _models_endpoint_url(base_url: str) -> str:
     endpoint = str(base_url).rstrip("/")
     for suffix in ("/chat/completions", "/responses"):
         if endpoint.endswith(suffix):
             endpoint = endpoint[: -len(suffix)]
             break
     return f"{endpoint.rstrip('/')}/models"
+
+
+def import_endpoint_models_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """从端点 GET /models，把端点下尚未配置的模型批量写入配置。
+
+    类似 CC Switch：一个 URL 拉全部模型。复用端点已有的密钥与参数，
+    不需要逐个手填。
+    """
+    endpoint_id = required_string(payload, "endpoint_id").strip()
+    registry = load_registry()
+    members = [
+        registry.get(name)
+        for name in registry.names()
+        if registry.get(name).endpoint_key == endpoint_id
+    ]
+    if not members:
+        raise ValueError(f"找不到端点：{endpoint_id}")
+    template = members[0]
+    existing_models = {member.model for member in members}
+    existing_names = set(registry.names())
+
+    api_key = str(payload.get("api_key") or "").strip()
+    if api_key:
+        save_env_value(WORKSPACE_ROOT / ".env", template.api_key_env, api_key)
+
+    endpoint = _models_endpoint_url(template.base_url)
+    request = urllib.request.Request(
+        endpoint,
+        headers=template.auth_headers(),
+        method="GET",
+    )
+    started_at = time.monotonic()
+    client = OpenAICompatibleClient()
+    route_profile = model_route_profile(template.base_url, template.model, 30)
+    try:
+        with client._open_request(
+            request,
+            profile=route_profile,
+            timeout=30,
+        ) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        detail = error.read(2000).decode("utf-8", errors="replace")
+        raise ValueError(f"获取模型失败：HTTP {error.code} · {compact_error_detail(detail)}") from error
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as error:
+        raise ValueError(f"获取模型失败：{error}") from error
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("接口返回的模型列表不是有效 JSON。") from error
+    raw_models = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(raw_models, list):
+        raise ValueError("接口未返回 OpenAI-compatible 的 data 模型列表。")
+    discovered = sorted(
+        {
+            str(item.get("id") or "").strip()
+            for item in raw_models
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+    )
+
+    config_path = WORKSPACE_ROOT / CONFIG_PATH
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    profiles = data.setdefault("profiles", [])
+    added: list[str] = []
+    skipped: list[str] = []
+    for model_id in discovered:
+        if model_id in existing_models:
+            skipped.append(model_id)
+            continue
+        name = f"{endpoint_id}-{model_id}"
+        if name in existing_names:
+            name = f"{endpoint_id}-{model_id}-{abs(hash(model_id)) % 10000}"
+        profile_data = {
+            "name": name,
+            "provider": template.provider,
+            "base_url": template.base_url,
+            "model": model_id,
+            "api_key_env": template.api_key_env,
+            "temperature": template.temperature,
+            "max_tokens": template.max_tokens,
+            "context_length": template.context_length,
+            "timeout_seconds": template.timeout_seconds,
+            "stream_idle_timeout_seconds": template.stream_idle_timeout_seconds,
+            "supports_vision": infer_model_vision_support(
+                {"name": name, "provider": template.provider, "base_url": template.base_url, "model": model_id}
+            ),
+            "auth_header": template.auth_header,
+            "auth_scheme": template.auth_scheme,
+            "endpoint_id": template.endpoint_id,
+            "endpoint_label": template.endpoint_label,
+        }
+        profiles.append(profile_data)
+        existing_names.add(name)
+        existing_models.add(model_id)
+        added.append(model_id)
+    if added:
+        write_model_config(config_path, data)
+
+    result = models_payload()
+    result.update(
+        {
+            "imported": added,
+            "imported_count": len(added),
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+            "latency_ms": max(1, round((time.monotonic() - started_at) * 1000)),
+            "message": (
+                f"已接入 {len(added)} 个新模型"
+                + (f"，{len(skipped)} 个已存在跳过" if skipped else "")
+                if added
+                else f"端点已有全部 {len(skipped)} 个模型，无需新增"
+            ),
+        }
+    )
+    return result
 
 
 def compact_error_detail(detail: str) -> str:
@@ -2515,11 +2952,27 @@ def load_agent_settings() -> dict[str, Any]:
         str(settings.get("details") or settings.get("work_background") or "")
     )
     settings["memory_enabled"] = bool(settings.get("memory_enabled", True))
+    settings["auto_approve"] = bool(settings.get("auto_approve", True))
     settings["work_background"] = normalize_multiline_text(str(settings.get("work_background") or ""))
-    settings["company_document_format"] = normalize_multiline_text(
-        str(settings.get("company_document_format") or "")
-    )
+    # 旧的账户级公司排版覆盖已经废弃。读取旧设置时主动丢弃，避免它继续
+    # 覆盖 official-document 中固定的 GB/T 9704—2012 基线。
+    settings.pop("company_document_format", None)
+    raw_roots = settings.get("extra_read_roots")
+    settings["extra_read_roots"] = [
+        str(root).strip()
+        for root in (raw_roots if isinstance(raw_roots, list) else [])
+        if str(root or "").strip()
+    ]
     return settings
+
+
+def agent_extra_read_roots() -> tuple[Path, ...]:
+    """用户声明的工作区外只读目录，文件工具与 shell 沙箱共用同一份。"""
+
+    return tuple(
+        Path(root).expanduser().resolve()
+        for root in load_agent_settings().get("extra_read_roots") or []
+    )
 
 
 def enabled_skill_ids() -> set[str]:
@@ -2577,17 +3030,26 @@ def save_agent_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "occupation": normalize_multiline_text(str(payload.get("occupation", current.get("occupation")) or "")),
         "details": normalize_multiline_text(str(payload.get("details", current.get("details")) or "")),
         "memory_enabled": bool(payload.get("memory_enabled", current.get("memory_enabled", True))),
+        "auto_approve": bool(payload.get("auto_approve", current.get("auto_approve", True))),
         # ``work_background`` was the old all-in-one field.  Keep reading it
         # for migration, but do not keep duplicating it after the user saves
         # the structured "details" field.
         "work_background": "",
-        "company_document_format": normalize_multiline_text(
-            str(payload.get("company_document_format", current.get("company_document_format")) or "")
-        ),
         "skill_enabled": (
             {str(key): bool(value) for key, value in current.get("skill_enabled", {}).items()}
             if isinstance(current.get("skill_enabled"), dict)
             else {}
+        ),
+        # 只读目录白名单：设置页提交列表就更新；老客户端不带这个键时
+        # 原样保留，别被一次无关的保存冲掉。
+        "extra_read_roots": (
+            [
+                str(root).strip()
+                for root in payload["extra_read_roots"]
+                if str(root or "").strip()
+            ]
+            if isinstance(payload.get("extra_read_roots"), list)
+            else list(current.get("extra_read_roots") or [])
         ),
     }
     path = user_agent_settings_path()
@@ -2710,7 +3172,7 @@ def cross_chat_memories_payload(*, project_id: str | None = None, query: str = "
             "automatic_project_limit": 10,
             "minimum_user_turns": 12,
             "refresh_interval_user_turns": 8,
-            "history_recall": "hybrid-history-rag",
+            "recall": "unified-hybrid-rag",
         },
         "project_id": project_id,
     }
@@ -2820,7 +3282,9 @@ def tools_payload() -> dict[str, Any]:
         enabled_skill_ids=enabled_skill_ids(),
         file_change_handler=update_file_reference_index,
         recall_data_root=user_data_dir(),
+        approval_rules_path=remembered_approvals_path(user_data_dir()),
         agent_reminder_source=pending_agent_reminders,
+        extra_read_roots=agent_extra_read_roots(),
     )
     return {
         "tools": [
@@ -2868,6 +3332,137 @@ def compact_command_result(prepared: Any) -> str:
     )
 
 
+CONTEXT_COMPACTION_METRIC_KEYS = (
+    "context_estimated_tokens",
+    "context_pre_compaction_tokens",
+    "context_post_compaction_tokens",
+    "context_trigger_tokens",
+    "context_serialized_bytes",
+    "context_serialized_bytes_trigger",
+    "context_tool_result_chars",
+    "context_tool_result_chars_trigger",
+    "context_post_compaction_serialized_bytes",
+    "context_post_compaction_tool_result_chars",
+    "context_pressure_reasons",
+    "context_token_count_source",
+)
+
+
+def context_compaction_metrics(prepared: Any, context_trigger_tokens: int) -> dict[str, Any]:
+    """Return explicit before/after metrics for UI, archive, and diagnosis."""
+
+    before_tokens = max(0, int(getattr(prepared, "estimated_tokens", 0) or 0))
+    after_tokens = max(
+        0,
+        int(getattr(prepared, "post_compaction_estimated_tokens", before_tokens) or 0),
+    )
+    return {
+        # Backward-compatible field: this has always represented preflight
+        # pressure, although the old UI accidentally described it as the
+        # post-compaction value.
+        "context_estimated_tokens": before_tokens,
+        "context_pre_compaction_tokens": before_tokens,
+        "context_post_compaction_tokens": after_tokens,
+        "context_trigger_tokens": max(0, int(context_trigger_tokens)),
+        "context_serialized_bytes": max(
+            0, int(getattr(prepared, "serialized_bytes", 0) or 0)
+        ),
+        "context_serialized_bytes_trigger": CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES,
+        "context_tool_result_chars": max(
+            0, int(getattr(prepared, "tool_result_chars", 0) or 0)
+        ),
+        "context_tool_result_chars_trigger": CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS,
+        "context_post_compaction_serialized_bytes": max(
+            0, int(getattr(prepared, "post_compaction_serialized_bytes", 0) or 0)
+        ),
+        "context_post_compaction_tool_result_chars": max(
+            0, int(getattr(prepared, "post_compaction_tool_result_chars", 0) or 0)
+        ),
+        "context_pressure_reasons": list(getattr(prepared, "pressure_reasons", ()) or ()),
+        "context_token_count_source": str(
+            getattr(prepared, "token_count_source", "estimated_session_plus_reserve")
+            or "estimated_session_plus_reserve"
+        ),
+    }
+
+
+def context_compaction_start_detail(
+    inspection: Any,
+    reasons: Sequence[str],
+    context_trigger_tokens: int,
+) -> str:
+    labels: list[str] = []
+    reason_set = set(reasons)
+    if "tokens" in reason_set:
+        labels.append(
+            f"token 约 {int(inspection.estimated_tokens):,}/{int(context_trigger_tokens):,}"
+        )
+    if "serialized_bytes" in reason_set:
+        labels.append(
+            "会话体积 "
+            f"{int(inspection.serialized_bytes):,}/{CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES:,} 字节"
+        )
+    if "tool_results" in reason_set:
+        labels.append(
+            "工具结果 "
+            f"{int(inspection.tool_result_chars):,}/{CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS:,} 字符"
+        )
+    reason_text = "；".join(labels) if labels else "用户主动要求"
+    source = token_count_source_label(str(
+        getattr(inspection, "token_count_source", "estimated_session_plus_reserve")
+        or "estimated_session_plus_reserve"
+    ))
+    return (
+        f"触发项：{reason_text}。token 依据：{source}。"
+        "正在生成断点摘要，原始记录不会删除。"
+    )
+
+
+def context_compaction_detail(prepared: Any, context_trigger_tokens: int) -> str:
+    """Explain why compaction ran without mixing pre- and post-state."""
+
+    metrics = context_compaction_metrics(prepared, context_trigger_tokens)
+    reasons = set(metrics["context_pressure_reasons"])
+    before_tokens = metrics["context_pre_compaction_tokens"]
+    token_trigger = metrics["context_trigger_tokens"]
+    if "tokens" in reasons:
+        token_status = (
+            f"压缩前约 {before_tokens:,} tokens，已达到 {token_trigger:,} token 安全线"
+        )
+    else:
+        token_status = (
+            f"压缩前约 {before_tokens:,} tokens，低于 {token_trigger:,} token 安全线"
+        )
+
+    causes: list[str] = []
+    if "tokens" in reasons:
+        causes.append("token 用量达到安全线")
+    if "serialized_bytes" in reasons:
+        causes.append(
+            "待整理会话体积 "
+            f"{metrics['context_serialized_bytes']:,} 字节达到 "
+            f"{metrics['context_serialized_bytes_trigger']:,} 字节安全线"
+        )
+    if "tool_results" in reasons:
+        causes.append(
+            "历史工具结果累计 "
+            f"{metrics['context_tool_result_chars']:,} 字符达到 "
+            f"{metrics['context_tool_result_chars_trigger']:,} 字符安全线"
+        )
+    if "forced" in reasons:
+        causes.append("用户主动执行 /compact")
+    if not causes:
+        causes.append("会话达到安全整理条件")
+
+    after_tokens = metrics["context_post_compaction_tokens"]
+    covered = max(0, int(getattr(prepared, "summary_message_count", 0) or 0))
+    return (
+        f"{token_status}。触发原因：{'；'.join(causes)}。"
+        f"压缩后工作上下文约 {after_tokens:,} tokens；"
+        f"已归纳到第 {covered} 条消息，原始记录仍保留在会话存档中。"
+    )
+
+
 def clear_completed_task_plan(session: Any) -> None:
     state = session.metadata.get("active_task_plan")
     if not isinstance(state, dict):
@@ -2879,12 +3474,35 @@ def clear_completed_task_plan(session: Any) -> None:
         session.metadata.pop("active_task_plan", None)
 
 
+def mark_task_plan_run_status(
+    session: Any,
+    runtime: ConversationRuntime,
+    turn_id: str,
+    status: str,
+    *,
+    detail: str = "",
+) -> None:
+    """Keep a resumable plan while making its terminal run state explicit."""
+
+    state = session.metadata.get("active_task_plan")
+    if not isinstance(state, dict) or str(state.get("turn_id") or "") != str(turn_id or ""):
+        return
+    next_state = dict(state)
+    next_state["run_status"] = str(status or "")
+    next_state["terminal_at"] = int(time.time())
+    if detail:
+        next_state["terminal_detail"] = str(detail)[:2000]
+    else:
+        next_state.pop("terminal_detail", None)
+    session.metadata["active_task_plan"] = next_state
+    runtime.record_metadata_update({"active_task_plan": next_state})
+
+
 def agent_system_context(*, mode: str = "task") -> str:
     settings = load_agent_settings()
     nickname = str(settings.get("nickname") or "").strip()
     occupation = str(settings.get("occupation") or "").strip()
     details = str(settings.get("details") or "").strip()
-    company_document_format = str(settings.get("company_document_format") or "").strip()
     # The voice belongs to the profile. Keeping it here as an if/else meant a
     # new runtime could not have one without editing this function.
     from .runtime_profiles import registry as runtime_profile_registry
@@ -2906,32 +3524,135 @@ def agent_system_context(*, mode: str = "task") -> str:
             "近期工作记录或原始聊天中核验，不得把这里未更新的旧描述当作当前事实。"
         )
         blocks.append("\n".join(profile_lines))
-    if company_document_format:
-        blocks.append(
-            "公司标准文件格式（纯文字设置）：\n"
-            f"{company_document_format}\n\n"
-            "使用规则：这是公司级 Word 排版覆盖，不是正文内容。"
-            "普通正式文字材料可直接交给 docx 技能按此生成；"
-            "请示、报告、通知、通报、函、批复、意见、决定、公告、通告、纪要等明显公文内容，"
-            "先打开 official-document 技能确定文种、要素和规范，再打开 docx 技能生成最终文件。"
-            "不得为套格式虚构红头、文号、签发人、印章、密级或日期。"
-        )
     return "\n\n".join(blocks)
 
 
 def agent_turn_time_context() -> str:
-    """Return per-turn time context kept at the cache-friendly tail of the prompt."""
-    current_local_time_text = datetime.now().astimezone().isoformat(timespec="seconds")
+    """Return a timestamp captured once for an append-only turn event."""
+    current_local_time = datetime.now().astimezone()
+    weekday = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")[
+        current_local_time.weekday()
+    ]
+    return f"系统当前时间：{current_local_time:%Y-%m-%d %H:%M:%S}，{weekday}。"
+
+
+def join_system_context_blocks(*blocks: str) -> str:
+    """Join prompt blocks without letting incidental whitespace shape the cache prefix."""
+
+    return "\n\n".join(
+        text
+        for text in (str(block or "").strip() for block in blocks)
+        if text
+    )
+
+
+def agent_turn_runtime_context(*blocks: str) -> str:
+    """Build one immutable event appended immediately before its user turn."""
+
+    body = join_system_context_blocks(
+        agent_turn_time_context(),
+        *blocks,
+    )
+    return f"当前轮 runtime context：\n{body}"
+
+
+def active_task_plan_runtime_context(metadata: dict[str, Any]) -> str:
+    state = metadata.get("active_task_plan") if isinstance(metadata, dict) else None
+    steps = state.get("steps") if isinstance(state, dict) else None
+    if not isinstance(steps, list) or not steps:
+        return ""
     return (
-        "系统当前本地日期时间（本轮提示词生成时读取，含时区偏移）："
-        f"{current_local_time_text}。"
-        "处理‘今天’‘昨天’‘明天’等相对日期时，必须以这个日期为锚点；"
-        "用户明确提供的绝对日期优先。不要把未来日期或模型猜测当作相对日期的依据。"
+        "进入本轮时的活计划快照：\n"
+        + json.dumps(steps, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def build_append_only_turn_runtime_context(
+    *,
+    session_messages: list[dict[str, Any]],
+    latest_user_content: str,
+    profile: ModelProfile,
+    conversation_id: str,
+    project_context: str,
+    project_id: str,
+    summary_message_count: int,
+    skill_hint: str | None,
+    context_file_paths: list[str],
+    workspace_root: Path,
+    index_path: Path,
+    session_metadata: dict[str, Any],
+) -> str:
+    """Render the immutable per-turn event before appending it and the user message."""
+
+    user_message = {"role": "user", "content": latest_user_content}
+    prospective_messages = [*session_messages, user_message]
+    reference_text = user_file_reference_text(prospective_messages)
+    visible_files = (
+        visible_file_reference_index(
+            workspace_root=workspace_root,
+            index_path=index_path,
+        )
+        if extract_file_names(reference_text)
+        else {}
+    )
+    # Only the new attachment belongs to this turn's event. Earlier attachment
+    # fallbacks are already preserved beside the turns that introduced them.
+    new_image_notice = enrich_image_attachments_for_model(
+        [user_message],
+        profile,
+        workspace_root=workspace_root,
+    ).notice
+    return agent_turn_runtime_context(
+        image_fallback_system_context(new_image_notice),
+        (
+            memory_context_for_reply(query=latest_user_content, project_id=project_id)
+            if runtime_profile_for(conversation_id).proactive_messages
+            else ""
+        ),
+        project_context,
+        recall_runtime_state_context(summary_message_count),
+        build_chat_session_system_context(
+            prospective_messages,
+            skill_hint=skill_hint,
+            context_file_paths=context_file_paths,
+            workspace_root=workspace_root,
+            visible_files=visible_files,
+            index_path=index_path,
+        ),
+        active_task_plan_runtime_context(session_metadata),
+    )
+
+
+def recall_guidance_system_context() -> str:
+    """Stable recall routing guidance; implementation details stay in the tool."""
+
+    return (
+        "需要引用或核对较早的聊天、文件、数字、原话、决定或纠错，而当前上下文不足时，先使用 recall。\n"
+        "项目会话优先 scope=project；无结果时可换同义词重试一次。\n"
+        "用户纠正内容优先，但关键数字和原话仍应以检索到的来源核对。"
+    )
+
+
+def recall_runtime_state_context(summary_message_count: int) -> str:
+    """Expose compaction state only when older messages are actually covered."""
+
+    covered = max(0, int(summary_message_count or 0))
+    if not covered:
+        return ""
+    return f"已有 {covered} 条较早消息被压缩摘要覆盖；需要原文时使用 recall 找回。"
+
+
+def agent_stable_system_context(*, mode: str = "task") -> str:
+    """Stable prompt prefix shared across turns while account and skills stay unchanged."""
+
+    return join_system_context_blocks(
+        agent_system_context(mode=mode),
+        recall_guidance_system_context(),
+        render_chat_skill_catalog(),
     )
 
 
 def memory_context_for_reply(*, query: str, project_id: str = "") -> str:
-    """Inject bounded core memory; leave details to raw-history retrieval."""
     if not load_agent_settings().get("memory_enabled", True):
         return ""
     store = CrossChatMemoryStore(get_session_store())
@@ -2941,7 +3662,7 @@ def memory_context_for_reply(*, query: str, project_id: str = "") -> str:
         return ""
     blocks = [
         "核心记忆（数量固定、低频更新，只包含跨任务稳定信息；"
-        "具体数字、文件、某次讨论和阶段进度必须调用 recall_chat_history 检索原文）："
+        "具体数字、文件、某次讨论和阶段进度必须调用 recall 检索原文）："
     ]
     if account_items:
         blocks.append(
@@ -3169,12 +3890,25 @@ def list_files_payload(root: str, *, limit: int) -> dict[str, Any]:
     if not directory.is_dir():
         raise ValueError(f"Not a directory: {root}")
     files: list[dict[str, Any]] = []
-    for item in directory.rglob("*"):
-        if not item.is_file():
-            continue
-        if not is_file_library_visible(item):
-            continue
-        files.append(file_item_payload(item))
+    # Scan only the subdirectories that can contain visible files.
+    # A full rglob("*") on meet_files traverses 59k+ files (quarantine zones,
+    # ASR audio, execution snapshots) just to discard them.  Targeted walks
+    # cut this to a few hundred stat() calls.
+    VISIBLE_SUBDIRS = (
+        "attachments",
+        "office_workspace",
+        "office_extracts",
+        "realtime_transcripts",
+        "资料项目",
+    )
+    for entry in directory.iterdir():
+        if entry.is_file() and is_file_library_visible(entry):
+            files.append(file_item_payload(entry))
+        elif entry.is_dir() and not entry.name.startswith(("_", ".")):
+            if entry.name in VISIBLE_SUBDIRS or entry.name == "attachments":
+                for item in entry.rglob("*"):
+                    if item.is_file() and is_file_library_visible(item):
+                        files.append(file_item_payload(item))
     files.sort(key=lambda item: (int(item["modified"]), str(item["path"])), reverse=True)
     attachment_index = load_attachment_index(storage_root / "meet_files" / "attachments")
     files = dedupe_file_library_items(files, attachment_index)[:limit]
@@ -3317,14 +4051,97 @@ def meeting_archive_output_payload(raw_path: str) -> dict[str, Any] | None:
     return item
 
 
-def load_conversations_payload() -> dict[str, Any]:
-    """Read the account archive as one consistent, versioned snapshot."""
+def load_conversations_payload(since_revision: int | None = None) -> dict[str, Any]:
+    """Read the account archive as one consistent, versioned snapshot.
+
+    ``since_revision`` lets an already-loaded client ask "anything new?" and get
+    an empty body back: the Friday view polls this endpoint every 30 seconds,
+    and re-shipping the full multi-megabyte archive each time is what made the
+    UI feel slow after every refresh.
+    """
     with CONVERSATION_ARCHIVE_LOCK:
-        items, revision = _read_conversation_archive_snapshot(user_conversation_history_path())
+        path = user_conversation_history_path()
+        items, revision = _read_conversation_archive_snapshot(path)
+        deleted_ids = sorted(_read_conversation_archive_tombstones(path))
+    if since_revision is not None and since_revision == revision:
+        return {
+            "items": [],
+            "deleted_ids": deleted_ids,
+            "revision": revision,
+            "unchanged": True,
+        }
     return {
         "items": hydrate_conversation_archive_projects(items),
+        "deleted_ids": deleted_ids,
         "revision": revision,
     }
+
+
+def load_conversation_index_payload(since_revision: int | None = None) -> dict[str, Any]:
+    """Return the sidebar index without replaying every conversation body.
+
+    Full message timelines and activity traces are deliberately excluded.  A
+    browser only needs those after the user opens one conversation; shipping
+    all of them on every reload made the history list wait on tens of
+    thousands of event rows and a multi-megabyte JSON response.
+    """
+    with CONVERSATION_ARCHIVE_LOCK:
+        path = user_conversation_history_path()
+        items, revision = _read_conversation_archive_snapshot(path)
+        tombstones = _read_conversation_archive_tombstones(path)
+    deleted_ids = sorted(tombstones)
+    if since_revision is not None and since_revision == revision:
+        return {
+            "items": [],
+            "deleted_ids": deleted_ids,
+            "revision": revision,
+            "unchanged": True,
+        }
+    recovered = recover_log_only_conversation_archive_items(items, tombstones=tombstones)
+    return {
+        "items": [conversation_archive_index_item(item) for item in recovered],
+        "deleted_ids": deleted_ids,
+        "revision": revision,
+    }
+
+
+def load_conversation_detail_payload(conversation_id: str) -> dict[str, Any] | None:
+    """Load one authoritative conversation only after the user opens it."""
+    resolved_id = sanitize_conversation_id(conversation_id)
+    if not resolved_id:
+        return None
+    with CONVERSATION_ARCHIVE_LOCK:
+        path = user_conversation_history_path()
+        items, revision = _read_conversation_archive_snapshot(path)
+        tombstones = _read_conversation_archive_tombstones(path)
+    if resolved_id in tombstones:
+        return None
+    item = next(
+        (
+            candidate
+            for candidate in items
+            if isinstance(candidate, dict)
+            and sanitize_conversation_id(candidate.get("id")) == resolved_id
+        ),
+        None,
+    )
+    if item is None:
+        recovered = recover_log_only_conversation_archive_items(items, tombstones=tombstones)
+        item = next(
+            (
+                candidate
+                for candidate in recovered
+                if isinstance(candidate, dict)
+                and sanitize_conversation_id(candidate.get("id")) == resolved_id
+            ),
+            None,
+        )
+    if item is None:
+        return None
+    hydrated = hydrate_conversation_archive_projects([item], recover_orphans=False)
+    if not hydrated:
+        return None
+    return {"item": hydrated[0], "revision": revision}
 
 
 def cascade_delete_conversations(conversation_ids: Iterable[str]) -> dict[str, int]:
@@ -3338,14 +4155,12 @@ def cascade_delete_conversations(conversation_ids: Iterable[str]) -> dict[str, i
     # malicious client includes it in deleted_ids.
     ids.discard(FRIDAY_CONVERSATION_ID)
     if not ids:
-        return {"sessions": 0, "history_index_rows": 0, "memories": 0, "pending_turns": 0}
+        return {"sessions": 0, "memories": 0, "pending_turns": 0}
 
     session_store = get_session_store()
     deleted_sessions = sum(1 for conversation_id in ids if session_store.delete(conversation_id))
-    history_index_rows = delete_conversation_index(
-        session_store.session_dir.parent / "history_search.sqlite3",
-        ids,
-    )
+    # 旧 history_search 索引已随 recall_chat_history 下线而冻结（不再写入），
+    # 删除链路不再维护它；文件留在磁盘上，需要时可手工清理。
     memory_store = CrossChatMemoryStore(session_store)
     deleted_memories = sum(
         memory_store.delete_for_conversation(conversation_id)
@@ -3360,32 +4175,76 @@ def cascade_delete_conversations(conversation_ids: Iterable[str]) -> dict[str, i
     # 账户目录从 session_store 推导，不再另找一次当前用户——这条路径在没有
     # 认证上下文时（比如单测）会抛，而清理不该因此变成噪音。
     data_root = session_store.session_dir.parent
-    deleted_events = 0
-    try:
-        deleted_events = sum(
-            SessionLogStore(session_store.session_dir / "session_log.sqlite3").delete(
-                conversation_id
-            )
-            for conversation_id in ids
+    # 删除不能“尽力而为”后返回成功。事件库或检索库失败必须向上
+    # 抛出，让前端保留条目并明确告知用户没有删干净。
+    deleted_events = sum(
+        SessionLogStore(session_store.session_dir / "session_log.sqlite3").delete(
+            conversation_id
         )
-    except Exception as error:
-        print(f"[delete] 事件日志清理失败：{type(error).__name__}: {error}")
-    deleted_recall = 0
-    try:
-        index = recall_index_for(data_root)
-        for conversation_id in ids:
-            index.forget_source(f"chat:{conversation_id}")
-            deleted_recall += 1
-        index.vacuum_vectors()
-    except Exception as error:
-        print(f"[delete] 检索索引清理失败：{type(error).__name__}: {error}")
+        for conversation_id in ids
+    )
+    index = recall_index_for(data_root)
+    for conversation_id in ids:
+        index.forget_source(f"chat:{conversation_id}")
+    index.vacuum_vectors()
+    deleted_recall = len(ids)
     return {
         "sessions": deleted_sessions,
-        "history_index_rows": history_index_rows,
         "memories": deleted_memories,
         "pending_turns": deleted_pending_turns,
         "log_events": deleted_events,
         "recall_sources": deleted_recall,
+    }
+
+
+def delete_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Synchronously and permanently delete conversations from every store."""
+    raw_ids = payload.get("conversation_ids")
+    if raw_ids is None:
+        raw_id = payload.get("conversation_id")
+        raw_ids = [raw_id] if raw_id is not None else []
+    if not isinstance(raw_ids, list):
+        raise ValueError("conversation_ids must be a list.")
+    conversation_ids = {
+        conversation_id
+        for raw_id in raw_ids
+        if (conversation_id := sanitize_conversation_id(raw_id))
+    }
+    conversation_ids.discard(FRIDAY_CONVERSATION_ID)
+    if not conversation_ids:
+        raise ValueError("没有可删除的对话。")
+
+    path = user_conversation_history_path()
+    with CONVERSATION_ARCHIVE_LOCK:
+        current_items, current_revision = _read_conversation_archive_snapshot(path)
+        tombstones = _read_conversation_archive_tombstones(path)
+        deleted_at = int(time.time())
+        tombstones.update({conversation_id: deleted_at for conversation_id in conversation_ids})
+        next_items = [
+            item
+            for item in current_items
+            if not (
+                isinstance(item, dict)
+                and sanitize_conversation_id(item.get("id")) in conversation_ids
+            )
+        ]
+        next_revision = current_revision + 1
+        _write_conversation_archive_snapshot(
+            path,
+            next_items,
+            next_revision,
+            changed_ids=set(),
+            deleted_ids=conversation_ids,
+            tombstones=tombstones,
+        )
+        cleanup = cascade_delete_conversations(conversation_ids)
+
+    return {
+        "ok": True,
+        "deleted_ids": sorted(conversation_ids),
+        "revision": next_revision,
+        "count": len(next_items),
+        "cleanup": cleanup,
     }
 
 
@@ -3417,6 +4276,7 @@ def save_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
     path = user_conversation_history_path()
     with CONVERSATION_ARCHIVE_LOCK:
         current_items, current_revision = _read_conversation_archive_snapshot(path)
+        tombstones = _read_conversation_archive_tombstones(path)
         if raw_revision is not None and raw_revision != current_revision:
             return {
                 "ok": False,
@@ -3434,6 +4294,27 @@ def save_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 upserts or [],
                 deleted_ids or [],
             )
+        requested_deleted_ids = {
+            conversation_id
+            for raw_id in deleted_ids or []
+            if (conversation_id := sanitize_conversation_id(raw_id))
+        }
+        requested_deleted_ids.discard(FRIDAY_CONVERSATION_ID)
+        deleted_at = int(time.time())
+        tombstones.update(
+            {conversation_id: deleted_at for conversation_id in requested_deleted_ids}
+        )
+        # A stale tab may still hold a complete pre-delete snapshot. Once an id
+        # has a server-side tombstone, no save/upsert path may recreate it.
+        next_items = [
+            item
+            for item in next_items
+            if not (
+                isinstance(item, dict)
+                and sanitize_conversation_id(item.get("id")) in tombstones
+            )
+        ]
+        next_items = [protect_conversation_archive_item(item) for item in next_items]
 
         next_revision = current_revision + 1
         changed_ids = (
@@ -3451,7 +4332,6 @@ def save_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
             for item in next_items
             if isinstance(item, dict) and sanitize_conversation_id(item.get("id"))
         }
-        requested_deleted_ids = {sanitize_conversation_id(raw_id) for raw_id in deleted_ids or []}
         cascade_deleted_ids = (current_ids - next_ids) | requested_deleted_ids
         _write_conversation_archive_snapshot(
             path,
@@ -3459,6 +4339,7 @@ def save_conversations_payload(payload: dict[str, Any]) -> dict[str, Any]:
             next_revision,
             changed_ids=changed_ids,
             deleted_ids=cascade_deleted_ids,
+            tombstones=tombstones,
         )
         cascade_delete_conversations(cascade_deleted_ids)
 
@@ -3506,6 +4387,27 @@ def _read_conversation_archive_snapshot(path: Path) -> tuple[list[Any], int]:
     return [], 0
 
 
+def _read_conversation_archive_tombstones(path: Path) -> dict[str, int]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    raw_tombstones = data.get("tombstones") if isinstance(data, dict) else None
+    if not isinstance(raw_tombstones, dict):
+        return {}
+    return {
+        conversation_id: int(deleted_at)
+        for raw_id, deleted_at in raw_tombstones.items()
+        if (conversation_id := sanitize_conversation_id(raw_id))
+        and conversation_id != FRIDAY_CONVERSATION_ID
+        and isinstance(deleted_at, int)
+        and not isinstance(deleted_at, bool)
+        and deleted_at > 0
+    }
+
+
 def _write_conversation_archive_snapshot(
     path: Path,
     items: list[Any],
@@ -3513,6 +4415,7 @@ def _write_conversation_archive_snapshot(
     *,
     changed_ids: set[str],
     deleted_ids: set[str],
+    tombstones: dict[str, int] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized_items: list[dict[str, Any]] = []
@@ -3544,6 +4447,7 @@ def _write_conversation_archive_snapshot(
         "revision": revision,
         "order": [str(item["id"]) for item in normalized_items],
         "items": [_conversation_archive_manifest_item(item) for item in normalized_items],
+        "tombstones": dict(sorted((tombstones or {}).items())),
         "saved_at": int(time.time()),
     }
     _write_json_atomically(path, payload)
@@ -4465,32 +5369,242 @@ def sanitize_conversation_archive_items(items: list[Any]) -> list[Any]:
     return [sanitize_conversation_archive_item(item) for item in items]
 
 
-def hydrate_conversation_archive_projects(items: list[Any]) -> list[Any]:
-    """Restore a missing display-level project id from the durable session metadata.
-
-    The session metadata is the source of truth used for project-scoped agent
-    context.  Older browser archives can be missing ``projectId`` after an
-    interrupted first-turn title save; returning a hydrated copy makes those
-    chats visible again without touching their message content.
-    """
+def recover_log_only_conversation_archive_items(
+    items: list[Any],
+    *,
+    tombstones: dict[str, int] | None = None,
+) -> list[Any]:
+    """Append recoverable log-only conversations without touching known items."""
     hydrated = sanitize_conversation_archive_items(items)
-    session_dir = user_conversation_dir() / "sessions"
+    by_id = {
+        sanitize_conversation_id(item.get("id")): item
+        for item in hydrated
+        if isinstance(item, dict) and sanitize_conversation_id(item.get("id"))
+    }
+    deleted = (
+        tombstones
+        if tombstones is not None
+        else _read_conversation_archive_tombstones(user_conversation_history_path())
+    )
+    try:
+        log_ids = get_session_log_store().list_sessions()
+    except Exception:
+        log_ids = []
+    for conversation_id in log_ids:
+        if conversation_id in deleted or conversation_id in by_id:
+            continue
+        try:
+            orphan_log = get_session_log_store().load_live(conversation_id)
+            orphan_timeline = orphan_log.derive_timeline()
+        except Exception:
+            continue
+        roles = {str(message.get("role") or "") for message in orphan_timeline}
+        # A log-only test fixture, a prompt that never got an answer or an
+        # internal lifecycle record is not a recoverable chat card.  Completed
+        # human dialogue is.  This keeps the repair from exposing internal ids
+        # such as ``conversation-1`` in the sidebar.
+        if not {"user", "assistant"}.issubset(roles):
+            continue
+        metadata = orphan_log.derive_metadata()
+        first_user = next(
+            (
+                str(message.get("content") or "").strip()
+                for message in orphan_timeline
+                if message.get("role") == "user" and str(message.get("content") or "").strip()
+            ),
+            "",
+        )
+        recovered_title = str(metadata.get("title") or "").strip()
+        if not recovered_title:
+            recovered_title = re.sub(r"\s+", " ", first_user).strip()[:42] or conversation_id
+        item = {
+            "id": conversation_id,
+            "title": recovered_title,
+            "group": "最近",
+            "messages": orphan_timeline,
+        }
+        hydrated.append(item)
+        by_id[conversation_id] = item
+    return hydrated
+
+
+def conversation_archive_index_item(item: Any) -> Any:
+    """Keep only fields needed to render and manage the history sidebar."""
+    if not isinstance(item, dict):
+        return item
+    allowed = (
+        "id",
+        "title",
+        "group",
+        "pinned",
+        "projectId",
+        "activeTurnId",
+        "activeTurnStatus",
+        "acknowledgedTaskKey",
+        "unseenTaskKey",
+    )
+    compact = {key: item[key] for key in allowed if key in item}
+    messages = item.get("messages")
+    compact["messageCount"] = len(messages) if isinstance(messages, list) else 0
+    return compact
+
+
+def hydrate_conversation_archive_projects(
+    items: list[Any],
+    *,
+    recover_orphans: bool = True,
+) -> list[Any]:
+    """Project complete browser conversations from durable runtime facts."""
+    hydrated = (
+        recover_log_only_conversation_archive_items(items)
+        if recover_orphans
+        else sanitize_conversation_archive_items(items)
+    )
+
     for item in hydrated:
-        if not isinstance(item, dict) or str(item.get("projectId") or "").strip():
+        if not isinstance(item, dict):
             continue
         conversation_id = sanitize_conversation_id(str(item.get("id") or ""))
         if not conversation_id:
             continue
-        session_path = session_dir / f"{conversation_id}.json"
         try:
-            session_data = json.loads(session_path.read_text(encoding="utf-8"))
-            metadata = session_data.get("metadata") if isinstance(session_data, dict) else None
-            project_id = str(metadata.get("project_id") or "").strip() if isinstance(metadata, dict) else ""
-            if PROJECT_ID_PATTERN.fullmatch(project_id):
-                item["projectId"] = project_id
-        except (OSError, ValueError, json.JSONDecodeError):
+            session = get_conversation_repository().load(
+                conversation_id,
+                recover_interrupted=False,
+            )
+            timeline = get_conversation_repository().timeline(conversation_id)
+        except Exception:
             continue
+        project_id = str(session.metadata.get("project_id") or "").strip()
+        if PROJECT_ID_PATTERN.fullmatch(project_id):
+            item["projectId"] = project_id
+        if not str(item.get("title") or "").strip() or item.get("title") == conversation_id:
+            first_user = next(
+                (
+                    str(message.get("content") or "").strip()
+                    for message in timeline
+                    if message.get("role") == "user"
+                    and str(message.get("content") or "").strip()
+                ),
+                "",
+            )
+            item["title"] = str(
+                session.metadata.get("title")
+                or re.sub(r"\s+", " ", first_user).strip()[:42]
+                or conversation_id
+            )
+        if timeline:
+            item["messages"] = [
+                {
+                    "id": str(message.get("id") or ""),
+                    "role": str(message.get("role") or "assistant"),
+                    "content": message.get("content") or "",
+                    "channel": str(message.get("channel") or "chat"),
+                    "createdAt": int(message.get("created_at") or 0),
+                    "read": bool(message.get("read", True)),
+                }
+                for message in timeline
+            ]
+        if session.summary:
+            item["contextSummary"] = session.summary
+            item["contextSummaryMessageCount"] = session.summary_message_count
     return hydrated
+
+
+def _display_messages_from_runtime(messages: list[Any]) -> list[dict[str, Any]]:
+    display: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
+            continue
+        if role == "user" and looks_like_internal_tool_image_message(content):
+            continue
+        display.append({"role": role, "content": content})
+    return display
+
+
+def _conversation_runtime_display(
+    conversation_id: str,
+) -> tuple[list[dict[str, Any]], str, int] | None:
+    try:
+        repository = get_conversation_repository()
+        session = repository.load(
+            conversation_id,
+            recover_interrupted=False,
+        )
+        timeline = repository.timeline(conversation_id)
+    except Exception:
+        return None
+    return (
+        _display_messages_from_runtime(timeline or session.messages),
+        str(getattr(session, "summary", "") or ""),
+        int(getattr(session, "summary_message_count", 0) or 0),
+    )
+
+
+def protect_conversation_archive_item(item: Any) -> Any:
+    """Refuse to let a short browser snapshot wipe a complete runtime session.
+
+    A restarted or stale tab can hold only a bootstrap/error shell and submit it
+    after the agent has already completed substantial work. The runtime session
+    is authoritative for every conversation, not only Friday. A real rewind
+    shrinks the runtime session first, so an archive with the same shorter count
+    still passes normally.
+    """
+    if not isinstance(item, dict):
+        return item
+    conversation_id = sanitize_conversation_id(item.get("id"))
+    if not conversation_id:
+        return item
+    runtime = _conversation_runtime_display(conversation_id)
+    if runtime is None:
+        return item
+    display_messages, summary, summary_count = runtime
+    if not display_messages:
+        return item
+    messages = item.get("messages")
+    if isinstance(messages, list):
+        incoming_signatures = [_conversation_message_signature(message) for message in messages]
+        runtime_signatures = [_conversation_message_signature(message) for message in display_messages]
+        if incoming_signatures == runtime_signatures:
+            return item
+        active_status = str(item.get("activeTurnStatus") or "")
+        # During a live turn the browser may own one trailing draft that is not
+        # yet a durable assistant/message event. Preserve it only when every
+        # durable message is an exact prefix; stale or duplicated prefixes never
+        # outrank the append-only timeline merely because they are longer.
+        if (
+            active_status in {"running", "waiting_approval"}
+            and len(incoming_signatures) >= len(runtime_signatures)
+            and incoming_signatures[: len(runtime_signatures)] == runtime_signatures
+        ):
+            return item
+    rebuilt = dict(item)
+    rebuilt["id"] = conversation_id
+    rebuilt["messages"] = display_messages
+    if summary:
+        rebuilt["contextSummary"] = summary
+        rebuilt["contextSummaryMessageCount"] = summary_count
+    return rebuilt
+
+
+def _conversation_message_signature(message: Any) -> tuple[str, str, str]:
+    if not isinstance(message, dict):
+        return ("", str(message), "")
+    content = message.get("content")
+    if not isinstance(content, str):
+        try:
+            content = json.dumps(content, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            content = str(content)
+    return (
+        str(message.get("role") or ""),
+        content,
+        str(message.get("channel") or "chat"),
+    )
 
 
 def sanitize_conversation_archive_item(item: Any) -> Any:
@@ -4499,7 +5613,26 @@ def sanitize_conversation_archive_item(item: Any) -> Any:
     clean = dict(item)
     messages = clean.get("messages")
     if isinstance(messages, list):
-        clean["messages"] = [sanitize_conversation_message(message) for message in messages]
+        sanitized_messages: list[Any] = []
+        for message in messages:
+            sanitized = sanitize_conversation_message(message)
+            if sanitized is None:
+                continue
+            previous = sanitized_messages[-1] if sanitized_messages else None
+            legacy_duplicate = bool(
+                isinstance(previous, dict)
+                and isinstance(sanitized, dict)
+                and previous.get("role") == "user"
+                and sanitized.get("role") == "user"
+                and previous.get("content") == sanitized.get("content")
+                and not str(previous.get("id") or "").strip()
+                and not str(sanitized.get("id") or "").strip()
+                and not previous.get("createdAt")
+                and not sanitized.get("createdAt")
+            )
+            if not legacy_duplicate:
+                sanitized_messages.append(sanitized)
+        clean["messages"] = sanitized_messages
     activities = clean.get("activities")
     if isinstance(activities, dict):
         clean["activities"] = {
@@ -4513,10 +5646,62 @@ def sanitize_conversation_message(message: Any) -> Any:
         return message
     clean = dict(message)
     content = clean.get("content")
+    if (
+        clean.get("role") == "user"
+        and isinstance(content, str)
+        and looks_like_internal_tool_image_message(content)
+    ):
+        return None
     if isinstance(content, str) and contains_tool_call_markup(content):
         cleaned_content = strip_tool_call_markup(content).strip()
         clean["content"] = cleaned_content or "工具调用过程已隐藏。请重新发送上一条请求继续。"
+    artifacts = clean.get("artifacts")
+    if isinstance(artifacts, list):
+        sanitized_artifacts: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            path = normalize_workspace_reference_path(
+                str(artifact.get("path") or ""),
+                workspace_root=account_workspace_root(),
+            )
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            sanitized_artifacts.append(
+                {
+                    "artifact_id": str(artifact.get("artifact_id") or path),
+                    "path": path,
+                    "title": str(artifact.get("title") or Path(path).name),
+                    "kind": str(artifact.get("kind") or Path(path).suffix.lstrip(".") or "file"),
+                    "status": str(artifact.get("status") or "created"),
+                    "verified": bool(artifact.get("verified", False)),
+                    "size_bytes": max(0, int(artifact.get("size_bytes") or 0)),
+                }
+            )
+        clean["artifacts"] = sanitized_artifacts
+    else:
+        clean.pop("artifacts", None)
     return clean
+
+
+def looks_like_internal_tool_image_message(content: Any) -> bool:
+    """Recognize the old stringified read_file image bridge.
+
+    This is deliberately narrow: ordinary user prose mentioning Base64 must
+    remain visible.  Only the harness marker plus a data-URL image block is an
+    internal message that should never appear in chat history.
+    """
+
+    text = str(content or "").strip()
+    if not text.startswith("[") or "以下是刚才用 read_file 载入的图片。" not in text[:240]:
+        return False
+    return (
+        ("'type': 'image_url'" in text or '"type": "image_url"' in text)
+        and "data:image/" in text
+        and ";base64," in text
+    )
 
 
 def sanitize_activity_record(record: Any) -> Any:
@@ -4525,8 +5710,80 @@ def sanitize_activity_record(record: Any) -> Any:
     clean = dict(record)
     events = clean.get("events")
     if isinstance(events, list):
-        clean["events"] = [sanitize_activity_event(event) for event in events]
+        clean["events"] = project_activity_events(events)
     return clean
+
+
+def project_activity_events(events: Sequence[Any]) -> list[Any]:
+    """Project append-only lifecycle snapshots into one UI item per stable id.
+
+    Turn files retain every update for audit and recovery. Browser archives are
+    a human-facing projection: showing all snapshots as separate cards made a
+    single command look like repeated sandbox creation after refresh.
+    """
+
+    projected: list[Any] = []
+    positions: dict[str, int] = {}
+    for raw_event in events:
+        event = sanitize_activity_event(raw_event)
+        if not isinstance(event, dict):
+            projected.append(event)
+            continue
+        event_id = str(event.get("id") or "").strip()
+        if not event_id or event_id not in positions:
+            if event_id:
+                positions[event_id] = len(projected)
+            projected.append(event)
+            continue
+        index = positions[event_id]
+        current = projected[index]
+        if not isinstance(current, dict):
+            projected.append(event)
+            continue
+        projected[index] = merge_activity_snapshot(current, event)
+    return projected
+
+
+def merge_activity_snapshot(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for key, value in incoming.items():
+        if value is not None:
+            merged[key] = value
+    merged["event"] = "activity"
+    if not str(incoming.get("content") or "") and str(current.get("content") or ""):
+        merged["content"] = current["content"]
+    # Activity updates are snapshots of one stable event.  Recovery/status
+    # snapshots can legitimately omit reasoning, but an omission must not
+    # erase reasoning that an earlier stream fragment already persisted.
+    if not str(incoming.get("reasoning_content") or "").strip() and str(
+        current.get("reasoning_content") or ""
+    ).strip():
+        merged["reasoning_content"] = current["reasoning_content"]
+
+    phase_rank = {"thinking": 0, "action": 1, "observation": 2, "complete": 3, "error": 4}
+    current_phase = str(current.get("phase") or "")
+    incoming_phase = str(incoming.get("phase") or "")
+    if phase_rank.get(current_phase, -1) >= phase_rank.get(incoming_phase, -1):
+        merged["phase"] = current_phase
+
+    current_status = str(current.get("command_status") or "")
+    incoming_status = str(incoming.get("command_status") or "")
+    if "error" in {current_status, incoming_status}:
+        merged["command_status"] = "error"
+    elif incoming_status == "running" and current_status and current_status != "running":
+        merged["command_status"] = current_status
+
+    terminal_execution_statuses = {"succeeded", "failed", "cancelled", "conflicted"}
+    current_execution_status = str(current.get("execution_status") or "")
+    incoming_execution_status = str(incoming.get("execution_status") or "")
+    if current_execution_status in terminal_execution_statuses:
+        merged["execution_status"] = current_execution_status
+    elif incoming_execution_status in terminal_execution_statuses:
+        merged["execution_status"] = incoming_execution_status
+
+    if "command" in {current.get("activity_type"), incoming.get("activity_type")}:
+        merged["activity_type"] = "command"
+    return merged
 
 
 def sanitize_activity_event(event: Any) -> Any:
@@ -4538,6 +5795,27 @@ def sanitize_activity_event(event: Any) -> Any:
         if isinstance(value, str) and contains_tool_call_markup(value):
             cleaned_value = strip_tool_call_markup(value).strip()
             clean[key] = cleaned_value or "工具调用过程已隐藏。"
+    # Repair the old impossible wording in archived turns. Before this fix,
+    # non-token pressure (serialized bytes/tool results) still rendered as
+    # "token exceeded". The legacy event did not retain the two exact pressure
+    # values, so say that plainly instead of inventing them.
+    detail = str(clean.get("detail") or "")
+    legacy_compaction = re.search(
+        r"估算上下文\s+([\d,]+)\s+tokens，已超过\s+([\d,]+)\s+tokens",
+        detail,
+    )
+    if legacy_compaction:
+        before_tokens = int(legacy_compaction.group(1).replace(",", ""))
+        trigger_tokens = int(legacy_compaction.group(2).replace(",", ""))
+        if before_tokens < trigger_tokens:
+            clean["detail"] = (
+                f"压缩前约 {before_tokens:,} tokens，低于 {trigger_tokens:,} token 安全线。"
+                "该旧记录由会话体积或历史工具结果安全线触发；当时未保存细分数值。"
+                "分点摘要已生成，原始记录仍保留在会话存档中。"
+            )
+            clean["context_pre_compaction_tokens"] = before_tokens
+            clean["context_trigger_tokens"] = trigger_tokens
+            clean["context_pressure_reasons"] = ["legacy_non_token_pressure"]
     return clean
 
 
@@ -4674,10 +5952,23 @@ def is_attachment_file(path: Path, *, workspace_root: Path | None = None) -> boo
     return len(parts) >= 3 and parts[0] == "meet_files" and parts[1] == "attachments"
 
 
+def resolve_user_visible_file(path: str) -> tuple[Path, Path]:
+    """Resolve ordinary workspace files and account-private report files safely."""
+
+    raw_path = str(path or "").strip().replace("\\", "/")
+    if raw_path == "work_reports" or raw_path.startswith("work_reports/"):
+        storage_root = user_data_dir().resolve()
+        file_path = WorkspaceFiles(storage_root).resolve(raw_path)
+        report_root = (storage_root / "work_reports").resolve()
+        if not file_path.is_relative_to(report_root):
+            raise ValueError(f"Invalid work report path: {path}")
+        return file_path, storage_root
+    storage_root = account_workspace_root().resolve()
+    return WorkspaceFiles(storage_root).resolve(raw_path), storage_root
+
+
 def read_file_payload(path: str, *, max_chars: int) -> dict[str, Any]:
-    storage_root = account_workspace_root()
-    workspace = WorkspaceFiles(storage_root)
-    file_path = workspace.resolve(path)
+    file_path, storage_root = resolve_user_visible_file(path)
     if not file_path.is_file():
         raise ValueError(f"Not a file: {path}")
     stat = file_path.stat()
@@ -5870,7 +7161,9 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         enabled_skill_ids=enabled_skill_ids(),
         file_change_handler=update_file_reference_index,
         recall_data_root=user_data_dir(),
+        approval_rules_path=remembered_approvals_path(user_data_dir()),
         agent_reminder_source=pending_agent_reminders,
+        extra_read_roots=agent_extra_read_roots(),
     )
     max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
     max_steps = max(1, min(max_steps, 60))
@@ -5880,11 +7173,12 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         tools=tools,
         workspace_root=account_workspace_root(),
         max_steps=max_steps,
-        extra_system_context=agent_system_context(),
+        auto_approve=bool(load_agent_settings().get("auto_approve", True)),
+        extra_system_context=agent_stable_system_context(),
     )
     result = agent.run_messages(
         [{"role": "user", "content": goal}],
-        system_context=agent_turn_time_context(),
+        system_context=agent_turn_runtime_context(),
     )
     return {"result": asdict(result)}
 
@@ -6066,6 +7360,7 @@ def rewind_session_or_rebuild_from_display(
 def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     registry = load_registry()
     profile = registry.get(str(payload.get("profile") or registry.default_profile))
+    context_trigger_tokens = profile_context_trigger_tokens(profile)
     client = OpenAICompatibleClient()
     messages = sanitize_chat_messages(payload.get("messages"))
     if not messages or messages[-1]["role"] != "user":
@@ -6086,7 +7381,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
     max_steps = max(1, min(max_steps, 60))
     reasoning_effort = normalize_reasoning_effort(payload.get("reasoning_effort"))
-    auto_approve = payload.get("auto_approve") is True
+    auto_approve = bool(load_agent_settings().get("auto_approve", True))
     debug_trace = DebugTrace(
         WORKSPACE_ROOT,
         conversation_id=conversation_id,
@@ -6105,7 +7400,12 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     store = get_session_store()
-    session = store.load(conversation_id)
+    repository = get_conversation_repository()
+    session = repository.load(
+        conversation_id,
+        display_messages=messages,
+        exclude_last_user=True,
+    )
     rewind_user_ordinal = sanitize_rewind_user_message_ordinal(payload)
     if rewind_user_ordinal is not None:
         get_turn_store().discard_pending_for_conversation(conversation_id)
@@ -6118,6 +7418,8 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     )
     if not bootstrapped:
         bootstrapped = store.bootstrap_from_display_messages(session, messages, exclude_last_user=True)
+    if rewind_user_ordinal is not None:
+        repository.checkpoint(session)
     if not session.summary:
         session.summary = sanitize_conversation_summary(payload.get("conversation_summary"))
         session.summary_message_count = sanitize_summary_message_count(
@@ -6148,7 +7450,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "context_summary_message_count": session.summary_message_count,
                 "context_compacted": False,
             }
-        store.save(session)
+        repository.checkpoint(session)
         content = compact_command_result(prepared_context)
         return {
             "message": {"role": "assistant", "content": content},
@@ -6161,9 +7463,27 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "context_summary": session.summary,
             "context_summary_message_count": session.summary_message_count,
             "context_compacted": prepared_context.compacted,
-            "context_estimated_tokens": prepared_context.estimated_tokens,
+            **context_compaction_metrics(prepared_context, context_trigger_tokens),
         }
-    store.append_user_message(session, messages[-1]["content"])
+    turn_runtime_context = build_append_only_turn_runtime_context(
+        session_messages=session.messages,
+        latest_user_content=messages[-1]["content"],
+        profile=profile,
+        conversation_id=conversation_id,
+        project_context=project_context,
+        project_id=project_id,
+        summary_message_count=session.summary_message_count,
+        skill_hint=skill_hint,
+        context_file_paths=context_file_paths,
+        workspace_root=storage_root,
+        index_path=file_index_path,
+        session_metadata=session.metadata,
+    )
+    store.append_user_message(
+        session,
+        messages[-1]["content"],
+        runtime_context=turn_runtime_context,
+    )
     try:
         prepared_context = prepare_session_memory(
             client,
@@ -6172,7 +7492,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
         )
     except ContextCompactionError as error:
-        store.save(session)
+        repository.checkpoint(session)
         debug_trace.emit("automatic_compaction_failed", error=str(error))
         content = f"当前请求未执行：{error}"
         return {
@@ -6187,7 +7507,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "context_summary_message_count": session.summary_message_count,
             "context_compacted": False,
         }
-    store.save(session)
+    repository.checkpoint(session)
     debug_trace.emit(
         "session_prepared",
         bootstrapped=bootstrapped,
@@ -6197,6 +7517,12 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         summary_message_count=session.summary_message_count,
         compacted=prepared_context.compacted,
         estimated_tokens=prepared_context.estimated_tokens,
+        post_compaction_estimated_tokens=prepared_context.post_compaction_estimated_tokens,
+        serialized_bytes=prepared_context.serialized_bytes,
+        post_compaction_serialized_bytes=prepared_context.post_compaction_serialized_bytes,
+        tool_result_chars=prepared_context.tool_result_chars,
+        post_compaction_tool_result_chars=prepared_context.post_compaction_tool_result_chars,
+        pressure_reasons=list(prepared_context.pressure_reasons),
     )
 
     tools = build_default_tools(
@@ -6218,72 +7544,55 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         file_change_handler=update_file_reference_index,
         recall_data_root=user_data_dir(),
+        approval_rules_path=remembered_approvals_path(user_data_dir()),
         agent_reminder_source=pending_agent_reminders,
-        sandbox_auto_allow=auto_approve,
+        sandbox_auto_allow=True,
+        extra_read_roots=agent_extra_read_roots(),
     )
+
+    image_preparation = enrich_image_attachments_for_model(
+        list(prepared_context.messages),
+        profile,
+        workspace_root=storage_root,
+    )
+    # 日志与归档只存人可读的路径，base64 绝不落盘：它会把事件日志撑到几十兆，
+    # 还会把检索索引污染成一个几百万 token 的怪节点。图片在装配请求那一刻才附上。
+    runtime_messages = dehydrate_model_messages(image_preparation.messages)
+    nonstream_runtime = ConversationRuntime.from_messages(runtime_messages, session_id=conversation_id)
+    nonstream_base = len(nonstream_runtime.log.derive_transcript())
+    nonstream_mirror = DurableTurnMirror(
+        get_session_log_store(),
+        conversation_id,
+        skip_before_seq=nonstream_runtime.log.seq,
+    )
+    nonstream_runtime.writer = nonstream_mirror
+    nonstream_mirror.record_prompt(latest_user_message_content(nonstream_runtime))
+    nonstream_turn_id = f"sync-{uuid.uuid4().hex}"
+    nonstream_runtime.begin_turn(nonstream_turn_id, route="/api/agent/chat")
+    # Land the prompt and turn boundary before spending model/tool work. A
+    # process crash can then be recovered from the log instead of a browser
+    # draft or a best-effort JSON cache.
+    nonstream_mirror.flush()
 
     def persist_task_plan(plan: list[dict[str, str]], explanation: str) -> None:
         plan_state = {
             "steps": plan,
             "explanation": explanation,
             "updated_at": int(time.time()),
+            "turn_id": nonstream_turn_id,
         }
         session.metadata["active_task_plan"] = plan_state
-        store.save(session)
+        nonstream_runtime.record_metadata_update({"active_task_plan": plan_state})
+        nonstream_mirror.flush()
         debug_trace.emit("task_plan_updated", plan=plan, explanation=explanation)
-
-    reference_text = user_file_reference_text(session.messages)
-    visible_files = (
-        visible_file_reference_index(
-            workspace_root=storage_root,
-            index_path=file_index_path,
-        )
-        if extract_file_names(reference_text)
-        else {}
-    )
-    conversation_image_paths = refresh_conversation_image_paths(
-        session,
-        workspace_root=storage_root,
-    )
-    store.save(session)
-    image_preparation = enrich_image_attachments_for_model(
-        list(prepared_context.messages),
-        profile,
-        workspace_root=storage_root,
-        conversation_image_paths=conversation_image_paths,
-    )
-    # 日志与归档只存人可读的路径，base64 绝不落盘：它会把事件日志撑到几十兆，
-    # 还会把检索索引污染成一个几百万 token 的怪节点。图片在装配请求那一刻才附上。
-    runtime_messages = dehydrate_model_messages(image_preparation.messages)
 
     def attach_images_at_request_time(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return enrich_image_attachments_for_model(
             messages,
             profile,
             workspace_root=storage_root,
-            conversation_image_paths=conversation_image_paths,
         ).messages
 
-    runtime_system_context = (
-        prepared_context.system_context
-        + image_fallback_system_context(image_preparation.notice)
-        + agent_turn_time_context()
-        + (
-            memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
-            if runtime_profile_for(conversation_id).proactive_messages
-            else ""
-        )
-        + project_context
-        + render_history_recall_system_context(session.summary_message_count, project_id=project_id)
-        + build_chat_session_system_context(
-            prepared_context.messages,
-            skill_hint=skill_hint,
-            context_file_paths=context_file_paths,
-            workspace_root=storage_root,
-            visible_files=visible_files,
-            index_path=file_index_path,
-        )
-    )
     runtime_message_count_before_run = len(runtime_messages)
     usage_callback = session_usage_callback(
         session=session,
@@ -6303,17 +7612,21 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         plan_update_callback=persist_task_plan,
         usage_callback=usage_callback,
         initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
-        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
+        extra_system_context=join_system_context_blocks(
+            agent_stable_system_context(mode=assistant_runtime_mode(conversation_id)),
+            prepared_context.system_context,
+        ),
         reasoning_effort=reasoning_effort,
+        late_task_plan_context=False,
     )
-    nonstream_runtime = ConversationRuntime.from_messages(
-        runtime_messages, session_id=conversation_id
-    )
-    nonstream_base = len(nonstream_runtime.log.derive_transcript())
-    result = agent.run_messages(
-        nonstream_runtime,
-        system_context=runtime_system_context,
-    )
+    try:
+        result = agent.run_messages(nonstream_runtime)
+        nonstream_runtime.end_turn(TURN_END_COMPLETED)
+    except Exception as error:
+        nonstream_runtime.end_turn(TURN_END_FAILED, detail=str(error))
+        nonstream_mirror.flush()
+        raise
+    nonstream_mirror.flush()
     # History now lives in the log the run built, not in the list handed to it.
     session.messages.extend(
         dehydrate_model_messages((result.transcript or [])[nonstream_base:])
@@ -6330,7 +7643,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if session.messages and session.messages[-1].get("role") == "assistant":
         session.messages[-1]["content"] = final_content
     clear_completed_task_plan(session)
-    store.save(session)
+    repository.checkpoint(session)
     if runtime_profile_for(conversation_id).memory_enabled:
         schedule_memory_refresh(
             client=client, profile=profile, session=session, conversation_id=conversation_id,
@@ -6344,7 +7657,13 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         stored_message_count=len(session.messages),
     )
     return {
-        "message": {"role": "assistant", "content": final_content},
+        "message": {
+            "role": "assistant",
+            "content": final_content,
+            "artifacts": [
+                item for item in (result.artifacts or []) if item.get("delivery_ready") is True
+            ],
+        },
         "steps_used": result.steps_used,
         "model_profile": result.model_profile,
         "used_tools": result.used_tools,
@@ -6354,7 +7673,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "context_summary": session.summary,
         "context_summary_message_count": session.summary_message_count,
         "context_compacted": prepared_context.compacted,
-        "context_estimated_tokens": prepared_context.estimated_tokens,
+        **context_compaction_metrics(prepared_context, context_trigger_tokens),
     }
 
 
@@ -6404,7 +7723,8 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     max_steps = int(payload.get("max_steps") or DEFAULT_MAX_STEPS)
     max_steps = max(1, min(max_steps, 60))
     reasoning_effort = normalize_reasoning_effort(payload.get("reasoning_effort"))
-    auto_approve = payload.get("auto_approve") is True
+    context_trigger_tokens = profile_context_trigger_tokens(profile)
+    auto_approve = bool(load_agent_settings().get("auto_approve", True))
     debug_trace = DebugTrace(
         WORKSPACE_ROOT,
         conversation_id=conversation_id,
@@ -6473,7 +7793,13 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     )
 
     store = get_session_store()
-    session = store.load(conversation_id)
+    repository = get_conversation_repository()
+    session = repository.load(
+        conversation_id,
+        display_messages=messages,
+        exclude_last_user=True,
+        recover_interrupted=False,
+    )
     bootstrapped = rewind_session_or_rebuild_from_display(
         store,
         session,
@@ -6483,6 +7809,8 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     )
     if not bootstrapped:
         bootstrapped = store.bootstrap_from_display_messages(session, messages, exclude_last_user=True)
+    if rewind_user_ordinal is not None:
+        repository.checkpoint(session)
     if not session.summary:
         session.summary = sanitize_conversation_summary(payload.get("conversation_summary"))
         session.summary_message_count = sanitize_summary_message_count(
@@ -6497,18 +7825,26 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             profile=profile,
         )
         estimated_tokens = memory_inspection.estimated_tokens
+        explicit_pressure_reasons = context_pressure_reasons(memory_inspection, profile)
         yield turn_runtime.emit(
             {
                 "event": "activity",
                 "phase": "thinking",
                 "title": "正在压缩上下文",
-                "detail": (
-                    "正在调用当前模型生成续作摘要。"
+                "detail": context_compaction_start_detail(
+                    memory_inspection,
+                    explicit_pressure_reasons,
+                    context_trigger_tokens,
                 ),
                 "activity_type": "runtime_summary",
                 "runtime_stage": "compacting",
                 "context_estimated_tokens": estimated_tokens,
-                "context_trigger_tokens": CHAT_SUMMARY_TRIGGER_TOKENS,
+                "context_trigger_tokens": context_trigger_tokens,
+                "context_serialized_bytes": memory_inspection.serialized_bytes,
+                "context_serialized_bytes_trigger": CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES,
+                "context_tool_result_chars": memory_inspection.tool_result_chars,
+                "context_tool_result_chars_trigger": CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS,
+                "context_pressure_reasons": list(explicit_pressure_reasons or ("forced",)),
                 "elapsed_ms": int((time.monotonic() - started_at) * 1000),
             }
         )
@@ -6553,18 +7889,17 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 }
             )
             return
-        store.save(session)
+        repository.checkpoint(session)
         content = compact_command_result(prepared_context)
         yield turn_runtime.emit(
             {
                 "event": "activity",
                 "phase": "thinking",
                 "title": "上下文已整理",
-                "detail": content,
+                "detail": context_compaction_detail(prepared_context, context_trigger_tokens),
                 "activity_type": "runtime_summary",
                 "runtime_stage": "complete",
-                "context_estimated_tokens": prepared_context.estimated_tokens,
-                "context_trigger_tokens": CHAT_SUMMARY_TRIGGER_TOKENS,
+                **context_compaction_metrics(prepared_context, context_trigger_tokens),
                 "elapsed_ms": int((time.monotonic() - started_at) * 1000),
             }
         )
@@ -6579,29 +7914,57 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 "context_summary": session.summary,
                 "context_summary_message_count": session.summary_message_count,
                 "context_compacted": prepared_context.compacted,
-                "context_estimated_tokens": prepared_context.estimated_tokens,
+                **context_compaction_metrics(prepared_context, context_trigger_tokens),
                 **debug_trace.context_payload(),
             }
         )
         return
-    store.append_user_message(session, messages[-1]["content"])
+    turn_runtime_context = build_append_only_turn_runtime_context(
+        session_messages=session.messages,
+        latest_user_content=messages[-1]["content"],
+        profile=profile,
+        conversation_id=conversation_id,
+        project_context=project_context,
+        project_id=project_id,
+        summary_message_count=session.summary_message_count,
+        skill_hint=skill_hint,
+        context_file_paths=context_file_paths,
+        workspace_root=storage_root,
+        index_path=file_index_path,
+        session_metadata=session.metadata,
+    )
+    store.append_user_message(
+        session,
+        messages[-1]["content"],
+        runtime_context=turn_runtime_context,
+    )
     memory_inspection = inspect_session_memory(
         session,
         reserved_tokens=reserved_tokens,
         profile=profile,
     )
     estimated_tokens = memory_inspection.estimated_tokens
-    if estimated_tokens >= CHAT_SUMMARY_TRIGGER_TOKENS:
+    preflight_pressure_reasons = context_pressure_reasons(memory_inspection, profile)
+    if preflight_pressure_reasons:
         yield turn_runtime.emit(
             {
                 "event": "activity",
                 "phase": "thinking",
                 "title": "正在压缩上下文",
-                "detail": "正在压缩上下文，请稍候。",
+                "detail": context_compaction_start_detail(
+                    memory_inspection,
+                    preflight_pressure_reasons,
+                    context_trigger_tokens,
+                ),
                 "activity_type": "runtime_summary",
                 "runtime_stage": "compacting",
                 "context_estimated_tokens": estimated_tokens,
-                "context_trigger_tokens": CHAT_SUMMARY_TRIGGER_TOKENS,
+                "context_trigger_tokens": context_trigger_tokens,
+                "context_serialized_bytes": memory_inspection.serialized_bytes,
+                "context_serialized_bytes_trigger": CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES,
+                "context_tool_result_chars": memory_inspection.tool_result_chars,
+                "context_tool_result_chars_trigger": CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS,
+                "context_pressure_reasons": list(preflight_pressure_reasons),
                 "elapsed_ms": int((time.monotonic() - started_at) * 1000),
             }
         )
@@ -6619,7 +7982,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         yield turn_runtime.cancel_event()
         return
     except ContextCompactionError as error:
-        store.save(session)
+        repository.checkpoint(session)
         debug_trace.emit("automatic_stream_compaction_failed", error=str(error))
         yield turn_runtime.emit(
             {
@@ -6630,7 +7993,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             }
         )
         return
-    store.save(session)
+    repository.checkpoint(session)
     debug_trace.emit(
         "session_prepared",
         bootstrapped=bootstrapped,
@@ -6640,6 +8003,12 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         summary_message_count=session.summary_message_count,
         compacted=prepared_context.compacted,
         estimated_tokens=prepared_context.estimated_tokens,
+        post_compaction_estimated_tokens=prepared_context.post_compaction_estimated_tokens,
+        serialized_bytes=prepared_context.serialized_bytes,
+        post_compaction_serialized_bytes=prepared_context.post_compaction_serialized_bytes,
+        tool_result_chars=prepared_context.tool_result_chars,
+        post_compaction_tool_result_chars=prepared_context.post_compaction_tool_result_chars,
+        pressure_reasons=list(prepared_context.pressure_reasons),
     )
     if bootstrapped:
         yield turn_runtime.emit(
@@ -6657,15 +8026,10 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 "event": "activity",
                 "phase": "thinking",
                 "title": "上下文已整理",
-                "detail": (
-                    f"估算上下文 {prepared_context.estimated_tokens} tokens，已超过 "
-                    f"{CHAT_SUMMARY_TRIGGER_TOKENS} tokens；"
-                    "分点摘要已生成，并作为后续初始上下文。"
-                ),
+                "detail": context_compaction_detail(prepared_context, context_trigger_tokens),
                 "activity_type": "runtime_summary",
                 "runtime_stage": "complete",
-                "context_estimated_tokens": prepared_context.estimated_tokens,
-                "context_trigger_tokens": CHAT_SUMMARY_TRIGGER_TOKENS,
+                **context_compaction_metrics(prepared_context, context_trigger_tokens),
                 "elapsed_ms": int((time.monotonic() - started_at) * 1000),
             }
         )
@@ -6690,9 +8054,35 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         ),
         file_change_handler=update_file_reference_index,
         recall_data_root=user_data_dir(),
+        approval_rules_path=remembered_approvals_path(user_data_dir()),
         agent_reminder_source=pending_agent_reminders,
-        sandbox_auto_allow=auto_approve,
+        sandbox_auto_allow=True,
+        extra_read_roots=agent_extra_read_roots(),
     )
+
+    image_preparation = enrich_image_attachments_for_model(
+        list(prepared_context.messages),
+        profile,
+        workspace_root=storage_root,
+    )
+    # 日志与归档只存人可读的路径，base64 绝不落盘：它会把事件日志撑到几十兆，
+    # 还会把检索索引污染成一个几百万 token 的怪节点。图片在装配请求那一刻才附上。
+    runtime_messages = dehydrate_model_messages(image_preparation.messages)
+    conversation_runtime = ConversationRuntime.from_messages(
+        runtime_messages, session_id=conversation_id
+    )
+    # Seeding drops history that cannot be projected, so the basis for "what
+    # this turn added" has to come from the log, not from the caller's list.
+    transcript_base = len(conversation_runtime.log.derive_transcript())
+    turn_mirror = DurableTurnMirror(
+        get_session_log_store(),
+        conversation_id,
+        skip_before_seq=conversation_runtime.log.seq,
+    )
+    conversation_runtime.writer = turn_mirror
+    turn_mirror.record_prompt(latest_user_message_content(conversation_runtime))
+    conversation_runtime.begin_turn(turn_runtime.turn_id, route="/api/agent/chat-stream")
+    turn_mirror.flush()
 
     def persist_stream_task_plan(plan: list[dict[str, str]], explanation: str) -> None:
         plan_state = {
@@ -6702,62 +8092,21 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             "turn_id": turn_runtime.turn_id,
         }
         session.metadata["active_task_plan"] = plan_state
-        store.save(session)
+        # Plan updates belong to this turn. Sending them through the turn's
+        # mirror keeps one ordered writer instead of checkpointing the same
+        # conversation behind the mirror's back.
+        conversation_runtime.record_metadata_update({"active_task_plan": plan_state})
+        turn_mirror.flush()
         get_turn_store().update_metadata(turn_runtime.turn_id, {"task_plan": plan_state})
         debug_trace.emit("task_plan_updated", plan=plan, explanation=explanation)
-
-    reference_text = user_file_reference_text(session.messages)
-    visible_files = (
-        visible_file_reference_index(
-            workspace_root=storage_root,
-            index_path=file_index_path,
-        )
-        if extract_file_names(reference_text)
-        else {}
-    )
-    conversation_image_paths = refresh_conversation_image_paths(
-        session,
-        workspace_root=storage_root,
-    )
-    store.save(session)
-    image_preparation = enrich_image_attachments_for_model(
-        list(prepared_context.messages),
-        profile,
-        workspace_root=storage_root,
-        conversation_image_paths=conversation_image_paths,
-    )
-    # 日志与归档只存人可读的路径，base64 绝不落盘：它会把事件日志撑到几十兆，
-    # 还会把检索索引污染成一个几百万 token 的怪节点。图片在装配请求那一刻才附上。
-    runtime_messages = dehydrate_model_messages(image_preparation.messages)
 
     def attach_images_at_request_time(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return enrich_image_attachments_for_model(
             messages,
             profile,
             workspace_root=storage_root,
-            conversation_image_paths=conversation_image_paths,
         ).messages
 
-    runtime_system_context = (
-        prepared_context.system_context
-        + image_fallback_system_context(image_preparation.notice)
-        + agent_turn_time_context()
-        + (
-            memory_context_for_reply(query=messages[-1]["content"], project_id=project_id)
-            if runtime_profile_for(conversation_id).proactive_messages
-            else ""
-        )
-        + project_context
-        + render_history_recall_system_context(session.summary_message_count, project_id=project_id)
-        + build_chat_session_system_context(
-            prepared_context.messages,
-            skill_hint=skill_hint,
-            context_file_paths=context_file_paths,
-            workspace_root=storage_root,
-            visible_files=visible_files,
-            index_path=file_index_path,
-        )
-    )
     runtime_message_count_before_run = len(runtime_messages)
     usage_callback = session_usage_callback(
         session=session,
@@ -6774,29 +8123,21 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         max_steps=max_steps,
         debug_trace=debug_trace,
         cancel_check=turn_runtime.cancelled,
-        pending_messages=turn_runtime.drain_messages,
         request_transform=attach_images_at_request_time,
         reasoning_effort=reasoning_effort,
         auto_approve=auto_approve,
         plan_update_callback=persist_stream_task_plan,
         usage_callback=usage_callback,
         initial_task_plan=(session.metadata.get("active_task_plan") or {}).get("steps", []),
-        extra_system_context=agent_system_context(mode=assistant_runtime_mode(conversation_id)),
+        extra_system_context=join_system_context_blocks(
+            agent_stable_system_context(mode=assistant_runtime_mode(conversation_id)),
+            prepared_context.system_context,
+        ),
+        late_task_plan_context=False,
     )
-    conversation_runtime = ConversationRuntime.from_messages(
-        runtime_messages, session_id=conversation_id
-    )
-    # Seeding drops history that cannot be projected, so the basis for "what
-    # this turn added" has to come from the log, not from the caller's list.
-    transcript_base = len(conversation_runtime.log.derive_transcript())
-    turn_mirror = DurableTurnMirror(
-        get_session_log_store(),
-        conversation_id,
-        skip_before_seq=conversation_runtime.log.seq,
-    )
-    conversation_runtime.writer = turn_mirror
-    turn_mirror.record_prompt(latest_user_message_content(conversation_runtime))
-    conversation_runtime.begin_turn(turn_runtime.turn_id, route="/api/agent/chat-stream")
+    inbox_adapter = ExternalEventInboxAdapter(turn_runtime, conversation_runtime)
+    agent.pending_messages = inbox_adapter.take_messages
+    agent.pending_messages_committed = inbox_adapter.acknowledge
 
     def persist_runtime_history() -> None:
         """Write back everything the turn recorded, on every exit path.
@@ -6814,7 +8155,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         session.messages.extend(dehydrate_model_messages(transcript[transcript_base:]))
         session.summary = prepared_context.summary
         session.summary_message_count = prepared_context.summary_message_count
-        store.save(session)
+        repository.checkpoint(session)
         # 让检索索引跟上这一轮。后台线程：索引写入不许挡住回复。
         #
         # 这段包在 try 里，是因为它跑在 persist_runtime_history 里——每条退出路径
@@ -6832,6 +8173,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             print(f"[recall] 本轮索引未能启动：{type(error).__name__}: {error}")
 
     session_saved_after_run = False
+    terminal_agent_error: dict[str, Any] | None = None
     if image_preparation.notice:
         yield turn_runtime.emit(
             {
@@ -6844,10 +8186,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             }
         )
     try:
-        for event in agent.iter_message_events(
-            conversation_runtime,
-            system_context=runtime_system_context,
-        ):
+        for event in agent.iter_message_events(conversation_runtime):
             turn_runtime.raise_if_cancelled()
             event["elapsed_ms"] = int((time.monotonic() - started_at) * 1000)
             event.setdefault("selected_skill", skill_hint)
@@ -6860,7 +8199,9 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                     pending_approval["context_summary"] = prepared_context.summary
                     pending_approval["context_summary_message_count"] = prepared_context.summary_message_count
                     pending_approval["context_compacted"] = prepared_context.compacted
-                    pending_approval["context_estimated_tokens"] = prepared_context.estimated_tokens
+                    pending_approval.update(
+                        context_compaction_metrics(prepared_context, context_trigger_tokens)
+                    )
                     get_turn_store().set_pending_approval(turn_runtime.turn_id, pending_approval)
                 content = str(event.get("content") or "")
                 if contains_tool_call_markup(content):
@@ -6872,9 +8213,10 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                     str(event.get("content") or ""),
                     image_preparation.notice,
                 )
-                if not event.get("waiting_approval"):
+                waiting_approval = bool(event.get("waiting_approval"))
+                if not waiting_approval:
                     clear_completed_task_plan(session)
-                conversation_runtime.end_turn(TURN_END_COMPLETED)
+                    conversation_runtime.end_turn(TURN_END_COMPLETED)
                 persist_runtime_history()
                 if runtime_profile_for(conversation_id).memory_enabled:
                     schedule_memory_refresh(
@@ -6895,9 +8237,21 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 event["context_summary"] = session.summary
                 event["context_summary_message_count"] = session.summary_message_count
                 event["context_compacted"] = prepared_context.compacted
-                event["context_estimated_tokens"] = prepared_context.estimated_tokens
+                event.update(context_compaction_metrics(prepared_context, context_trigger_tokens))
+                event["artifacts"] = delivery_artifacts_for_turn(
+                    conversation_runtime,
+                    turn_runtime.turn_id,
+                )
+            if event.get("event") == "error":
+                terminal_agent_error = dict(event)
             yield turn_runtime.emit(event)
     except (AgentCancelled, TurnCancelled):
+        mark_task_plan_run_status(
+            session,
+            conversation_runtime,
+            turn_runtime.turn_id,
+            "aborted",
+        )
         conversation_runtime.end_turn(TURN_END_ABORTED)
         persist_runtime_history()
         debug_trace.emit(
@@ -6915,18 +8269,54 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             error=str(error),
             traceback=traceback.format_exc().splitlines()[-16:],
         )
+        mark_task_plan_run_status(
+            session,
+            conversation_runtime,
+            turn_runtime.turn_id,
+            "failed",
+            detail=str(error),
+        )
         conversation_runtime.end_turn(TURN_END_FAILED, detail=str(error))
         persist_runtime_history()
         yield turn_runtime.fail_event(error)
         return
     if not session_saved_after_run:
-        conversation_runtime.end_turn(TURN_END_COMPLETED)
+        if terminal_agent_error is not None:
+            detail = str(
+                terminal_agent_error.get("detail")
+                or terminal_agent_error.get("message")
+                or "模型执行失败。"
+            )
+            mark_task_plan_run_status(
+                session,
+                conversation_runtime,
+                turn_runtime.turn_id,
+                "failed",
+                detail=detail,
+            )
+            conversation_runtime.end_turn(TURN_END_FAILED, detail=detail)
+        else:
+            conversation_runtime.end_turn(TURN_END_COMPLETED)
         persist_runtime_history()
-        debug_trace.emit(
-            "http_chat_stream_partial_saved",
-            turn_id=turn_runtime.turn_id,
-            stored_message_count=len(session.messages),
-        )
+        if terminal_agent_error is not None:
+            debug_trace.emit(
+                "http_chat_stream_failed",
+                turn_id=turn_runtime.turn_id,
+                error_type=str(terminal_agent_error.get("type") or "AgentError"),
+                error=str(
+                    terminal_agent_error.get("detail")
+                    or terminal_agent_error.get("message")
+                    or "模型执行失败。"
+                ),
+                source="agent_error_event",
+                stored_message_count=len(session.messages),
+            )
+        else:
+            debug_trace.emit(
+                "http_chat_stream_partial_saved",
+                turn_id=turn_runtime.turn_id,
+                stored_message_count=len(session.messages),
+            )
 
 
 def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -6969,9 +8359,36 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
     )
     debug_trace.emit("approval_resume_start", turn_id=turn_id)
 
+    # 「确认并记住」：把当前这条精确命令写进账户级记住审批名单，下一次
+    # 原样出现时自动放行。DELETE/SYSTEM 在存储层被拒绝，永远现场确认。
+    remembered_rule: dict[str, Any] | None = None
+    if payload.get("remember") is True:
+        approval_payload = pending_approval.get("approval_payload")
+        if isinstance(approval_payload, dict):
+            remembered_rule = remember_command_approval(
+                remembered_approvals_path(user_data_dir()),
+                command=str(approval_payload.get("command") or ""),
+                risk_category=str(approval_payload.get("risk_category") or ""),
+            )
+            debug_trace.emit(
+                "approval_remembered",
+                turn_id=turn_id,
+                remembered=bool(remembered_rule),
+                command=str(approval_payload.get("command") or ""),
+            )
+
     turn_runtime = TurnRuntime.resume(turn_store, turn_id)
     started_at = turn_runtime.started_at
     yield turn_runtime.initial_event()
+    if remembered_rule is not None:
+        yield {
+            "event": "activity",
+            "phase": "action",
+            "title": "已记住这条命令",
+            "detail": "下次同一命令自动放行；删除或系统级命令永远不会被记住。",
+            "content": str(remembered_rule.get("command") or ""),
+            "activity_type": "command",
+        }
 
     runtime_messages = pending_approval.get("runtime_messages_before_batch")
     if not isinstance(runtime_messages, list):
@@ -6990,13 +8407,28 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
     system_context = str(pending_approval.get("system_context") or "")
     extra_system_context = str(
         pending_approval.get("extra_system_context")
-        or agent_system_context(mode=assistant_runtime_mode(conversation_id))
+        or agent_stable_system_context(mode=assistant_runtime_mode(conversation_id))
     )
     skill_hint = pending_approval.get("selected_skill")
     skill_hint = str(skill_hint) if skill_hint else None
 
     session_store = get_session_store()
-    session = session_store.load(conversation_id)
+    repository = get_conversation_repository()
+    session = repository.load(conversation_id, recover_interrupted=False)
+    resume_runtime = ConversationRuntime.from_messages(
+        runtime_messages, session_id=conversation_id
+    )
+    resume_transcript_base = len(resume_runtime.log.derive_transcript())
+    resume_mirror = DurableTurnMirror(
+        get_session_log_store(),
+        conversation_id,
+        skip_before_seq=resume_runtime.log.seq,
+    )
+    resume_runtime.writer = resume_mirror
+    resume_runtime.resume_turn(
+        turn_runtime.turn_id,
+        open_step=int(pending_approval.get("step") or 0) or None,
+    )
 
     def persist_resumed_task_plan(plan: list[dict[str, str]], explanation: str) -> None:
         plan_state = {
@@ -7010,7 +8442,8 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
             metadata = {}
             session.metadata = metadata
         metadata["active_task_plan"] = plan_state
-        session_store.save(session)
+        resume_runtime.record_metadata_update({"active_task_plan": plan_state})
+        resume_mirror.flush()
         if hasattr(turn_store, "update_metadata"):
             turn_store.update_metadata(turn_runtime.turn_id, {"task_plan": plan_state})
         debug_trace.emit("task_plan_updated_after_approval", plan=plan, explanation=explanation)
@@ -7032,8 +8465,10 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         enabled_skill_ids=enabled_skill_ids(),
         file_change_handler=update_file_reference_index,
         recall_data_root=user_data_dir(),
+        approval_rules_path=remembered_approvals_path(user_data_dir()),
         agent_reminder_source=pending_agent_reminders,
-        sandbox_auto_allow=pending_approval.get("auto_approve") is True,
+        sandbox_auto_allow=True,
+        extra_read_roots=agent_extra_read_roots(),
     )
     agent = ReActAgent(
         client=client,
@@ -7043,13 +8478,12 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
         max_steps=max(1, min(int(pending_approval.get("max_steps") or DEFAULT_MAX_STEPS), 60)),
         debug_trace=debug_trace,
         cancel_check=turn_runtime.cancelled,
-        pending_messages=turn_runtime.drain_messages,
         request_transform=lambda items: enrich_image_attachments_for_model(
             items, profile, workspace_root=account_workspace_root()
         ).messages,
         extra_system_context=extra_system_context,
         reasoning_effort=normalize_reasoning_effort(pending_approval.get("reasoning_effort")),
-        auto_approve=pending_approval.get("auto_approve") is True,
+        auto_approve=bool(load_agent_settings().get("auto_approve", True)),
         plan_update_callback=persist_resumed_task_plan,
         usage_callback=session_usage_callback(
             session=session,
@@ -7059,26 +8493,21 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
             debug_trace=debug_trace,
         ),
         initial_task_plan=active_task_plan.get("steps", []) if isinstance(active_task_plan, dict) else [],
+        # New conversations carry the plan in their immutable turn event.
+        # Keep the legacy late block only for approvals created before this migration.
+        late_task_plan_context=not any(
+            is_turn_runtime_context_message(item) for item in runtime_messages
+        ),
     )
-
-    resume_runtime = ConversationRuntime.from_messages(
-        runtime_messages, session_id=conversation_id
-    )
-    resume_transcript_base = len(resume_runtime.log.derive_transcript())
-    resume_mirror = DurableTurnMirror(
-        get_session_log_store(),
-        conversation_id,
-        skip_before_seq=resume_runtime.log.seq,
-    )
-    resume_runtime.writer = resume_mirror
-    resume_mirror.record_prompt(latest_user_message_content(resume_runtime))
-    resume_runtime.begin_turn(turn_runtime.turn_id, route="/api/agent/turns/:id/approve")
+    resume_inbox_adapter = ExternalEventInboxAdapter(turn_runtime, resume_runtime)
+    agent.pending_messages = resume_inbox_adapter.take_messages
+    agent.pending_messages_committed = resume_inbox_adapter.acknowledge
 
     def persist_resume_history() -> None:
         resume_mirror.flush()
         transcript = resume_runtime.log.derive_transcript()
         session.messages.extend(dehydrate_model_messages(transcript[resume_transcript_base:]))
-        session_store.save(session)
+        repository.checkpoint(session)
 
     session_saved_after_run = False
     try:
@@ -7123,6 +8552,11 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
                         or resumed_approval.get("context_estimated_tokens")
                         or 0
                     )
+                    for metric_key in CONTEXT_COMPACTION_METRIC_KEYS:
+                        if metric_key == "context_estimated_tokens":
+                            continue
+                        if metric_key not in next_pending_approval and metric_key in resumed_approval:
+                            next_pending_approval[metric_key] = resumed_approval[metric_key]
                     turn_store.set_pending_approval(turn_runtime.turn_id, next_pending_approval)
                 context_approval = (
                     next_pending_approval
@@ -7135,25 +8569,19 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
                         "检测到模型把工具调用格式写入最终回复，后端已拦截，未展示原始工具JSON。"
                         "请重试刚才的请求；如果仍出现，请检查模型是否支持原生 tool calling。"
                     )
-                session.messages.extend(
-                    message
-                    for message in runtime_messages[runtime_message_count_before_run:]
-                    if isinstance(message, dict)
-                )
                 session.summary = str(context_approval.get("context_summary") or session.summary or "")
                 session.summary_message_count = int(
                     context_approval.get("context_summary_message_count")
                     or session.summary_message_count
                     or 0
                 )
-                session_store.save(session)
                 # An approval wait keeps its turn open on purpose: the batch is
                 # parked, not finished, and resume must continue that same turn.
                 if not event.get("waiting_approval"):
                     resume_runtime.end_turn(TURN_END_COMPLETED)
                     clear_completed_task_plan(session)
-                    session_store.save(session)
                     turn_store.clear_pending_approval(turn_runtime.turn_id)
+                persist_resume_history()
                 session_saved_after_run = True
                 debug_trace.emit(
                     "approval_resume_final",
@@ -7173,6 +8601,13 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
                 event["context_compacted"] = bool(context_approval.get("context_compacted"))
                 event["context_estimated_tokens"] = int(
                     context_approval.get("context_estimated_tokens") or 0
+                )
+                for metric_key in CONTEXT_COMPACTION_METRIC_KEYS:
+                    if metric_key in context_approval:
+                        event[metric_key] = context_approval[metric_key]
+                event["artifacts"] = delivery_artifacts_for_turn(
+                    resume_runtime,
+                    turn_runtime.turn_id,
                 )
             yield turn_runtime.emit(event)
     except (AgentCancelled, TurnCancelled):
@@ -7317,9 +8752,6 @@ class ImageAttachmentPreparation:
     notice: str = ""
 
 
-CONVERSATION_IMAGE_PATHS_KEY = "conversation_image_paths"
-
-
 def user_file_reference_text(messages: list[dict[str, Any]]) -> str:
     return "\n".join(
         str(message.get("content") or "")
@@ -7355,56 +8787,11 @@ def attachment_block_paths(text: str) -> list[str]:
     return paths
 
 
-def refresh_conversation_image_paths(
-    session: ConversationSession,
-    *,
-    workspace_root: Path,
-) -> list[str]:
-    """Persist the original image paths independently from the LLM text window.
-
-    Conversation compaction intentionally drops most old messages from the next
-    model request. Keeping this small path list lets a later visual question
-    rehydrate the original pixels without persisting Base64 or replacing the
-    image with lossy OCR text. Only real attachments (the「参考附件：」block)
-    qualify; typed paths are the agent's business, via read_file.
-    """
-
-    root = workspace_root.resolve()
-    candidates: list[str] = [
-        str(path)
-        for path in session.metadata.get(CONVERSATION_IMAGE_PATHS_KEY, [])
-        if isinstance(path, str)
-    ]
-    for message in session.messages:
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        candidates.extend(attachment_block_paths(str(message.get("content") or "")))
-
-    image_paths: list[str] = []
-    seen: set[str] = set()
-    for raw_path in candidates:
-        normalized = normalize_workspace_reference_path(raw_path, workspace_root=root)
-        if not normalized or normalized in seen:
-            continue
-        candidate = (root / normalized).resolve()
-        mime_type = mimetypes.guess_type(candidate.name)[0] or ""
-        if not candidate.is_file() or not mime_type.startswith("image/"):
-            continue
-        seen.add(normalized)
-        image_paths.append(normalized)
-    session.metadata[CONVERSATION_IMAGE_PATHS_KEY] = image_paths
-    return image_paths
-
-
-IMAGE_ATTACH_RECENT_USER_TURNS = 2
-
-
 def enrich_image_attachments_for_model(
     messages: list[dict[str, Any]],
     profile: ModelProfile,
     *,
     workspace_root: Path | None = None,
-    conversation_image_paths: list[str] | None = None,
 ) -> ImageAttachmentPreparation:
     """Turn attachment-block image paths into multimodal inputs.
 
@@ -7421,20 +8808,11 @@ def enrich_image_attachments_for_model(
     seen_paths: set[str] = set()
     attached_count = 0
     skipped_count = 0
-    # 只给最近几条用户消息附图。以前每一轮都把历史里所有图重新编码上传一遍，
-    # 第五轮会再传一次第三轮的图——两张手机照片就是 7MB，几轮下来必然撞限流。
-    user_positions = [
-        position
-        for position, message in enumerate(messages)
-        if isinstance(message, dict) and message.get("role") == "user"
-    ]
-    attachable = set(user_positions[-IMAGE_ATTACH_RECENT_USER_TURNS:])
-    for position, message in enumerate(messages):
+    # 图片属于上传它的那条用户消息。不把历史图片平铺到最新消息，
+    # 否则“第三轮那张图”在多图会话里会失去轮次语义。已被压缩覆盖的
+    # 附件块会在 memory 层移出模型上下文，因此这里只按请求中的原位置装配。
+    for message in messages:
         if not isinstance(message, dict) or message.get("role") != "user":
-            enriched.append(message)
-            continue
-        if position not in attachable:
-            # 早先的图不再重传，正文里的文件名仍在，模型要看可以自己去读。
             enriched.append(message)
             continue
         text = str(message.get("content") or "")
@@ -7464,57 +8842,6 @@ def enrich_image_attachments_for_model(
             enriched.append({**message, "content": parts})
         else:
             enriched.append(message)
-    retained_image_paths = [str(path) for path in (conversation_image_paths or []) if str(path)]
-    if retained_image_paths and not profile.supports_vision:
-        skipped_count += sum(1 for path in retained_image_paths if path not in seen_paths)
-    elif retained_image_paths:
-        target_index = next(
-            (
-                index
-                for index in range(len(enriched) - 1, -1, -1)
-                if isinstance(enriched[index], dict) and enriched[index].get("role") == "user"
-            ),
-            None,
-        )
-        if target_index is not None:
-            target = enriched[target_index]
-            original_content = target.get("content")
-            target_parts = (
-                list(original_content)
-                if isinstance(original_content, list)
-                else [{"type": "text", "text": str(original_content or "")}]
-            )
-            appended_retained_image = False
-            for path in retained_image_paths:
-                if path in seen_paths:
-                    continue
-                candidate = (root / path).resolve()
-                if root not in (candidate, *candidate.parents) or not candidate.is_file():
-                    continue
-                mime_type = mimetypes.guess_type(candidate.name)[0] or ""
-                if not mime_type.startswith("image/"):
-                    continue
-                try:
-                    encoded = base64.b64encode(candidate.read_bytes()).decode("ascii")
-                except OSError:
-                    continue
-                target_parts.extend(
-                    [
-                        {
-                            "type": "text",
-                            "text": f"\n\n[本会话持续视觉上下文：{path}]",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
-                        },
-                    ]
-                )
-                seen_paths.add(path)
-                attached_count += 1
-                appended_retained_image = True
-            if appended_retained_image:
-                enriched[target_index] = {**target, "content": target_parts}
     notice = ""
     if skipped_count:
         notice = (
@@ -7542,6 +8869,36 @@ def image_fallback_final_content(content: str, notice: str) -> str:
     if not notice:
         return content
     return f"> ⚠️ {notice}\n\n{content}".strip()
+
+
+def delivery_artifacts_for_turn(
+    runtime: ConversationRuntime,
+    turn_id: str,
+) -> list[dict[str, Any]]:
+    """Return verified-on-disk delivery metadata, not paths parsed from prose."""
+
+    expected_turn = str(turn_id or "")
+    items: list[dict[str, Any]] = []
+    for artifact in runtime.log.derive_artifacts():
+        if expected_turn and str(artifact.get("turn_id") or "") != expected_turn:
+            continue
+        if artifact.get("delivery_ready") is not True:
+            continue
+        path = str(artifact.get("path") or "").strip()
+        if not path:
+            continue
+        items.append(
+            {
+                "artifact_id": str(artifact.get("artifact_id") or path),
+                "path": path,
+                "title": str(artifact.get("title") or Path(path).name),
+                "kind": str(artifact.get("kind") or Path(path).suffix.lstrip(".") or "file"),
+                "status": str(artifact.get("status") or "created"),
+                "verified": bool(artifact.get("verified", False)),
+                "size_bytes": int(artifact.get("size_bytes") or 0),
+            }
+        )
+    return items
 
 
 def session_usage_callback(
@@ -7582,8 +8939,18 @@ def session_usage_callback(
         store.save(session)
         debug_trace.emit(
             "provider_usage_baseline_saved",
+            usage_scope="single_request",
             prompt_tokens=baseline["prompt_tokens"],
-            completion_tokens=baseline["completion_tokens"],
+            completion_tokens=int(
+                usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            ),
+            total_tokens=int(
+                usage.get("total_tokens")
+                or (
+                    baseline["prompt_tokens"]
+                    + int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                )
+            ),
             anchor_raw_session_tokens=anchor_tokens,
             summary_message_count=covered_count,
         )
@@ -7595,11 +8962,34 @@ def dehydrate_model_messages(messages: list[dict[str, Any]]) -> list[dict[str, A
     """Keep persisted history textual; never write image base64 into archives."""
     result: list[dict[str, Any]] = []
     for message in messages:
-        if isinstance(message, dict) and isinstance(message.get("content"), list):
-            text = "".join(
+        if not isinstance(message, dict):
+            result.append(message)
+            continue
+        content = message.get("content")
+        if (
+            message.get("role") == "user"
+            and isinstance(content, str)
+            and looks_like_internal_tool_image_message(content)
+        ):
+            continue
+        if isinstance(content, list):
+            text_parts = [
                 str(part.get("text") or "")
-                for part in message["content"]
+                for part in content
                 if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            has_internal_marker = any(
+                text.strip() == "以下是刚才用 read_file 载入的图片。"
+                for text in text_parts
+            )
+            has_image = any(
+                isinstance(part, dict) and part.get("type") == "image_url"
+                for part in content
+            )
+            if message.get("role") == "user" and has_internal_marker and has_image:
+                continue
+            text = "".join(
+                text_parts
             ).strip()
             result.append({**message, "content": text})
         else:
@@ -7858,6 +9248,16 @@ def fallback_conversation_title_from_messages(messages: list[dict[str, str]]) ->
     if meeting_name and looks_like_meeting_minutes_request(transcript):
         return normalize_conversation_title(f"{meeting_name}会议纪要")
 
+    # The user's explicit subject is stronger evidence than an attachment name.
+    # Audio filenames are frequently recorder defaults or simply mislabeled.
+    explicit_subject = infer_explicit_conversation_subject(first_user)
+    if explicit_subject and re.search(r"会议|纪要|洽谈|沟通|拜访|调研|录音|音频", transcript):
+        suffix = "洽谈纪要" if re.search(r"洽谈|沟通|拜访|调研", transcript) else "录音整理"
+        return normalize_conversation_title(f"{explicit_subject}{suffix}")
+
+    if "机器人产业细分赛道" in transcript and re.search(r"两份工作|两项工作|^\s*1[.、]", first_user):
+        return "安徽机器人产业细分赛道两项工作"
+
     attachment_name = infer_first_attachment_name(transcript)
     if attachment_name:
         stem = Path(attachment_name).stem.strip()
@@ -7868,6 +9268,18 @@ def fallback_conversation_title_from_messages(messages: list[dict[str, str]]) ->
 
     title = fallback_conversation_title(remove_attachment_block(first_user))
     return title if title != PENDING_CONVERSATION_TITLE else "工作智能体任务"
+
+
+def infer_explicit_conversation_subject(content: str) -> str:
+    cleaned = remove_attachment_block(content).strip()
+    first_clause = re.split(r"[。；;\n]", cleaned, maxsplit=1)[0].strip()
+    if not first_clause or len(first_clause) > 32:
+        return ""
+    match = re.search(
+        r"((?:合肥市)?(?:[\u4e00-\u9fff]{2,8}(?:区|县))?[\u4e00-\u9fff]{2,16}(?:局|委|厅|中心|学校|学院|大学|公司))$",
+        first_clause,
+    )
+    return cleanup_title_phrase(match.group(1)) if match else ""
 
 
 def infer_meeting_name_for_title(messages: list[dict[str, str]]) -> str:
@@ -7977,16 +9389,12 @@ def build_chat_session_system_context(
         index_path=index_path,
     )
     known_paths_block = render_known_file_references(known_file_refs)
-    skills_block = render_chat_skill_catalog()
     # 技能由模型按索引里的 description 自行匹配。这里只传达用户在界面上做出的
     # 显式选择——那是用户意图，不是我们替模型猜的意图。
     skill_instruction = (
         f"\n\n用户为本轮显式选择了技能 {skill_hint}。\n" if skill_hint else ""
     )
-    return (
-        "\n\n当前会话动态上下文：最近消息以标准 messages 形式提供；较新的消息和工具结果优先。\n"
-        f"{skills_block}{known_paths_block}{skill_instruction}\n"
-    )
+    return join_system_context_blocks(known_paths_block, skill_instruction)
 
 
 def serialize_runtime_messages_for_context(messages: list[dict[str, Any]]) -> str:
@@ -8042,6 +9450,8 @@ def format_chat_goal(
         "最终答复请写成Markdown正文，方便前端渲染；不要把整段最终答复放进代码块。"
         "ReAct 过程（例如读取技能、准备搜索、执行脚本、检查环境、工具参数和中间观察）只应体现在活动/工具调用中，"
         "最终答复只写用户要的结论、摘要、文件路径或下一步建议；不要在最终答复中复述“先读取技能说明”“正在调用工具”“搜索词是……”等过程。"
+        "如果本轮生成或修改了可交付文件，最终答复末尾必须单列“交付文件”，逐项写完整的工作区相对路径；"
+        "前端会把这些路径转成站内预览和下载入口，不能只写文件名或只写笼统目录。"
         "领域任务先读取对应技能；不要猜测隐藏的技能工具名。"
         "浏览器快照中遇到无文字的图标按钮时，不要把空文本 button 的点击当作已成功；"
         "聊天发送优先对已确认的 textbox 调用 browser_type，并传 submit: true。"
@@ -8054,43 +9464,18 @@ def format_chat_goal(
 
 
 def render_chat_skill_catalog() -> str:
-    """One line per skill: the id to open it, and enough text to match against.
+    """Render the lightweight routing index: skill id plus its description only."""
 
-    The model routes on meaning, so it needs the description and nothing else.
-    Labels, mentions and enabled flags are for the frontend; carrying them here
-    cost more characters than the descriptions themselves.
-    """
-
-    skills = skill_catalog_payload()["skills"]
-    if not skills:
+    lines = [
+        f"- {str(skill.get('id') or '').strip()}：{str(skill.get('description') or '').strip()}"
+        for skill in skill_catalog_payload()["skills"]
+        if bool(skill.get("enabled", skill.get("default_enabled", False)))
+        and str(skill.get("id") or "").strip()
+        and str(skill.get("description") or "").strip()
+    ]
+    if not lines:
         return ""
-    lines: list[str] = []
-    disabled: list[str] = []
-    for skill in skills:
-        skill_id = str(skill.get("id") or "").strip()
-        if not skill_id:
-            continue
-        if not bool(skill.get("enabled", skill.get("default_enabled", False))):
-            disabled.append(skill_id)
-            continue
-        summary = " ".join(
-            part
-            for part in (
-                str(skill.get("description") or "").strip(),
-                str(skill.get("when_to_use") or "").strip(),
-            )
-            if part
-        )
-        lines.append(f"- {skill_id}：{summary}" if summary else f"- {skill_id}")
-    if not lines and not disabled:
-        return ""
-    block = "已安装技能（任务匹配某条描述时，用 sys_skill.open 读取它的完整说明）：\n"
-    block += "\n".join(lines)
-    if disabled:
-        # Naming them costs one line and prevents "I can't do that" when the
-        # capability exists but is switched off.
-        block += "\n未启用（需用户先在网页技能页开启）：" + "、".join(disabled)
-    return block + "\n\n"
+    return "可用技能：\n" + "\n".join(lines)
 
 
 PATH_TRAILING_PUNCTUATION = "，。；;、,.!?！？:：)]}"
@@ -8701,6 +10086,9 @@ def main() -> int:
     for user in users:
         gateway.ensure_worker(user.id, user_weixin_state_dir(user))
     atexit.register(gateway.stop_all)
+    retired_turns = reconcile_interrupted_turns(users)
+    if retired_turns:
+        print(f"Reconciled {retired_turns} interrupted turn(s) left running by a previous process.")
     start_friday_scheduler()
     atexit.register(stop_friday_scheduler)
     server = ThreadingHTTPServer((args.host, args.port), WorkAgentHandler)

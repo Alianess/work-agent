@@ -20,6 +20,9 @@ from .sync import RecallSync
 
 
 RECALL_DATABASE_NAME = "recall.sqlite3"
+RECALL_RESULT_MAX_TEXT_CHARS = 700
+RECALL_TOOL_MAX_RESULTS = 6
+RECALL_TOOL_MAX_CHARS = 12_000
 _INDEX_CACHE: dict[str, RecallIndex] = {}
 _INDEX_LOCK = threading.Lock()
 
@@ -81,26 +84,94 @@ def register_recall_tools(
     data_root: str | Path,
     *,
     graph: Any | None = None,
+    project_id: str = "",
+    session_store: Any | None = None,
+    conversation_id: str = "",
 ) -> None:
+    def _current_conversation_is_fully_replayed() -> bool:
+        if session_store is None or not conversation_id:
+            return False
+        try:
+            session = session_store.load(conversation_id)
+        except Exception:
+            return False
+        return not str(getattr(session, "summary", "") or "").strip() and int(
+            getattr(session, "summary_message_count", 0) or 0
+        ) == 0
+
+    def _compact_outcome(outcome: dict[str, Any]) -> dict[str, Any]:
+        compacted = dict(outcome)
+        compact_results: list[dict[str, Any]] = []
+        for raw_item in list(outcome.get("results") or [])[:RECALL_TOOL_MAX_RESULTS]:
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            text = str(item.get("text") or "")
+            item["text_chars"] = len(text)
+            if len(text) > RECALL_RESULT_MAX_TEXT_CHARS:
+                item["text"] = text[:RECALL_RESULT_MAX_TEXT_CHARS].rstrip() + "…"
+                item["text_truncated"] = True
+            compact_results.append(item)
+        compacted["results"] = compact_results
+        if isinstance(compacted.get("memory_results"), list):
+            compacted["memory_results"] = compacted["memory_results"][:5]
+        compacted["note"] = (
+            "results 是短片段，已在工具边界限长；不够用时用 recall_expand "
+            "按 expand 里的 id 展开，tokens 是展开代价。"
+        )
+        encoded = json.dumps(compacted, ensure_ascii=False, indent=2)
+        while len(encoded) > RECALL_TOOL_MAX_CHARS and len(compact_results) > 1:
+            compact_results.pop()
+            retrieval = compacted.setdefault("retrieval", {})
+            if isinstance(retrieval, dict):
+                retrieval["results_trimmed_for_output_budget"] = True
+            encoded = json.dumps(compacted, ensure_ascii=False, indent=2)
+        return compacted
+
     def _recall(args: dict[str, Any]) -> str:
         query = str(args.get("query") or "").strip()
         if not query:
             raise ValueError("query 不能为空。")
+        scope = str(args.get("scope") or "all").strip()
+        if scope == "project" and not project_id:
+            raise ValueError("当前会话不在任何项目里，scope=project 不可用；请用 scope=all。")
         kinds = args.get("source_kinds") or []
         filters = NodeFilter(
             source_kinds=tuple(str(item) for item in kinds if str(item or "").strip()),
+            excluded_source_ids=(f"chat:{conversation_id}",)
+            if _current_conversation_is_fully_replayed()
+            else (),
             since_ms=_parse_since(args.get("since")),
             until_ms=_parse_since(args.get("until")),
+            project_ids=(project_id,) if scope == "project" else (),
+            include_superseded=bool(args.get("include_superseded")),
         )
         outcome = search(
             build_deps(data_root, graph=graph),
             query,
             filters=filters,
             entity_names=[str(item) for item in (args.get("entities") or []) if str(item or "").strip()],
-            top_k=max(1, min(int(args.get("limit") or DEFAULT_TOP_K), 10)),
+            top_k=max(1, min(int(args.get("limit") or DEFAULT_TOP_K), RECALL_TOOL_MAX_RESULTS)),
             recency_weight=float(args.get("recency_weight", 0.3)),
         )
-        return json.dumps(outcome, ensure_ascii=False, indent=2)
+        if scope == "project":
+            outcome["scope"] = f"project:{project_id}"
+        # 核心记忆跟原文一起给：模型既然主动检索了，相关的记忆条目就不该
+        # 再等它另开一问。账户级始终在场；scope=project 时叠加项目级。
+        if session_store is not None:
+            try:
+                from ..cross_chat_memory import CrossChatMemoryStore, rank_memories_for_query
+
+                memory_store = CrossChatMemoryStore(session_store)
+                memories = memory_store.list(project_id="", limit=100)
+                if project_id:
+                    memories += memory_store.list(project_id=project_id, limit=100)
+                memory_results = rank_memories_for_query(memories, query)
+                if memory_results:
+                    outcome["memory_results"] = memory_results
+            except Exception:
+                pass  # 记忆附带是加菜，失败不该殃及检索本身
+        return json.dumps(_compact_outcome(outcome), ensure_ascii=False, indent=2)
 
     def _expand(args: dict[str, Any]) -> str:
         node_id_value = str(args.get("id") or "").strip()
@@ -119,40 +190,47 @@ def register_recall_tools(
         Tool(
             name="recall",
             description=(
-                "Search everything this account has seen: workspace documents (Word, PDF, "
-                "spreadsheets, Markdown), meeting transcripts, and past conversations. "
-                "Use it when the answer depends on something said or written earlier and you "
-                "do not already have it. Returns the smallest readable passage that matched, "
-                "each with an 'expand' map naming the section, the parent section and the whole "
-                "file together with the token cost of opening each — open one with recall_expand "
-                "only when the passage is not enough. "
-                "Not for questions about counts or current state (how many revisions, which "
-                "version is latest): those are ledger questions, not search questions."
+                "Search indexed documents, meeting transcripts, and past chats. "
+                "Returns matching passages with ids for recall_expand."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "自然语言问题，或当时出现过的专名、文件名、数字。",
+                        "description": "Question or remembered keywords.",
                     },
                     "source_kinds": {
                         "type": "array",
                         "items": {"type": "string", "enum": ["document", "chat", "transcript"]},
-                        "description": "只搜某几类语料。留空搜全部。",
                     },
-                    "since": {"type": "string", "description": "起始时间，YYYY-MM-DD 或毫秒时间戳。"},
-                    "until": {"type": "string", "description": "截止时间，同上。"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "project"] if project_id else ["all"],
+                        "default": "all",
+                        "description": (
+                            "project=current project; all=account."
+                            if project_id
+                            else "This conversation has no project; use all."
+                        ),
+                    },
+                    "include_superseded": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Include older document versions.",
+                    },
+                    "since": {"type": "string", "description": "YYYY-MM-DD or Unix milliseconds."},
+                    "until": {"type": "string", "description": "YYYY-MM-DD or Unix milliseconds."},
                     "entities": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "限定到某些人、公司或项目。知识图谱未建时忽略。",
+                        "description": "People, companies, or projects.",
                     },
                     "limit": {"type": "integer", "default": DEFAULT_TOP_K},
                     "recency_weight": {
                         "type": "number",
                         "default": 0.3,
-                        "description": "问“最新/上一版”时调高，问定义或背景时调低。",
+                        "description": "Higher favors recent results.",
                     },
                 },
                 "required": ["query"],
@@ -163,30 +241,23 @@ def register_recall_tools(
     registry.register(
         Tool(
             name="recall_expand",
-            description=(
-                "Open more context around a passage recall returned. Pass scope=up1/up2/file to "
-                "climb the document structure, prev/next for the neighbouring passage, or "
-                "max_tokens to get the largest whole section that fits a budget. The token cost "
-                "of each option is already in the recall result, so choose before spending. "
-                "A section over the limit comes back as an outline instead of text — pick a "
-                "smaller one from it."
-            ),
+            description="Expand a recall result by hierarchy, neighbor, or token budget.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "recall 结果 expand 里的 id。"},
+                    "id": {"type": "string", "description": "Id from a recall result."},
                     "scope": {
                         "type": "string",
                         "enum": ["up1", "up2", "up3", "file", "prev", "next"],
                     },
                     "max_tokens": {
                         "type": "integer",
-                        "description": "不给 scope 时按预算取最大的完整单元。",
+                        "description": "Largest complete unit when scope is omitted.",
                     },
                     "seen_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "已经在上文见过的片段 id，返回时会标出来。",
+                        "description": "Ids already shown in context.",
                     },
                 },
                 "required": ["id"],
@@ -220,6 +291,7 @@ def index_conversation_async(
     log: Any,
     *,
     title: str = "",
+    project_id: str = "",
     on_error: Callable[[Exception], None] | None = None,
 ) -> threading.Thread:
     """轮末索引这次会话。
@@ -230,7 +302,9 @@ def index_conversation_async(
 
     def _run() -> None:
         try:
-            report = sync_for(data_root).index_conversation(conversation_id, log, title=title)
+            report = sync_for(data_root).index_conversation(
+                conversation_id, log, title=title, project_id=project_id
+            )
             # 词法索引完成后顺手把这一轮的新窗口补上向量。一轮只新增几个窗口，
             # 一次调用就够；等调度线程 60 秒后再来，这段时间稠密召回是缺的。
             if report.touched:

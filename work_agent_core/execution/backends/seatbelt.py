@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 
 from ..errors import failure
 from ..models import BackendKind, CommandSpec, ExecutionContract
+from ..network_broker import NetworkBroker
 from ...runtime_env import apply_project_agent_environment, runtime_bin_directories, runtime_search_path
 from .base import BackendHealth, ExecutionEnvironment, ProcessExecutionBackend
 
@@ -21,6 +23,7 @@ class SeatbeltBackend(ProcessExecutionBackend):
         *,
         runtime_workspace_root: str | Path | None = None,
         readable_source_root: str | Path | None = None,
+        extra_read_roots: tuple[Path, ...] = (),
     ) -> None:
         self.sandbox_exec = sandbox_exec
         self.runtime_workspace_root = Path(runtime_workspace_root or Path.cwd()).resolve()
@@ -31,6 +34,23 @@ class SeatbeltBackend(ProcessExecutionBackend):
         self.readable_source_root = (
             Path(readable_source_root).resolve() if readable_source_root else None
         )
+        # 用户在 agent 设置里声明的只读目录（桌面、下载……）：shell 里的读与
+        # read_file 的读保持一致，不然同一条路径两个工具两种答案。
+        self.extra_read_roots = extra_read_roots
+        self._broker_lock = threading.RLock()
+        self._brokers: dict[str, tuple[NetworkBroker, int]] = {}
+
+    def _read_roots(self) -> tuple[Path, ...]:
+        """Managed runtimes plus the account data the command is working on."""
+        roots = list(self._runtime_read_roots())
+        source = self.readable_source_root
+        if source is not None and source.is_dir() and source not in roots:
+            roots.append(source)
+        for extra in self.extra_read_roots:
+            resolved = Path(extra).resolve()
+            if resolved.is_dir() and resolved not in roots:
+                roots.append(resolved)
+        return tuple(roots)
 
     def health(self) -> BackendHealth:
         executable = shutil.which(self.sandbox_exec) if "/" not in self.sandbox_exec else self.sandbox_exec
@@ -79,8 +99,34 @@ class SeatbeltBackend(ProcessExecutionBackend):
                 user_action="repair_backend",
             )
         environment = super().prepare(contract, workspace_path=workspace_path, log_dir=log_dir)
-        profile_path = environment.log_dir / "seatbelt.sb"
-        profile_path.write_text(self._profile(workspace_path, self._read_roots()), encoding="utf-8")
+        broker: NetworkBroker | None = None
+        broker_port: int | None = None
+        try:
+            if contract.capabilities.network.mode == "domain_allowlist":
+                broker = NetworkBroker(
+                    allowed_domains=frozenset(contract.capabilities.network.allowed_domains),
+                    max_bytes_in=contract.capabilities.network.max_bytes_in,
+                    max_bytes_out=contract.capabilities.network.max_bytes_out,
+                )
+                broker_port = broker.start()
+                with self._broker_lock:
+                    self._brokers[environment.environment_id] = (broker, broker_port)
+            profile_path = environment.log_dir / "seatbelt.sb"
+            profile_path.write_text(
+                self._profile(
+                    workspace_path,
+                    self._read_roots(),
+                    network_broker_port=broker_port,
+                    dependency_write_root=(self.runtime_workspace_root / ".venv") if broker_port else None,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            with self._broker_lock:
+                self._brokers.pop(environment.environment_id, None)
+            if broker is not None:
+                broker.close()
+            raise
         return ExecutionEnvironment(
             environment_id=environment.environment_id,
             backend=environment.backend,
@@ -95,15 +141,38 @@ class SeatbeltBackend(ProcessExecutionBackend):
     def environment(self, environment: ExecutionEnvironment, command: CommandSpec) -> dict[str, str]:
         base = super().environment(environment, command)
         base["PATH"] = runtime_search_path(self.runtime_workspace_root, base.get("PATH", ""))
+        with self._broker_lock:
+            broker_entry = self._brokers.get(environment.environment_id)
+        if broker_entry is not None:
+            proxy_url = f"http://127.0.0.1:{broker_entry[1]}"
+            base.update(
+                {
+                    "HTTP_PROXY": proxy_url,
+                    "HTTPS_PROXY": proxy_url,
+                    "http_proxy": proxy_url,
+                    "https_proxy": proxy_url,
+                    "NO_PROXY": "",
+                    "no_proxy": "",
+                    "PIP_CONFIG_FILE": "/dev/null",
+                    "PIP_INDEX_URL": "https://pypi.org/simple",
+                    "PIP_EXTRA_INDEX_URL": "",
+                    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                    "SSL_CERT_FILE": "/private/etc/ssl/cert.pem",
+                    "REQUESTS_CA_BUNDLE": "/private/etc/ssl/cert.pem",
+                    "CURL_CA_BUNDLE": "/private/etc/ssl/cert.pem",
+                    "NPM_CONFIG_REGISTRY": "https://registry.npmjs.org/",
+                    "NPM_CONFIG_USERCONFIG": "/dev/null",
+                    "NPM_CONFIG_AUDIT": "false",
+                    "NPM_CONFIG_FUND": "false",
+                }
+            )
         return apply_project_agent_environment(base, self.runtime_workspace_root)
 
-    def _read_roots(self) -> tuple[Path, ...]:
-        """Managed runtimes plus the account data the command is working on."""
-        roots = list(self._runtime_read_roots())
-        source = self.readable_source_root
-        if source is not None and source.is_dir() and source not in roots:
-            roots.append(source)
-        return tuple(roots)
+    def destroy(self, environment: ExecutionEnvironment) -> None:
+        with self._broker_lock:
+            broker_entry = self._brokers.pop(environment.environment_id, None)
+        if broker_entry is not None:
+            broker_entry[0].close()
 
     def _runtime_read_roots(self) -> tuple[Path, ...]:
         """Return only managed program/runtime trees required by allowed commands.
@@ -130,7 +199,13 @@ class SeatbeltBackend(ProcessExecutionBackend):
         return tuple(roots)
 
     @staticmethod
-    def _profile(workspace_path: Path, runtime_roots: tuple[Path, ...]) -> str:
+    def _profile(
+        workspace_path: Path,
+        runtime_roots: tuple[Path, ...],
+        *,
+        network_broker_port: int | None = None,
+        dependency_write_root: Path | None = None,
+    ) -> str:
         workspace = _seatbelt_path(workspace_path)
         temporary = _seatbelt_path(workspace_path / ".work-agent-tmp")
         readable_roots = (
@@ -143,6 +218,9 @@ class SeatbeltBackend(ProcessExecutionBackend):
             # sandbox denies every pipeline before the command even starts.
             Path("/private/var/select"),
             Path("/etc"),
+            # macOS exposes /etc through a symlink into /private/etc; TLS
+            # clients resolve the certificate path before opening it.
+            Path("/private/etc"),
             *runtime_roots,
             workspace_path,
         )
@@ -158,6 +236,25 @@ class SeatbeltBackend(ProcessExecutionBackend):
                 '(regex #"^/dev/fd/[0-9]+$")',
             ]
         )
+        write_filters = [
+            '(literal "/dev/ptmx")',
+            '(literal "/dev/dtracehelper")',
+            '(literal "/dev/null")',
+            '(literal "/dev/random")',
+            '(literal "/dev/urandom")',
+            '(literal "/dev/zero")',
+            '(regex #"^/dev/fd/[0-9]+$")',
+            '(regex #"^/dev/tty[a-z0-9]*$")',
+            f'(subpath "{workspace}")',
+            f'(subpath "{temporary}")',
+        ]
+        if dependency_write_root is not None:
+            write_filters.append(f'(subpath "{_seatbelt_path(dependency_write_root)}")')
+        network_rule = (
+            f'(allow network-outbound (remote ip "localhost:{network_broker_port}"))'
+            if network_broker_port
+            else ""
+        )
         lines = [
             "(version 1)",
             # Modern macOS performs sysctl and service initialization before
@@ -169,24 +266,15 @@ class SeatbeltBackend(ProcessExecutionBackend):
             "(deny file-read*)",
             "(allow file-read*\n    " + "\n    ".join(read_filters) + ")",
             "(deny file-write*)",
-            "(allow file-write*\n"
-            "    (literal \"/dev/ptmx\")\n"
-            "    (literal \"/dev/dtracehelper\")\n"
-            "    (literal \"/dev/null\")\n"
-            "    (literal \"/dev/random\")\n"
-            "    (literal \"/dev/urandom\")\n"
-            "    (literal \"/dev/zero\")\n"
-            "    (regex #\"^/dev/fd/[0-9]+$\")\n"
-            "    (regex #\"^/dev/tty[a-z0-9]*$\")\n"
-            f"    (subpath \"{workspace}\")\n"
-            f"    (subpath \"{temporary}\"))",
+            "(allow file-write*\n    " + "\n    ".join(write_filters) + ")",
             "(deny appleevent-send)",
             "(deny user-preference-read user-preference-write)",
             "(deny distributed-notification-post)",
             "(deny iokit-open*)",
             "(deny network*)",
+            network_rule,
         ]
-        return "\n".join(lines)
+        return "\n".join(line for line in lines if line)
 
 
 def _seatbelt_path(path: Path) -> str:

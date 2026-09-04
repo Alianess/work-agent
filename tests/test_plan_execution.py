@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from work_agent_core.config import ModelProfile
 from work_agent_core.llm import LLMResponse
+from work_agent_core.memory import ContextCompactionError
 from work_agent_core.session_runtime import ConversationRuntime
 from work_agent_core.react import ReActAgent
 from work_agent_core.tool_bus import ToolBus
@@ -53,7 +54,7 @@ class _CheckpointClient:
     def __init__(self) -> None:
         self.calls = 0
 
-    def chat(self, messages, *, profile, max_tokens):
+    def chat(self, messages, *, profile, max_tokens, reasoning_effort=None):
         self.calls += 1
         return SimpleNamespace(
             content=(
@@ -64,6 +65,24 @@ class _CheckpointClient:
                 "## 错误、风险与待确认事项\n- 无\n"
                 "## 下一步准确动作\n- 运行测试"
             )
+        )
+
+
+class _EmptyCheckpointClient:
+    def chat(self, _messages, *, profile, max_tokens, reasoning_effort=None):
+        return SimpleNamespace(
+            content="",
+            raw={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": "",
+                            "reasoning_content": "只返回了推理通道",
+                        },
+                    }
+                ]
+            },
         )
 
 
@@ -109,7 +128,7 @@ class PlanExecutionTests(unittest.TestCase):
         ])
         messages = agent._request_messages(runtime)
 
-        with patch("work_agent_core.react.ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS", 1):
+        with patch("work_agent_core.react.profile_context_trigger_tokens", return_value=1):
             event = agent._maybe_compact_active_runtime(runtime, messages, step=2)
 
         self.assertIsNotNone(event)
@@ -126,6 +145,53 @@ class PlanExecutionTests(unittest.TestCase):
         transcript = runtime.log.derive_transcript()
         self.assertEqual([item["role"] for item in transcript], ["user", "assistant", "tool"])
         self.assertEqual(transcript[-1]["content"], "x = 1")
+
+    def test_running_react_compacts_when_tool_results_cross_the_workset_budget(self) -> None:
+        client = _CheckpointClient()
+        agent = ReActAgent(client=client, profile=self.profile, tools=ToolBus())
+        runtime = ConversationRuntime.from_messages([
+            {"role": "user", "content": "完成复杂改造"},
+            {"role": "assistant", "content": "我先核对代码", "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"/tmp/demo.py"}'},
+            }]},
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "content": "x = 1\n" * 40,
+            },
+        ])
+        messages = agent._request_messages(runtime)
+
+        with (
+            patch("work_agent_core.react.profile_context_trigger_tokens", return_value=1_000_000),
+            patch("work_agent_core.react.ACTIVE_REACT_CHECKPOINT_SERIALIZED_BYTES", 1_000_000),
+            patch("work_agent_core.react.ACTIVE_REACT_CHECKPOINT_TOOL_RESULT_CHARS", 20),
+        ):
+            event = agent._maybe_compact_active_runtime(runtime, messages, step=2)
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["activity_type"], "runtime_summary")
+        self.assertEqual(client.calls, 1)
+
+    def test_running_react_stops_when_checkpoint_model_returns_no_content(self) -> None:
+        agent = ReActAgent(client=_EmptyCheckpointClient(), profile=self.profile, tools=ToolBus())
+        runtime = ConversationRuntime.from_messages([
+            {"role": "user", "content": "完成复杂改造"},
+            {"role": "assistant", "content": "已经读取材料"},
+            {"role": "tool", "tool_call_id": "call-1", "name": "read_file", "content": "证据"},
+        ])
+        original_transcript = runtime.log.derive_transcript()
+
+        with patch("work_agent_core.react.profile_context_trigger_tokens", return_value=1):
+            with self.assertRaises(ContextCompactionError) as captured:
+                list(agent.iter_message_events(runtime))
+
+        self.assertIn("reasoning_chars", str(captured.exception))
+        self.assertEqual(runtime.log.derive_transcript(), original_transcript)
+        self.assertEqual(list(runtime.log.iter_type("compaction/replacement")), [])
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,44 @@ DEBUG_TRACE_DIR = Path("meet_files/debug_traces")
 DEFAULT_STRING_LIMIT = 4000
 RECENT_INDEX_NAME = "_recent.jsonl"
 SENSITIVE_KEY_RE = re.compile(r"(api[_-]?key|authorization|password|passwd|secret|token)", re.I)
+# Token *counts* are operational metrics, not credentials.  The broad
+# ``token`` secret matcher used to hide every provider usage value and context
+# threshold, which made the provider's per-request usage impossible to audit.
+# Keep this list deliberately exact:
+# string-valued access/session tokens remain redacted.
+SAFE_NUMERIC_TOKEN_METRIC_KEYS = frozenset(
+    {
+        "prompt_tokens",
+        "request_prompt_tokens",
+        "request_input_tokens",
+        "input_tokens",
+        "completion_tokens",
+        "request_completion_tokens",
+        "output_tokens",
+        "total_tokens",
+        "request_total_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "estimated_tokens",
+        "raw_estimated_tokens",
+        "anchor_estimated_tokens",
+        "anchor_raw_session_tokens",
+        "raw_context_tokens",
+        "reserved_tokens",
+        "delta_tokens",
+        "before_estimated_tokens",
+        "after_estimated_tokens",
+        "post_compaction_estimated_tokens",
+        "context_estimated_tokens",
+        "context_pre_compaction_tokens",
+        "context_post_compaction_tokens",
+        "context_trigger_tokens",
+        "token_trigger",
+        "max_tokens",
+    }
+)
 _WRITE_LOCK = threading.RLock()
 
 
@@ -85,7 +123,13 @@ def sanitize_debug_payload(value: Any, *, string_limit: int = DEFAULT_STRING_LIM
         cleaned: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            if SENSITIVE_KEY_RE.search(key_text):
+            normalized_key = key_text.strip().lower()
+            safe_numeric_token_metric = (
+                normalized_key in SAFE_NUMERIC_TOKEN_METRIC_KEYS
+                and isinstance(item, (int, float))
+                and not isinstance(item, bool)
+            )
+            if SENSITIVE_KEY_RE.search(key_text) and not safe_numeric_token_metric:
                 cleaned[key_text] = "[REDACTED]"
             else:
                 cleaned[key_text] = sanitize_debug_payload(item, string_limit=string_limit)

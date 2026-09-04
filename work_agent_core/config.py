@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+from urllib.parse import urlparse
 
 
 DEFAULT_CONFIG_PATH = Path("config/model_profiles.json")
@@ -35,6 +36,32 @@ def api_key_env_for_profile(profile_name: str) -> str:
     normalized = normalized[:48] or "MODEL"
     suffix = hashlib.sha256(str(profile_name).encode("utf-8")).hexdigest()[:8].upper()
     return f"WORK_AGENT_MODEL_{normalized}_{suffix}_API_KEY"
+
+
+def normalized_endpoint_key(base_url: str, endpoint_id: str = "") -> str:
+    """返回端点在配置里的稳定身份：优先显式 ID，否则用主机名推导。"""
+
+    key = str(endpoint_id or "").strip()
+    if key:
+        return key
+    try:
+        host = urlparse(base_url).hostname or ""
+    except ValueError:
+        host = ""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", host.lower()).strip("-")
+    return slug or "default"
+
+
+def friendly_endpoint_label(base_url: str, endpoint_label: str = "") -> str:
+    """用户没给端点名时，用主机名作为可读标签。"""
+
+    label = str(endpoint_label or "").strip()
+    if label:
+        return label
+    try:
+        return urlparse(base_url).hostname or base_url
+    except ValueError:
+        return base_url
 
 
 def save_env_value(path: str | Path, key: str, value: str) -> None:
@@ -100,6 +127,15 @@ def delete_env_value(path: str | Path, key: str) -> None:
 def infer_model_vision_support(data: dict[str, Any]) -> bool:
     """Conservative fallback for legacy profiles without an explicit flag."""
 
+    model_identity = " ".join(
+        str(data.get(key) or "")
+        for key in ("name", "model")
+    ).lower()
+    # A provider family can contain both text-only and vision variants.  The
+    # model's explicit capability suffix is stronger evidence than the family
+    # name (for example, deepseek-v4-flash-vision-exp).
+    if "vision" in model_identity:
+        return True
     identity = " ".join(
         str(data.get(key) or "")
         for key in ("name", "provider", "base_url", "model")
@@ -124,6 +160,9 @@ class ModelProfile:
     api_key_env: str
     temperature: float = 0.6
     max_tokens: int = 16384
+    context_length: int = 256000
+    """The actual context window configured at the serving endpoint."""
+
     timeout_seconds: int = 120
     supports_vision: bool = False
     auth_header: str = "Authorization"
@@ -138,6 +177,12 @@ class ModelProfile:
     思考型模型带附件时首 token 可能几十秒才出来，全局默认会把正常请求判成超时。
     """
 
+    endpoint_id: str = ""
+    """端点身份。同一端点下的模型共享密钥和切换入口；留空时按 base_url 主机名推导。"""
+
+    endpoint_label: str = ""
+    """端点在界面里显示的名称，如 Opencode Go。"""
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelProfile":
         return cls(
@@ -148,10 +193,13 @@ class ModelProfile:
             api_key_env=str(data.get("api_key_env") or "OPENAI_API_KEY"),
             temperature=float(data.get("temperature", 0.6)),
             max_tokens=int(data.get("max_tokens", 16384)),
+            context_length=int(data.get("context_length") or 256000),
             timeout_seconds=int(data.get("timeout_seconds", 120)),
             auth_header=str(data.get("auth_header") or "Authorization"),
             auth_scheme=str(data.get("auth_scheme", "Bearer")),
             stream_idle_timeout_seconds=int(data.get("stream_idle_timeout_seconds") or 0),
+            endpoint_id=str(data.get("endpoint_id") or "").strip(),
+            endpoint_label=str(data.get("endpoint_label") or "").strip(),
             supports_vision=(
                 bool(data["supports_vision"])
                 if isinstance(data.get("supports_vision"), bool)
@@ -159,12 +207,25 @@ class ModelProfile:
             ),
         )
 
+    @property
+    def endpoint_key(self) -> str:
+        return normalized_endpoint_key(self.base_url, self.endpoint_id)
+
+    @property
+    def display_endpoint_label(self) -> str:
+        return friendly_endpoint_label(self.base_url, self.endpoint_label)
+
     def auth_headers(self) -> dict[str, str]:
         """认证头。厂商各写各的，所以这件事属于 profile，不属于客户端。"""
 
         key = self.api_key()
         value = f"{self.auth_scheme} {key}".strip() if self.auth_scheme else key
-        return {self.auth_header: value, "Content-Type": "application/json"}
+        return {
+            self.auth_header: value,
+            "Content-Type": "application/json",
+            # OpenCode Go 等网关会按 Cloudflare 规则拦截 Python 默认 UA。
+            "User-Agent": "work-agent/1.0 (OpenAI-compatible client)",
+        }
 
     def api_key(self) -> str:
         value = os.getenv(self.api_key_env)

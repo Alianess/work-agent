@@ -47,9 +47,13 @@ class NodeFilter:
 
     source_kinds: tuple[str, ...] = ()
     source_ids: tuple[str, ...] = ()
+    excluded_source_ids: tuple[str, ...] = ()
     since_ms: int = 0
     until_ms: int = 0
     entity_ids: tuple[str, ...] = ()
+    project_ids: tuple[str, ...] = ()
+    include_superseded: bool = False
+    """默认排除被新版本取代的来源；问"以前的版本怎么写"时才显式打开。"""
 
     def where(self) -> tuple[str, list[Any]]:
         clauses: list[str] = ["n.is_leaf = 1"]
@@ -60,6 +64,9 @@ class NodeFilter:
         if self.source_ids:
             clauses.append(f"n.source_id IN ({','.join('?' * len(self.source_ids))})")
             params.extend(self.source_ids)
+        if self.excluded_source_ids:
+            clauses.append(f"n.source_id NOT IN ({','.join('?' * len(self.excluded_source_ids))})")
+            params.extend(self.excluded_source_ids)
         if self.since_ms:
             clauses.append("n.occurred_at >= ?")
             params.append(int(self.since_ms))
@@ -73,6 +80,19 @@ class NodeFilter:
                 f" WHERE e.node_id = n.id AND e.entity_id IN ({placeholders}))"
             )
             params.extend(self.entity_ids)
+        if self.project_ids:
+            placeholders = ",".join("?" * len(self.project_ids))
+            clauses.append(
+                "EXISTS (SELECT 1 FROM recall_sources s"
+                f" WHERE s.source_id = n.source_id AND s.project_id IN ({placeholders}))"
+            )
+            params.extend(self.project_ids)
+        if not self.include_superseded and not self.source_ids:
+            # source_ids 显式指定时不折叠：模型点名要看某个来源，那是它的决定。
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM recall_sources s2"
+                " WHERE s2.source_id = n.source_id AND s2.superseded_by <> '')"
+            )
         return " AND ".join(clauses), params
 
 
@@ -118,7 +138,10 @@ class RecallIndex:
                 title TEXT NOT NULL DEFAULT '',
                 content_hash TEXT NOT NULL,
                 occurred_at INTEGER NOT NULL DEFAULT 0,
-                indexed_at INTEGER NOT NULL
+                indexed_at INTEGER NOT NULL,
+                project_id TEXT NOT NULL DEFAULT '',
+                family_key TEXT NOT NULL DEFAULT '',
+                superseded_by TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS recall_nodes (
@@ -187,6 +210,22 @@ class RecallIndex:
             connection.execute(
                 "ALTER TABLE recall_nodes ADD COLUMN summary_wanted INTEGER NOT NULL DEFAULT 0"
             )
+        source_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(recall_sources)").fetchall()
+        }
+        if "project_id" not in source_columns:
+            connection.execute(
+                "ALTER TABLE recall_sources ADD COLUMN project_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "family_key" not in source_columns:
+            connection.execute(
+                "ALTER TABLE recall_sources ADD COLUMN family_key TEXT NOT NULL DEFAULT ''"
+            )
+        if "superseded_by" not in source_columns:
+            connection.execute(
+                "ALTER TABLE recall_sources ADD COLUMN superseded_by TEXT NOT NULL DEFAULT ''"
+            )
 
     # ------------------------------------------------------------------
     # 写入
@@ -206,6 +245,7 @@ class RecallIndex:
         uri: str = "",
         digest: str = "",
         aliases_for: Any | None = None,
+        project_id: str = "",
     ) -> "UpsertReport":
         """按节点增量写入。没变的节点原地不动，**它们的向量因此得以保留**。
 
@@ -224,6 +264,15 @@ class RecallIndex:
         body = "\n".join(node.text for node in tree.iter_depth_first())
         digest = digest or content_hash(body)
         if self.source_hash(tree.source_id) == digest:
+            # 内容没变仍然要补项目归属：内容跳过是省 embedding 钱，归属是
+            # 过滤条件，缺了它 scope=project 就永远搜不到这个来源。
+            if project_id:
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE recall_sources SET project_id = ?"
+                        " WHERE source_id = ? AND project_id != ?",
+                        (project_id, tree.source_id, project_id),
+                    )
             return UpsertReport(skipped=True)
 
         incoming: dict[str, tuple[MemoryNode, int, str]] = {}
@@ -288,15 +337,18 @@ class RecallIndex:
             connection.execute(
                 """
                 INSERT INTO recall_sources
-                    (source_id, source_kind, uri, title, content_hash, occurred_at, indexed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (source_id, source_kind, uri, title, content_hash, occurred_at,
+                     indexed_at, project_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_id) DO UPDATE SET
                     source_kind = excluded.source_kind,
                     uri = excluded.uri,
                     title = excluded.title,
                     content_hash = excluded.content_hash,
                     occurred_at = excluded.occurred_at,
-                    indexed_at = excluded.indexed_at
+                    indexed_at = excluded.indexed_at,
+                    project_id = CASE WHEN excluded.project_id != ''
+                        THEN excluded.project_id ELSE recall_sources.project_id END
                 """,
                 (
                     tree.source_id,
@@ -306,6 +358,7 @@ class RecallIndex:
                     digest,
                     root.occurred_at,
                     int(time.time() * 1000),
+                    project_id,
                 ),
             )
         return report
@@ -348,6 +401,127 @@ class RecallIndex:
             self._delete_source(connection, source_id)
 
     # ------------------------------------------------------------------
+    # 版本家族：同名主干 + 内容确认后，旧版让位给新版
+    # ------------------------------------------------------------------
+
+    VERSION_OVERLAP_RATIO = 0.30
+    # 防误折叠靠三重前置：同目录 + 同名主干 + 重叠 ≥30%。绝对共享数不设
+    # 更高门槛——中等文档只有两三个窗口，要求 ≥2 会把"改了一段"的真版本
+    # 挡在门外；大文档的巧合共享由比例挡（50 窗共享 2 = 4%，不过线）。
+    VERSION_OVERLAP_MIN_SHARED = 1
+
+    def reconcile_version_families(self, family_of: Any) -> dict[str, int]:
+        """Fold older versions of a document family behind the newest one.
+
+        family_of(uri) -> family key (empty means "no family").  Only the file
+        name is a *clue*; the verdict is content: sources share text hashes
+        exactly when they carry the same paragraphs, and only a family whose
+        neighbours overlap enough gets superseded.  A rename that ships a
+        completely different document never folds — the two stay searchable
+        side by side.
+
+        Idempotent: flags are recomputed from scratch each run, so removing
+        the newer file (or rebuilding) restores the older one to visibility.
+        """
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT source_id, uri, occurred_at FROM recall_sources"
+                " WHERE source_kind = 'document' AND uri <> ''"
+            ).fetchall()
+            families: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                key = str(family_of(str(row["uri"])) or "")
+                if not key:
+                    connection.execute(
+                        "UPDATE recall_sources SET family_key = '' WHERE source_id = ?",
+                        (str(row["source_id"]),),
+                    )
+                    continue
+                connection.execute(
+                    "UPDATE recall_sources SET family_key = ? WHERE source_id = ?",
+                    (key, str(row["source_id"])),
+                )
+                families.setdefault(key, []).append(
+                    {
+                        "source_id": str(row["source_id"]),
+                        "uri": str(row["uri"]),
+                        "occurred_at": int(row["occurred_at"] or 0),
+                    }
+                )
+            superseded = 0
+            for members in families.values():
+                for member in members:
+                    connection.execute(
+                        "UPDATE recall_sources SET superseded_by = '' WHERE source_id = ?",
+                        (member["source_id"],),
+                    )
+                if len(members) < 2:
+                    continue
+                members.sort(key=lambda item: (item["occurred_at"], item["uri"]))
+                # text_hash 含 header（header 含文件名），跨文件比对会把相同
+                # 正文判成不同；非叶节点的 text 还含标题行。版本判决只看叶子
+                # 的正文本身：现算哈希。比例是主判据，短文档靠它过线。
+                hashes = {
+                    member["source_id"]: {
+                        content_hash(str(row[0]))
+                        for row in connection.execute(
+                            "SELECT DISTINCT text FROM recall_nodes"
+                            " WHERE source_id = ? AND is_leaf = 1 AND text <> ''",
+                            (member["source_id"],),
+                        )
+                    }
+                    for member in members
+                }
+                for older, newer in zip(members, members[1:]):
+                    shared = hashes[older["source_id"]] & hashes[newer["source_id"]]
+                    denominator = min(
+                        len(hashes[older["source_id"]]), len(hashes[newer["source_id"]])
+                    )
+                    if not denominator:
+                        continue
+                    if (
+                        len(shared) >= self.VERSION_OVERLAP_MIN_SHARED
+                        and len(shared) / denominator >= self.VERSION_OVERLAP_RATIO
+                    ):
+                        connection.execute(
+                            "UPDATE recall_sources SET superseded_by = ? WHERE source_id = ?",
+                            (newer["source_id"], older["source_id"]),
+                        )
+                        superseded += 1
+            return {"families": len(families), "superseded": superseded}
+
+    def superseded_info(self, source_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """供结果组装附带版本信息：谁被谁取代、家族里还有几版。"""
+
+        if not source_ids:
+            return {}
+        placeholders = ",".join("?" * len(source_ids))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT source_id, family_key, superseded_by FROM recall_sources"
+                f" WHERE source_id IN ({placeholders})",
+                list(source_ids),
+            ).fetchall()
+            info: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                key = str(row["family_key"] or "")
+                count = 0
+                if key:
+                    count = int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM recall_sources WHERE family_key = ?",
+                            (key,),
+                        ).fetchone()[0]
+                    )
+                info[str(row["source_id"])] = {
+                    "family_key": key,
+                    "superseded_by": str(row["superseded_by"] or ""),
+                    "family_size": count,
+                }
+            return info
+
+    # ------------------------------------------------------------------
     # 读取
     # ------------------------------------------------------------------
 
@@ -355,6 +529,18 @@ class RecallIndex:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM recall_nodes WHERE id = ?", (node_id_value,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def source_root(self, source_id: str) -> dict[str, Any] | None:
+        """Return the file/chat root when a caller retained only its source id."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM recall_nodes"
+                " WHERE source_id = ? AND (parent_id IS NULL OR parent_id = '')"
+                " ORDER BY ordinal ASC LIMIT 1",
+                (source_id,),
             ).fetchone()
         return dict(row) if row else None
 
@@ -447,6 +633,7 @@ class RecallIndex:
                 FROM recall_nodes n
                 LEFT JOIN recall_vectors v ON v.text_hash = n.text_hash AND v.model = ?
                 WHERE n.is_leaf = 1 AND n.text_hash != '' AND v.text_hash IS NULL
+                  AND n.title != '工具结果'
                 GROUP BY n.text_hash
                 ORDER BY occurred_at DESC
                 LIMIT ?

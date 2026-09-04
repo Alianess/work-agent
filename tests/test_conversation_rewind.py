@@ -112,6 +112,26 @@ class ConversationRewindTests(unittest.TestCase):
             self.assertEqual(store.load(waiting.id).status, "waiting_approval")
             self.assertEqual(store.load(other.id).status, "running")
 
+    def test_startup_sweep_retires_running_turns_across_conversations(self) -> None:
+        """重启杀掉的 chat stream 在磁盘上永远 running；启动清扫让刷新即可恢复。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = TurnStore(directory, turn_dir=directory)
+            first = store.create(conversation_id="conversation-1")
+            second = store.create(conversation_id="conversation-2")
+            done = store.create(conversation_id="conversation-1")
+            done_path = Path(directory) / f"{done.id}.json"
+            payload = json.loads(done_path.read_text(encoding="utf-8"))
+            payload["status"] = "succeeded"
+            done_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            retired = store.fail_interrupted_running_all()
+
+            self.assertEqual(retired, 2)
+            self.assertEqual(store.load(first.id).status, "failed")
+            self.assertEqual(store.load(second.id).status, "failed")
+            self.assertIn("重启", store.load(first.id).error)
+
     def test_old_terminal_turn_logs_fold_to_public_path_and_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = TurnStore(directory)

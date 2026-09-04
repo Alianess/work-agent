@@ -12,9 +12,14 @@ from work_agent_core.memory import (
     PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS,
     ContextCompactionCancelled,
     ContextCompactionError,
+    compaction_output_token_budget,
+    extract_recent_visible_turns,
     inspect_session_memory,
     prepare_session_memory,
+    profile_context_trigger_tokens,
     provider_usage_baseline_payload,
+    summarize_active_react_checkpoint,
+    strip_compacted_attachment_block,
 )
 from work_agent_core.session_store import ConversationSession
 
@@ -24,9 +29,14 @@ class RecordingClient:
         self.content = content
         self.calls: list[dict[str, object]] = []
 
-    def chat(self, messages, *, profile, max_tokens):
+    def chat(self, messages, *, profile, max_tokens, reasoning_effort=None):
         self.calls.append(
-            {"messages": messages, "profile": profile, "max_tokens": max_tokens}
+            {
+                "messages": messages,
+                "profile": profile,
+                "max_tokens": max_tokens,
+                "reasoning_effort": reasoning_effort,
+            }
         )
         return SimpleNamespace(content=self.content)
 
@@ -39,6 +49,66 @@ class ChatMemoryTests(unittest.TestCase):
             base_url="http://example.invalid",
             model="test-model",
             api_key_env="TEST_API_KEY",
+        )
+
+    def test_profile_context_window_lowers_the_compaction_trigger(self) -> None:
+        local_profile = ModelProfile(
+            name="lmstudio-qwen3.8-27b",
+            provider="lm-studio",
+            base_url="http://100.86.69.1:1234/v1",
+            model="qwen3.8-27b",
+            api_key_env="LM_STUDIO_API_KEY",
+            context_length=108032,
+        )
+
+        self.assertEqual(profile_context_trigger_tokens(local_profile), 91827)
+
+    def test_large_context_profile_uses_its_own_window_without_global_cap(self) -> None:
+        glm_profile = ModelProfile(
+            name="opencode-go-glm-5.2",
+            provider="opencode-go",
+            base_url="https://opencode.ai/zen/go/v1",
+            model="glm-5.2",
+            api_key_env="UNUSED",
+            max_tokens=131_072,
+            context_length=1_000_000,
+        )
+
+        self.assertEqual(profile_context_trigger_tokens(glm_profile), 850_000)
+        self.assertEqual(compaction_output_token_budget(glm_profile), 131_072)
+
+    def test_compacted_attachment_reference_leaves_live_context(self) -> None:
+        text = (
+            "请看这张图\n\n参考附件：\n"
+            "- [图片] history.png: meet_files/attachments/history.png"
+        )
+
+        self.assertEqual(strip_compacted_attachment_block(text), "请看这张图")
+        self.assertEqual(
+            extract_recent_visible_turns(
+                [
+                    {"role": "user", "content": text},
+                    {"role": "assistant", "content": "已经看到。"},
+                ],
+                turn_limit=2,
+            ),
+            [
+                {"role": "user", "content": "请看这张图"},
+                {"role": "assistant", "content": "已经看到。"},
+            ],
+        )
+        self.assertEqual(
+            extract_recent_visible_turns(
+                [
+                    {
+                        "role": "user",
+                        "content": "参考附件：\n- [图片] history.png: meet_files/attachments/history.png",
+                    },
+                    {"role": "assistant", "content": "已经看到。"},
+                ],
+                turn_limit=2,
+            )[0]["content"],
+            "（该轮图片附件已随上下文压缩移除）",
         )
 
     def test_compaction_merges_all_completed_messages_and_keeps_two_visible_turns(self) -> None:
@@ -80,7 +150,7 @@ class ChatMemoryTests(unittest.TestCase):
         client = RecordingClient()
 
         with patch(
-            "work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS", 1
+            "work_agent_core.memory.profile_context_trigger_tokens", return_value=1
         ):
             prepared = prepare_session_memory(client, self.profile, session)
 
@@ -108,7 +178,7 @@ class ChatMemoryTests(unittest.TestCase):
                 {"role": "user", "content": "当前正在处理的问题"},
             ],
         )
-        self.assertEqual(client.calls[0]["max_tokens"], 8192)
+        self.assertEqual(client.calls[0]["max_tokens"], 16384)
         summary_input = client.calls[0]["messages"][1]["content"]
         self.assertIn("旧工作摘要：已经完成准备工作。", summary_input)
         self.assertIn("read_file", summary_input)
@@ -116,12 +186,13 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertIn("关键工具证据：预算 280 万元", summary_input)
         self.assertIn("第一轮问题", summary_input)
         self.assertIn("第三轮最终回答", summary_input)
+        self.assertIn("与续作无关的图片路径应删除", client.calls[0]["messages"][0]["content"])
         self.assertIn("不是长期记忆", prepared.system_context)
         self.assertIn("当前任务", prepared.system_context)
 
         followup_client = RecordingClient()
         with patch(
-            "work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS", 1_000_000
+            "work_agent_core.memory.profile_context_trigger_tokens", return_value=1_000_000
         ):
             followup = prepare_session_memory(followup_client, self.profile, session)
         self.assertFalse(followup.compacted)
@@ -156,7 +227,7 @@ class ChatMemoryTests(unittest.TestCase):
         client = RecordingClient()
 
         with patch(
-            "work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS", 1
+            "work_agent_core.memory.profile_context_trigger_tokens", return_value=1
         ):
             prepared = prepare_session_memory(client, self.profile, session)
 
@@ -178,12 +249,81 @@ class ChatMemoryTests(unittest.TestCase):
         client = RecordingClient()
 
         with patch(
-            "work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS", 1_000_000
+            "work_agent_core.memory.profile_context_trigger_tokens", return_value=1_000_000
         ):
             prepared = prepare_session_memory(client, self.profile, session)
 
         self.assertFalse(prepared.compacted)
         self.assertEqual(prepared.messages, messages)
+        self.assertEqual(client.calls, [])
+
+    def test_large_tool_history_compacts_before_the_token_window_is_nearly_full(self) -> None:
+        messages = [
+            {"role": "user", "content": "读取材料"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-large",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"a.md"}'},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-large",
+                "name": "read_file",
+                "content": "工具原文" * 20,
+            },
+            {"role": "assistant", "content": "材料已读取"},
+            {"role": "user", "content": "继续给出结论"},
+        ]
+        session = ConversationSession(id="tool-pressure-test", messages=deepcopy(messages))
+        client = RecordingClient()
+
+        with (
+            patch(
+                "work_agent_core.memory.profile_context_trigger_tokens",
+                return_value=1_000_000,
+            ),
+            patch("work_agent_core.memory.CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES", 1_000_000),
+            patch("work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS", 20),
+        ):
+            prepared = prepare_session_memory(client, self.profile, session)
+
+        self.assertTrue(prepared.compacted)
+        self.assertIn("tool_results", prepared.pressure_reasons)
+        self.assertEqual(prepared.summary_message_count, len(messages) - 1)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(prepared.tool_result_chars, len("工具原文" * 20))
+        self.assertLess(prepared.post_compaction_tool_result_chars, prepared.tool_result_chars)
+        self.assertEqual(
+            session.compaction_events[-1]["trigger_reasons"],
+            ["tool_results"],
+        )
+        self.assertEqual(
+            session.compaction_events[-1]["before_estimated_tokens"],
+            prepared.estimated_tokens,
+        )
+        self.assertEqual(
+            session.compaction_events[-1]["after_estimated_tokens"],
+            prepared.post_compaction_estimated_tokens,
+        )
+
+    def test_hundreds_of_kilobytes_do_not_masquerade_as_context_tokens(self) -> None:
+        messages = [
+            {"role": "user", "content": "读取这段英文材料"},
+            {"role": "assistant", "content": "x" * 300_000},
+        ]
+        session = ConversationSession(id="byte-token-separation", messages=deepcopy(messages))
+        client = RecordingClient()
+
+        prepared = prepare_session_memory(client, self.profile, session)
+
+        self.assertGreater(prepared.serialized_bytes, 256_000)
+        self.assertLess(prepared.estimated_tokens, profile_context_trigger_tokens(self.profile))
+        self.assertFalse(prepared.compacted)
+        self.assertEqual(prepared.pressure_reasons, ())
         self.assertEqual(client.calls, [])
 
     def test_reuses_preflight_inspection_without_sanitizing_messages_twice(self) -> None:
@@ -224,8 +364,8 @@ class ChatMemoryTests(unittest.TestCase):
             for message in messages
         )
         with patch(
-            "work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS",
-            raw_tokens + 10,
+            "work_agent_core.memory.profile_context_trigger_tokens",
+            return_value=raw_tokens + 10,
         ):
             prepared = prepare_session_memory(
                 client,
@@ -269,6 +409,10 @@ class ChatMemoryTests(unittest.TestCase):
             + (current_raw - anchor)
             + 8_192
             + PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS,
+        )
+        self.assertEqual(
+            inspection.token_count_source,
+            "provider_usage_plus_estimated_delta",
         )
 
     def test_usage_baseline_is_ignored_after_model_or_summary_changes(self) -> None:
@@ -319,7 +463,7 @@ class ChatMemoryTests(unittest.TestCase):
         client = RecordingClient()
 
         with patch(
-            "work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS", 1_000_000
+            "work_agent_core.memory.profile_context_trigger_tokens", return_value=1_000_000
         ):
             prepared = prepare_session_memory(
                 client,
@@ -331,6 +475,7 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertTrue(prepared.compacted)
         self.assertEqual(prepared.summary_message_count, 2)
         self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["reasoning_effort"], "light")
 
     def test_compaction_failure_preserves_original_messages_without_fallback(self) -> None:
         class FailingClient:
@@ -343,7 +488,7 @@ class ChatMemoryTests(unittest.TestCase):
         ]
         session = ConversationSession(id="failed-compact", messages=deepcopy(messages))
 
-        with patch("work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS", 1):
+        with patch("work_agent_core.memory.profile_context_trigger_tokens", return_value=1):
             with self.assertRaises(ContextCompactionError) as captured:
                 prepare_session_memory(FailingClient(), self.profile, session, force=True)
 
@@ -352,6 +497,64 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertEqual(session.summary, "")
         self.assertEqual(session.summary_message_count, 0)
         self.assertEqual(session.compaction_events, [])
+
+    def test_active_checkpoint_empty_response_reports_finish_and_reasoning_shape(self) -> None:
+        class ReasoningOnlyClient:
+            def chat(self, *_args, **_kwargs):
+                return SimpleNamespace(
+                    content="",
+                    raw={
+                        "choices": [
+                            {
+                                "finish_reason": "length",
+                                "message": {
+                                    "content": "",
+                                    "reasoning_content": "private reasoning body",
+                                },
+                            }
+                        ]
+                    },
+                )
+
+        with self.assertRaises(ContextCompactionError) as captured:
+            summarize_active_react_checkpoint(
+                ReasoningOnlyClient(),
+                self.profile,
+                [{"role": "user", "content": "继续任务"}],
+            )
+
+        message = str(captured.exception)
+        self.assertIn("finish_reason=length", message)
+        self.assertIn("reasoning_fields=reasoning_content", message)
+        self.assertIn("reasoning_chars=", message)
+        self.assertNotIn("private reasoning body", message)
+
+    def test_active_checkpoint_requests_light_reasoning(self) -> None:
+        class CheckpointClient:
+            def chat(self, *_args, **kwargs):
+                self.reasoning_effort = kwargs.get("reasoning_effort")
+                self.max_tokens = kwargs.get("max_tokens")
+                return SimpleNamespace(content="## 当前目标与完成条件\n- 继续任务")
+
+        client = CheckpointClient()
+        glm_profile = ModelProfile(
+            name="opencode-go-glm-5.2",
+            provider="opencode-go",
+            base_url="https://opencode.ai/zen/go/v1",
+            model="glm-5.2",
+            api_key_env="UNUSED",
+            max_tokens=131_072,
+            context_length=1_000_000,
+        )
+        checkpoint = summarize_active_react_checkpoint(
+            client,
+            glm_profile,
+            [{"role": "user", "content": "继续任务"}],
+        )
+
+        self.assertEqual(client.reasoning_effort, "light")
+        self.assertEqual(client.max_tokens, 131_072)
+        self.assertIn("继续任务", checkpoint)
 
     def test_compaction_can_cancel_the_streaming_model_request(self) -> None:
         class CancelableClient:
@@ -374,7 +577,7 @@ class ChatMemoryTests(unittest.TestCase):
         ]
         session = ConversationSession(id="cancel-compact", messages=deepcopy(messages))
 
-        with patch("work_agent_core.memory.CHAT_SUMMARY_TRIGGER_TOKENS", 1):
+        with patch("work_agent_core.memory.profile_context_trigger_tokens", return_value=1):
             with self.assertRaises(ContextCompactionCancelled):
                 prepare_session_memory(
                     CancelableClient(),

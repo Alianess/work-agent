@@ -16,12 +16,29 @@ from .recall_archive import (
     build_recall_episodes,
     compact_messages_for_archive,
 )
-from .session_store import ConversationSession, repair_runtime_message_sequence, sanitize_runtime_message
+from .session_store import (
+    ConversationSession,
+    is_turn_runtime_context_message,
+    repair_runtime_message_sequence,
+    sanitize_runtime_message,
+)
 
 
 CHAT_CONTEXT_TOKEN_BUDGET = 256_000
-CHAT_SUMMARY_TRIGGER_TOKENS = int(CHAT_CONTEXT_TOKEN_BUDGET * 0.9)
-CHAT_SUMMARY_MAX_TOKENS = 8_192
+CONTEXT_COMPACTION_TRIGGER_RATIO = 0.85
+CHAT_SUMMARY_TRIGGER_TOKENS = int(
+    CHAT_CONTEXT_TOKEN_BUDGET * CONTEXT_COMPACTION_TRIGGER_RATIO
+)
+# Serialized bytes are a process/transport guard, not a proxy for model tokens.
+# CJK text commonly occupies three UTF-8 bytes per token and JSON/tool payloads
+# often occupy more, so the previous 256 KB threshold compacted healthy ~140k
+# token sessions far before their context limit.
+CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES = 4 * 1024 * 1024
+# Tool text is already represented in token pressure. Keep a separate
+# multi-megabyte process guard for pathological payloads, but do not invoke a
+# model summary merely because an ordinary read/search returned 100k chars.
+CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS = 4 * 1024 * 1024
+CHAT_SUMMARY_MAX_TOKENS = 131_072
 CHAT_RECENT_VISIBLE_TURNS = 2
 # Leave room for the model's answer plus the system prompt, native tool
 # schemas, skill catalog and other request framing that is not stored in
@@ -31,7 +48,7 @@ CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS = 24_000
 PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS = 4_096
 PROVIDER_USAGE_BASELINE_KEY = "provider_token_usage_baseline"
 ACTIVE_REACT_CHECKPOINT_TRIGGER_TOKENS = CHAT_SUMMARY_TRIGGER_TOKENS
-ACTIVE_REACT_CHECKPOINT_MAX_TOKENS = 8_192
+ACTIVE_REACT_CHECKPOINT_MAX_TOKENS = 131_072
 
 CHAT_SUMMARY_SECTIONS = (
     "当前目标与用户意图",
@@ -53,11 +70,57 @@ class ContextCompactionCancelled(RuntimeError):
     """The user cancelled while a continuation summary was being generated."""
 
 
+def profile_context_trigger_tokens(profile: ModelProfile | None) -> int:
+    """Compact before the selected endpoint's real context window is exhausted."""
+
+    if profile is None:
+        return CHAT_SUMMARY_TRIGGER_TOKENS
+    configured = max(1, int(getattr(profile, "context_length", 0) or CHAT_CONTEXT_TOKEN_BUDGET))
+    # The old global min() silently capped every large-context model at the
+    # 256k fallback's 85% line.  A 1M model therefore compacted at 217.6k even
+    # when the provider accurately reported a much larger valid input.
+    return max(1, int(configured * CONTEXT_COMPACTION_TRIGGER_RATIO))
+
+
+def compaction_output_token_budget(profile: ModelProfile) -> int:
+    """Give compaction enough output room without crowding out its input.
+
+    The old fixed 8k limit was consumed entirely by reasoning on GLM.  A
+    compaction cap should follow the selected model, while remaining inside
+    the space left after the 85% input trigger and a small framing reserve.
+    """
+
+    configured_output = max(1, int(profile.max_tokens or 1))
+    available_after_trigger = max(
+        1_024,
+        int(profile.context_length)
+        - profile_context_trigger_tokens(profile)
+        - PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS,
+    )
+    return min(configured_output, available_after_trigger)
+
+
+def token_count_source_label(source: str) -> str:
+    """Render accounting provenance without implying an estimate is exact."""
+
+    return {
+        "provider_usage": "供应商最近一次请求的 input/prompt usage",
+        "provider_usage_plus_estimated_delta": (
+            "供应商最近一次请求的 input/prompt usage + 此后新增消息估算"
+        ),
+        "estimated_full_request": "发送前完整请求本地估算",
+        "estimated_session_plus_reserve": "会话消息本地估算 + 请求预留",
+    }.get(str(source or ""), str(source or "未知"))
+
+
 @dataclass(frozen=True)
 class SessionMemoryInspection:
     messages: list[dict[str, Any]]
     covered_count: int
     estimated_tokens: int
+    serialized_bytes: int
+    tool_result_chars: int
+    token_count_source: str = "estimated_session_plus_reserve"
 
 
 @dataclass(frozen=True)
@@ -66,8 +129,51 @@ class PreparedSessionMemory:
     summary: str
     summary_message_count: int
     compacted: bool
+    # ``estimated_tokens`` is deliberately the pressure measured *before*
+    # compaction.  Keep the post-compaction working-set estimate separate so
+    # callers never compare the smaller result with the trigger and claim the
+    # impossible (for example, "134k exceeded 230k").
     estimated_tokens: int
+    post_compaction_estimated_tokens: int
+    serialized_bytes: int
+    tool_result_chars: int
+    post_compaction_serialized_bytes: int
+    post_compaction_tool_result_chars: int
     system_context: str
+    pressure_reasons: tuple[str, ...] = ()
+    token_count_source: str = "estimated_session_plus_reserve"
+
+
+def message_pressure_metrics(
+    messages: list[dict[str, Any]],
+    *,
+    summary: str = "",
+) -> tuple[int, int]:
+    """Measure replay pressure that token-window accounting does not capture."""
+
+    serialized_bytes = len(
+        json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ) + len(str(summary or "").encode("utf-8"))
+    tool_result_chars = sum(
+        len(str(message.get("content") or ""))
+        for message in messages
+        if message.get("role") == "tool"
+    )
+    return serialized_bytes, tool_result_chars
+
+
+def context_pressure_reasons(
+    inspection: SessionMemoryInspection,
+    profile: ModelProfile | None,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if inspection.estimated_tokens >= profile_context_trigger_tokens(profile):
+        reasons.append("tokens")
+    if inspection.serialized_bytes >= CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES:
+        reasons.append("serialized_bytes")
+    if inspection.tool_result_chars >= CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS:
+        reasons.append("tool_results")
+    return tuple(reasons)
 
 
 def inspect_session_memory(
@@ -84,8 +190,13 @@ def inspect_session_memory(
     covered_count = min(max(0, int(session.summary_message_count or 0)), len(messages))
     if not str(session.summary or "").strip():
         covered_count = 0
-    raw_context_tokens = estimate_messages_tokens(messages[covered_count:]) + estimate_context_tokens(session.summary)
-    estimated_tokens = usage_baseline_context_tokens(
+    active_messages = messages[covered_count:]
+    raw_context_tokens = estimate_messages_tokens(active_messages) + estimate_context_tokens(session.summary)
+    serialized_bytes, tool_result_chars = message_pressure_metrics(
+        active_messages,
+        summary=session.summary,
+    )
+    estimated_tokens, token_count_source = usage_baseline_context_accounting(
         session,
         messages=messages,
         raw_context_tokens=raw_context_tokens,
@@ -96,6 +207,9 @@ def inspect_session_memory(
         messages=messages,
         covered_count=covered_count,
         estimated_tokens=estimated_tokens,
+        serialized_bytes=serialized_bytes,
+        tool_result_chars=tool_result_chars,
+        token_count_source=token_count_source,
     )
 
 
@@ -135,10 +249,34 @@ def usage_baseline_context_tokens(
     profile: ModelProfile | None,
 ) -> int:
     """Use the last real provider input count plus only the later message delta."""
+    return usage_baseline_context_accounting(
+        session,
+        messages=messages,
+        raw_context_tokens=raw_context_tokens,
+        reserved_tokens=reserved_tokens,
+        profile=profile,
+    )[0]
+
+
+def usage_baseline_context_accounting(
+    session: ConversationSession,
+    *,
+    messages: list[dict[str, Any]],
+    raw_context_tokens: int,
+    reserved_tokens: int,
+    profile: ModelProfile | None,
+) -> tuple[int, str]:
+    """Return pressure and provenance without conflating usage categories.
+
+    A provider's most recent single-request input count is authoritative for
+    that exact request.  Only content added after its persisted anchor is
+    estimated locally.  ``completion_tokens`` and ``total_tokens`` are billing
+    metrics and intentionally never participate in context-window pressure.
+    """
     fallback = max(0, int(raw_context_tokens)) + max(0, int(reserved_tokens))
     baseline = session.metadata.get(PROVIDER_USAGE_BASELINE_KEY)
     if not isinstance(baseline, dict) or profile is None:
-        return fallback
+        return fallback, "estimated_session_plus_reserve"
     if (
         str(baseline.get("profile") or "") != profile.name
         or str(baseline.get("model") or "") != profile.model
@@ -148,11 +286,11 @@ def usage_baseline_context_tokens(
         or str(baseline.get("summary_sha256") or "")
         != sha256(str(session.summary or "").encode("utf-8")).hexdigest()
     ):
-        return fallback
+        return fallback, "estimated_session_plus_reserve"
     prompt_tokens = int(baseline.get("prompt_tokens") or 0)
     anchor_tokens = int(baseline.get("anchor_raw_session_tokens") or 0)
     if prompt_tokens <= 0 or anchor_tokens < 0 or raw_context_tokens < anchor_tokens:
-        return fallback
+        return fallback, "estimated_session_plus_reserve"
     delta_tokens = raw_context_tokens - anchor_tokens
     # prompt_tokens already includes system text, tool schemas and request framing.
     # Only reserve the next answer and a small allowance for dynamic framing.
@@ -160,7 +298,15 @@ def usage_baseline_context_tokens(
         0,
         int(reserved_tokens) - CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
     )
-    return prompt_tokens + delta_tokens + output_reserve + PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS
+    pressure = (
+        prompt_tokens
+        + delta_tokens
+        + output_reserve
+        + PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS
+    )
+    if delta_tokens or output_reserve or PROVIDER_USAGE_DYNAMIC_SAFETY_TOKENS:
+        return pressure, "provider_usage_plus_estimated_delta"
+    return pressure, "provider_usage"
 
 
 def provider_usage_baseline_payload(
@@ -174,15 +320,11 @@ def provider_usage_baseline_payload(
     prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
     if prompt_tokens <= 0:
         return None
-    completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
     return {
         "profile": profile.name,
         "model": profile.model,
         "base_url": profile.base_url.rstrip("/"),
         "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
         "anchor_raw_session_tokens": max(0, int(anchor_raw_session_tokens)),
         "summary_message_count": max(0, int(summary_message_count)),
         "summary_sha256": sha256(str(summary or "").encode("utf-8")).hexdigest(),
@@ -222,8 +364,9 @@ def prepare_session_memory(
         )
     unsummarized_messages = session.messages[covered_count:]
     estimated_tokens = inspected.estimated_tokens
+    pressure_reasons = context_pressure_reasons(inspected, profile)
 
-    if not force and estimated_tokens < CHAT_SUMMARY_TRIGGER_TOKENS:
+    if not force and not pressure_reasons:
         recent = runtime_messages_with_retained_turns(
             session.messages,
             covered_count=covered_count,
@@ -235,7 +378,14 @@ def prepare_session_memory(
             summary_message_count=covered_count,
             compacted=False,
             estimated_tokens=estimated_tokens,
+            post_compaction_estimated_tokens=estimated_tokens,
+            serialized_bytes=inspected.serialized_bytes,
+            tool_result_chars=inspected.tool_result_chars,
+            post_compaction_serialized_bytes=inspected.serialized_bytes,
+            post_compaction_tool_result_chars=inspected.tool_result_chars,
             system_context=render_summary_system_context(session.summary),
+            pressure_reasons=pressure_reasons,
+            token_count_source=inspected.token_count_source,
         )
 
     completed_end = completed_message_prefix_end(unsummarized_messages)
@@ -251,7 +401,14 @@ def prepare_session_memory(
             summary_message_count=covered_count,
             compacted=False,
             estimated_tokens=estimated_tokens,
+            post_compaction_estimated_tokens=estimated_tokens,
+            serialized_bytes=inspected.serialized_bytes,
+            tool_result_chars=inspected.tool_result_chars,
+            post_compaction_serialized_bytes=inspected.serialized_bytes,
+            post_compaction_tool_result_chars=inspected.tool_result_chars,
             system_context=render_summary_system_context(session.summary),
+            pressure_reasons=pressure_reasons,
+            token_count_source=inspected.token_count_source,
         )
 
     summary = summarize_session_messages(
@@ -274,6 +431,26 @@ def prepare_session_memory(
     session.summary = summary
     session.summary_message_count = next_covered_count
     session.metadata.pop(PROVIDER_USAGE_BASELINE_KEY, None)
+    recent_visible_turns = extract_recent_visible_turns(
+        session.messages[:next_covered_count],
+        turn_limit=CHAT_RECENT_VISIBLE_TURNS,
+    )
+    active_tail = session.messages[next_covered_count:]
+    prepared_messages = trim_to_valid_context_boundary(recent_visible_turns + active_tail)
+    post_serialized_bytes, post_tool_result_chars = message_pressure_metrics(
+        prepared_messages,
+        summary=summary,
+    )
+    # A provider usage baseline describes the request before the summary was
+    # replaced and is invalid after compaction.  The post value is therefore a
+    # fresh, conservative working-set estimate including the same framing and
+    # output reserve used by preflight.
+    post_estimated_tokens = (
+        estimate_messages_tokens(prepared_messages)
+        + estimate_context_tokens(summary)
+        + max(0, int(reserved_tokens))
+    )
+    resolved_pressure_reasons = pressure_reasons or ("forced",)
     session.compaction_events.append(
         {
             "id": f"compact-{int(time.time())}-{next_covered_count}",
@@ -281,23 +458,36 @@ def prepare_session_memory(
             "to_message_index": next_covered_count,
             "summary_sha256": sha256(summary.encode("utf-8")).hexdigest(),
             "episode_count": len(session.recall_episodes),
+            "trigger_reasons": list(resolved_pressure_reasons),
+            "before_estimated_tokens": estimated_tokens,
+            "token_count_source": inspected.token_count_source,
+            "before_serialized_bytes": inspected.serialized_bytes,
+            "before_tool_result_chars": inspected.tool_result_chars,
+            "token_trigger": profile_context_trigger_tokens(profile),
+            "serialized_bytes_trigger": CHAT_SUMMARY_TRIGGER_SERIALIZED_BYTES,
+            "tool_result_chars_trigger": CHAT_SUMMARY_TRIGGER_TOOL_RESULT_CHARS,
+            "after_estimated_tokens": post_estimated_tokens,
+            "after_serialized_bytes": post_serialized_bytes,
+            "after_tool_result_chars": post_tool_result_chars,
             "created_at": int(time.time()),
         }
     )
     session.compaction_events = session.compaction_events[-64:]
 
-    recent_visible_turns = extract_recent_visible_turns(
-        session.messages[:next_covered_count],
-        turn_limit=CHAT_RECENT_VISIBLE_TURNS,
-    )
-    active_tail = session.messages[next_covered_count:]
     return PreparedSessionMemory(
-        messages=trim_to_valid_context_boundary(recent_visible_turns + active_tail),
+        messages=prepared_messages,
         summary=summary,
         summary_message_count=next_covered_count,
         compacted=True,
         estimated_tokens=estimated_tokens,
+        post_compaction_estimated_tokens=post_estimated_tokens,
+        serialized_bytes=inspected.serialized_bytes,
+        tool_result_chars=inspected.tool_result_chars,
+        post_compaction_serialized_bytes=post_serialized_bytes,
+        post_compaction_tool_result_chars=post_tool_result_chars,
         system_context=render_summary_system_context(summary),
+        pressure_reasons=resolved_pressure_reasons,
+        token_count_source=inspected.token_count_source,
     )
 
 
@@ -344,7 +534,10 @@ def summarize_session_messages(
                 "6. 每个栏目可以有任意数量条目，以信息完整为先；确实没有内容才写“无”。\n"
                 "7. 最近两轮的完整 ReAct 工具链也在输入中；把其中会影响续作的信息并入"
                 "摘要，不要因为运行时还会展示最近两轮最终回答而省略工具证据。\n"
-                "8. 使用紧凑 Markdown 条目，不写寒暄、修辞、思维链或重复内容。\n\n"
+                "8. 附件图像的像素会在本次压缩后移出模型上下文。只有当当前任务后续"
+                "明确需要重新打开某张图时，才在摘要中保留其精确路径及用途；"
+                "与续作无关的图片路径应删除，不得用 OCR 文本冒充已保留原图。\n"
+                "9. 使用紧凑 Markdown 条目，不写寒暄、修辞、思维链或重复内容。\n\n"
                 "必须严格使用以下八个二级标题，保持顺序：\n"
                 + "\n".join(f"## {section}" for section in CHAT_SUMMARY_SECTIONS)
             ),
@@ -361,7 +554,15 @@ def summarize_session_messages(
     ]
     try:
         if cancel_check is None or not hasattr(client, "chat_tools_stream"):
-            response = client.chat(messages, profile=profile, max_tokens=CHAT_SUMMARY_MAX_TOKENS)
+            response = client.chat(
+                messages,
+                profile=profile,
+                max_tokens=min(
+                    CHAT_SUMMARY_MAX_TOKENS,
+                    compaction_output_token_budget(profile),
+                ),
+                reasoning_effort="light",
+            )
         else:
             if cancel_check():
                 raise ContextCompactionCancelled("用户停止了上下文压缩。")
@@ -387,7 +588,11 @@ def summarize_session_messages(
                 response = client.chat_tools_stream(
                     messages,
                     profile=profile,
-                    max_tokens=CHAT_SUMMARY_MAX_TOKENS,
+                    max_tokens=min(
+                        CHAT_SUMMARY_MAX_TOKENS,
+                        compaction_output_token_budget(profile),
+                    ),
+                    reasoning_effort="light",
                     cancel_event=cancel_event,
                 )
             finally:
@@ -460,7 +665,11 @@ def summarize_active_react_checkpoint(
             },
         ],
             profile=profile,
-            max_tokens=ACTIVE_REACT_CHECKPOINT_MAX_TOKENS,
+            max_tokens=min(
+                ACTIVE_REACT_CHECKPOINT_MAX_TOKENS,
+                compaction_output_token_budget(profile),
+            ),
+            reasoning_effort="light",
         )
     except Exception as error:
         raise ContextCompactionError(
@@ -468,8 +677,45 @@ def summarize_active_react_checkpoint(
         ) from error
     checkpoint = str(response.content or "").strip()
     if not checkpoint:
-        raise ContextCompactionError("当前模型没有返回可用的运行检查点，不能安全继续本轮长任务。")
+        raise ContextCompactionError(
+            "当前模型没有返回可用的运行检查点，不能安全继续本轮长任务。"
+            + empty_checkpoint_response_diagnostics(getattr(response, "raw", None))
+        )
     return checkpoint
+
+
+def empty_checkpoint_response_diagnostics(raw: Any) -> str:
+    """Describe an empty compaction response without persisting private reasoning."""
+
+    if not isinstance(raw, dict):
+        return "响应未包含可诊断的原始结构。"
+    choices = raw.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    reasoning_chars = 0
+    reasoning_fields: list[str] = []
+    for key in (
+        "reasoning_content",
+        "reasoning",
+        "reasoning_summary",
+        "reasoning_details",
+        "thinking",
+        "thought",
+    ):
+        value = message.get(key)
+        if value in (None, "", [], {}):
+            continue
+        reasoning_fields.append(key)
+        try:
+            reasoning_chars += len(json.dumps(value, ensure_ascii=False))
+        except TypeError:
+            reasoning_chars += len(str(value))
+    finish_reason = str(choice.get("finish_reason") or "unknown")
+    message_keys = ",".join(sorted(str(key) for key in message)) or "none"
+    return (
+        f"响应诊断：finish_reason={finish_reason}，reasoning_chars={reasoning_chars}，"
+        f"reasoning_fields={','.join(reasoning_fields) or 'none'}，message_keys={message_keys}。"
+    )
 
 
 def serialize_runtime_messages_for_summary(messages: list[dict[str, Any]]) -> str:
@@ -512,6 +758,10 @@ def completed_message_prefix_end(messages: list[dict[str, Any]]) -> int:
     if not user_indexes:
         return 0
     current_turn_start = user_indexes[-1]
+    while current_turn_start > 0 and is_turn_runtime_context_message(
+        messages[current_turn_start - 1]
+    ):
+        current_turn_start -= 1
     if turn_has_final_answer(messages[current_turn_start:]):
         return len(messages)
     return current_turn_start
@@ -520,7 +770,7 @@ def completed_message_prefix_end(messages: list[dict[str, Any]]) -> int:
 def turn_has_final_answer(messages: list[dict[str, Any]]) -> bool:
     for message in reversed(messages):
         role = message.get("role")
-        if role == "tool":
+        if role in {"tool", "system"}:
             continue
         return bool(
             role == "assistant"
@@ -537,11 +787,16 @@ def extract_recent_visible_turns(
 ) -> list[dict[str, Any]]:
     turns: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
+    pending_turn_contexts: list[dict[str, Any]] = []
     for message in messages:
+        if is_turn_runtime_context_message(message):
+            pending_turn_contexts.append(message)
+            continue
         if message.get("role") == "user":
             if current:
                 turns.append(current)
-            current = [message]
+            current = [*pending_turn_contexts, message]
+            pending_turn_contexts = []
         elif current:
             current.append(message)
     if current:
@@ -550,7 +805,8 @@ def extract_recent_visible_turns(
     visible: list[dict[str, Any]] = []
     completed = [turn for turn in turns if turn_has_final_answer(turn)]
     for turn in completed[-max(0, turn_limit):]:
-        user = turn[0]
+        runtime_contexts = [message for message in turn if is_turn_runtime_context_message(message)]
+        user = next(message for message in turn if message.get("role") == "user")
         final = next(
             (
                 message
@@ -563,9 +819,27 @@ def extract_recent_visible_turns(
         )
         if final is None:
             continue
-        visible.append({"role": "user", "content": str(user.get("content") or "")})
+        visible.extend(runtime_contexts)
+        compacted_user_content = strip_compacted_attachment_block(
+            str(user.get("content") or "")
+        )
+        visible.append({
+            "role": "user",
+            "content": compacted_user_content or "（该轮图片附件已随上下文压缩移除）",
+        })
         visible.append({"role": "assistant", "content": str(final.get("content") or "")})
     return visible
+
+
+def strip_compacted_attachment_block(text: str) -> str:
+    """Remove covered attachment references from the live model window.
+
+    The durable transcript remains untouched. The generated compaction summary
+    alone decides whether a path remains relevant; covered image pixels are
+    never silently resurrected into a later request.
+    """
+
+    return re.sub(r"\n*参考附件：[\s\S]*$", "", str(text or "")).strip()
 
 
 def runtime_messages_with_retained_turns(

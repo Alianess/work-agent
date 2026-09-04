@@ -107,9 +107,12 @@ def search(
             filters = NodeFilter(
                 source_kinds=filters.source_kinds,
                 source_ids=filters.source_ids,
+                excluded_source_ids=filters.excluded_source_ids,
                 since_ms=filters.since_ms,
                 until_ms=filters.until_ms,
                 entity_ids=entity_ids,
+                project_ids=filters.project_ids,
+                include_superseded=filters.include_superseded,
             )
         else:
             degraded.append("知识图谱未建，实体过滤跳过")
@@ -265,6 +268,23 @@ def search(
         if not option.get("summary")
     )
 
+    # 版本家族信息：默认检索只给最新版，但要告诉模型"还有旧版存在"——
+    # 问"以前的写法"时它知道加 include_superseded 再来一次，而不是以为没有。
+    version_info = index.superseded_info(
+        list({str(item["source_id"]) for item in results})
+    )
+    for item in results:
+        info = version_info.get(str(item["source_id"]))
+        if info and info["family_size"] > 1:
+            item["versions"] = {
+                "family_size": info["family_size"],
+                "is_latest": not info["superseded_by"],
+                "note": (
+                    "同名材料有多个版本，默认只保留最新一份；要看历史版本"
+                    "用 include_superseded=true 再检索。"
+                ),
+            }
+
     return {
         "ok": True,
         "query": query,
@@ -275,6 +295,7 @@ def search(
             "reranked": reranked,
             "recency_weight": recency_weight,
             "duplicates_folded": duplicates,
+            "superseded_excluded": not filters.include_superseded,
             "degraded": degraded,
         },
         "note": (
@@ -298,7 +319,19 @@ def expand(
     它在缓存前缀里，重复的代价很小，读不通的代价大得多。
     """
 
+    requested_id = node_id_value
+    recovered_from = ""
     target = index.node(node_id_value)
+    if target is None and "#" in node_id_value:
+        # Models occasionally preserve the exact source id but transpose a few
+        # characters in the opaque node hash.  The source prefix is stable and
+        # unambiguous, so recover to that source's root instead of turning a
+        # successful recall into an avoidable "unknown node" dead end.
+        source_id = node_id_value.rsplit("#", 1)[0]
+        target = index.source_root(source_id)
+        if target is not None:
+            recovered_from = requested_id
+            node_id_value = str(target["id"])
     if target is None:
         return {"ok": False, "error": f"未知节点：{node_id_value}"}
 
@@ -344,7 +377,7 @@ def expand(
             }
             for row in _children(index, str(target["id"]))
         ]
-        return {
+        outcome = {
             "ok": True,
             "id": str(target["id"]),
             "too_large": True,
@@ -353,9 +386,13 @@ def expand(
             "outline": children,
             "note": "这一节超过展开上限，先从目录里挑一个更小的再展开。",
         }
+        if recovered_from:
+            outcome["recovered_from"] = recovered_from
+            outcome["note"] += " 原节点哈希无效，已按同一来源恢复到文件根节点。"
+        return outcome
 
     already = [item for item in seen_ids if item and item != str(target["id"])]
-    return {
+    outcome = {
         "ok": True,
         "id": str(target["id"]),
         "path": split_path(str(target["path"])),
@@ -365,6 +402,10 @@ def expand(
         "expand": _expand_map(index, str(target["id"])),
         "already_shown": already,
     }
+    if recovered_from:
+        outcome["recovered_from"] = recovered_from
+        outcome["note"] = "原节点哈希无效，已按同一来源恢复到文件根节点。"
+    return outcome
 
 
 def _children(index: RecallIndex, node_id_value: str) -> list[dict[str, Any]]:

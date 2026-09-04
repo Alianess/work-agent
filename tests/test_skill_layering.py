@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,7 +66,41 @@ class SkillLayeringTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.bus.get_model_tool("transcribe_meeting_audio")
 
-    def test_history_recall_is_a_request_scoped_core_tool(self) -> None:
+    def test_skill_folders_are_discovered_and_removed_without_central_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            skill_dir = workspace / "work_agent_skills" / "portable-skill"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: portable-skill\ndescription: Portable test skill.\n---\n\n# Portable\n",
+                encoding="utf-8",
+            )
+
+            discovered = {item.id for item in load_skill_manifests(workspace)}
+            self.assertIn("portable-skill", discovered)
+            gateway = SkillGateway(
+                workspace,
+                [],
+                enabled_skill_ids={"portable-skill"},
+            ).as_tool()
+            listed = json.loads(gateway.handler({"op": "list"}))
+            self.assertIn("portable-skill", {item["id"] for item in listed["skills"]})
+
+            shutil.rmtree(skill_dir)
+            discovered_after_removal = {item.id for item in load_skill_manifests(workspace)}
+            self.assertNotIn("portable-skill", discovered_after_removal)
+            reloaded_gateway = SkillGateway(
+                workspace,
+                [],
+                enabled_skill_ids={"portable-skill"},
+            ).as_tool()
+            reloaded_list = json.loads(reloaded_gateway.handler({"op": "list"}))
+            self.assertNotIn(
+                "portable-skill",
+                {item["id"] for item in reloaded_list["skills"]},
+            )
+
+    def test_recall_and_memory_are_request_scoped_core_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SessionStore(WORKSPACE, session_dir=Path(directory) / "sessions")
             bus = build_default_tools(
@@ -75,13 +110,12 @@ class SkillLayeringTests(unittest.TestCase):
                 session_store=store,
                 conversation_id="conversation-layering-test",
             )
-            self.assertIn("recall_chat_history", {tool.name for tool in bus.list_model_tools()})
-            opened = json.loads(
-                bus.get_model_tool("sys_skill").handler(
-                    {"op": "open", "skill_id": "recall-chat-history", "max_chars": 5000}
-                )
-            )
-            self.assertIn("recall_chat_history", {item["name"] for item in opened["available_tools"]})
+            names = {tool.name for tool in bus.list_model_tools()}
+            self.assertIn("recall", names)
+            self.assertIn("remember", names)
+            self.assertIn("forget", names)
+            # 旧检索工具已下线：统一检索一条路，不再给模型两个相似的选择。
+            self.assertNotIn("recall_chat_history", names)
 
     def test_work_report_store_can_be_separate_from_file_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +177,7 @@ class SkillLayeringTests(unittest.TestCase):
         )
         self.assertIn("docx", official["instructions"])
         self.assertIn("GB/T 9704", official["instructions"])
+        self.assertNotIn("当前账户公司 Word 格式", official["instructions"])
 
         reports = json.loads(
             gateway.handler({"op": "open", "skill_id": "work-reports", "max_chars": 8000})
@@ -189,6 +224,26 @@ class SkillLayeringTests(unittest.TestCase):
                     "arguments": {"query": "test"},
                 }
             )
+
+    def test_skill_context_is_injected_only_when_matching_skill_is_opened(self) -> None:
+        gateway = SkillGateway(
+            WORKSPACE,
+            [],
+            skill_contexts={
+                "docx": "当前账户公司 Word 格式：标题二号小标宋",
+                "official-document": "当前账户公司 Word 格式：标题二号小标宋",
+            },
+        ).as_tool()
+
+        docx = json.loads(gateway.handler({"op": "open", "skill_id": "docx"}))
+        official = json.loads(
+            gateway.handler({"op": "open", "skill_id": "official-document"})
+        )
+        anysearch = json.loads(gateway.handler({"op": "open", "skill_id": "anysearch"}))
+
+        self.assertIn("标题二号小标宋", docx["instructions"])
+        self.assertIn("标题二号小标宋", official["instructions"])
+        self.assertNotIn("标题二号小标宋", anysearch["instructions"])
         with self.assertRaises(KeyError):
             gateway.handler(
                 {

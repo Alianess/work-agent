@@ -64,13 +64,17 @@ import type {
   AttachmentItem,
   ChatMessage,
   CrossChatMemory,
+  DeliveryArtifact,
+  RememberedApprovalRule,
   FileItem,
   FilePayload,
+  FridayNotification,
   FridayNotificationsPayload,
   MeetingArchive,
   MeetingTime,
   MeetingResult,
   MeetingMinutesSettingsPayload,
+  ModelEndpoint,
   ModelsPayload,
   ModelProfile,
   OfficePdfInput,
@@ -100,10 +104,10 @@ type LibraryFileGroup = {
   description: string;
   files: FileItem[];
 };
-type StatusTone = "idle" | "success" | "error" | "loading";
+type StatusTone = "idle" | "success" | "warning" | "error" | "loading";
 type RealtimeTranscriptionStatus = "idle" | "recording" | "processing" | "error";
 type MeetingCaptureMode = "microphone" | "system-audio";
-type ModelProviderPresetId = "openai-compatible" | "openai" | "deepseek" | "openrouter";
+type ModelProviderPresetId = "openai-compatible" | "openai" | "deepseek" | "openrouter" | "opencode-go";
 type ComposerSubmenu = "model" | "reasoning" | "advanced" | null;
 type ModelEditorMode = "add" | "edit" | null;
 type TimelineEditorValues = {
@@ -163,9 +167,12 @@ const MODEL_PROVIDER_PRESETS: Record<
     description: string;
     provider: string;
     base_url: string;
+    endpoint_id?: string;
+    endpoint_label?: string;
     model: string;
     temperature: number;
     max_tokens: number;
+    context_length: number;
     timeout_seconds: number;
     supports_vision: boolean;
   }
@@ -178,6 +185,7 @@ const MODEL_PROVIDER_PRESETS: Record<
     model: "",
     temperature: 0.6,
     max_tokens: 16384,
+    context_length: 256000,
     timeout_seconds: 180,
     supports_vision: false
   },
@@ -189,6 +197,7 @@ const MODEL_PROVIDER_PRESETS: Record<
     model: "",
     temperature: 0.6,
     max_tokens: 16384,
+    context_length: 256000,
     timeout_seconds: 180,
     supports_vision: false
   },
@@ -200,6 +209,7 @@ const MODEL_PROVIDER_PRESETS: Record<
     model: "deepseek-v4-flash",
     temperature: 0.6,
     max_tokens: 8192,
+    context_length: 256000,
     timeout_seconds: 180,
     supports_vision: false
   },
@@ -211,8 +221,23 @@ const MODEL_PROVIDER_PRESETS: Record<
     model: "",
     temperature: 0.6,
     max_tokens: 16384,
+    context_length: 256000,
     timeout_seconds: 180,
     supports_vision: false
+  },
+  "opencode-go": {
+    label: "Opencode Go",
+    description: "OpenCode Go 聚合 API，一端多模型",
+    provider: "opencode-go",
+    base_url: "https://opencode.ai/zen/go/v1",
+    endpoint_id: "opencode-go",
+    endpoint_label: "Opencode Go",
+    model: "qwen3.8-max",
+    temperature: 0.6,
+    max_tokens: 32768,
+    context_length: 256000,
+    timeout_seconds: 300,
+    supports_vision: true
   }
 };
 
@@ -227,10 +252,13 @@ function createDefaultModelForm() {
     api_key: "",
     temperature: preset.temperature,
     max_tokens: preset.max_tokens,
+    context_length: preset.context_length,
     timeout_seconds: preset.timeout_seconds,
     supports_vision: preset.supports_vision,
     set_default: false,
-    source_name: ""
+    source_name: "",
+    endpoint_id: preset.endpoint_id ?? "",
+    endpoint_label: preset.endpoint_label ?? ""
   };
 }
 
@@ -246,9 +274,28 @@ type ConversationHistoryItem = {
   activeTurnId?: string;
   activeTurnStatus?: "running" | "waiting_approval";
   acknowledgedTaskKey?: string;
+  unseenTaskKey?: string;
   pinned?: boolean;
   projectId?: string;
 };
+
+type ConversationHistoryIndexItem = Pick<
+  ConversationHistoryItem,
+  "id" | "title" | "group"
+> &
+  Partial<
+    Pick<
+      ConversationHistoryItem,
+      | "activeTurnId"
+      | "activeTurnStatus"
+      | "acknowledgedTaskKey"
+      | "unseenTaskKey"
+      | "pinned"
+      | "projectId"
+    >
+  > & {
+    messageCount?: number;
+  };
 
 type ConversationRunState = {
   turnId: string;
@@ -266,6 +313,7 @@ type ActivityRecordMap = Record<number, ActivityRecord>;
 type QueuedChatItem = {
   content: string;
   attachments: AttachmentItem[];
+  reminder?: FridayNotification | null;
   skill: SkillInfo | null;
   autoApprove: boolean;
 };
@@ -409,7 +457,8 @@ function loadReasoningEffort(): ReasoningEffort {
 }
 
 function loadAutoApprove(): boolean {
-  return window.localStorage.getItem(AUTO_APPROVE_STORAGE_KEY) === "true";
+  const saved = window.localStorage.getItem(AUTO_APPROVE_STORAGE_KEY);
+  return saved !== "false";
 }
 
 function createRealtimeTranscriptSessionId() {
@@ -417,6 +466,13 @@ function createRealtimeTranscriptSessionId() {
     ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
     : Math.random().toString(36).slice(2, 14);
   return `rt-${Date.now().toString(36)}-${randomPart}`.toLowerCase();
+}
+
+function createLocalChatMessageId(role: ChatMessage["role"], createdAt: number) {
+  const randomPart = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+    : Math.random().toString(36).slice(2, 14);
+  return `local-${role}-${createdAt.toString(36)}-${randomPart}`;
 }
 
 function realtimeTranscriptSessionStorageKey(userId: number) {
@@ -449,6 +505,7 @@ function formatModelName(profile: ModelProfile) {
   if (normalized === "gpt-5.6-luna") return "5.6 Luna";
   if (normalized === "gpt-5.6-terra") return "5.6 Terra";
   if (normalized === "gpt-5.6-sol") return "5.6 Sol";
+  if (normalized === "qwen3.8-max") return "Qwen3.8 Max";
   if (normalized === "deepseek-v4-pro") return "DeepSeek V4 Pro";
   if (normalized === "deepseek-v4-flash") return "DeepSeek V4 Flash";
   if (normalized === "glm-5.2") return "GLM-5.2";
@@ -485,7 +542,27 @@ function presetForModelProfile(profile: ModelProfile): ModelProviderPresetId {
   }
   if (profile.base_url.includes("openrouter.ai")) return "openrouter";
   if (profile.base_url.includes("api.openai.com")) return "openai";
+  if (profile.provider === "opencode-go" || profile.base_url.includes("opencode.ai/zen/go")) {
+    return "opencode-go";
+  }
   return "openai-compatible";
+}
+
+function endpointKeyForBaseUrl(baseUrl: string) {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "default";
+  } catch {
+    return "default";
+  }
+}
+
+function endpointLabelForBaseUrl(baseUrl: string) {
+  try {
+    return new URL(baseUrl).hostname;
+  } catch {
+    return baseUrl;
+  }
 }
 
 function nextCopiedModelName(name: string, profiles: ModelProfile[]) {
@@ -518,6 +595,7 @@ export default function App() {
     new URLSearchParams(window.location.search).get("tab") === "files" ? "files" : "meeting"
   );
   const [models, setModels] = useState<ModelsPayload | null>(null);
+  const [modelsLoadError, setModelsLoadError] = useState("");
   const [asrSettings, setAsrSettings] = useState<AsrSettingsPayload | null>(null);
   const [agentSettings, setAgentSettings] = useState<AgentSettingsPayload | null>(null);
   const [weixinStatus, setWeixinStatus] = useState<WeixinChannelStatus | null>(null);
@@ -530,6 +608,7 @@ export default function App() {
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [meetingMinutesSettings, setMeetingMinutesSettings] = useState<MeetingMinutesSettingsPayload | null>(null);
   const [crossChatMemories, setCrossChatMemories] = useState<CrossChatMemory[]>([]);
+  const [rememberedApprovalRules, setRememberedApprovalRules] = useState<RememberedApprovalRule[]>([]);
   const [memoryManagerOpen, setMemoryManagerOpen] = useState(false);
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryScope, setMemoryScope] = useState<"all" | "account" | "projects">("all");
@@ -615,6 +694,8 @@ export default function App() {
   const [editMessageDraft, setEditMessageDraft] = useState("");
   const [conversationHistory, setConversationHistory] = useState<ConversationHistoryItem[]>([]);
   const conversationHistoryRef = useRef<ConversationHistoryItem[]>(conversationHistory);
+  const [conversationArchiveLoading, setConversationArchiveLoading] = useState(false);
+  const [conversationLoadingId, setConversationLoadingId] = useState<string | null>(null);
   const [currentConversationId, setCurrentConversationId] = useState(FRIDAY_CONVERSATION_ID);
   const [conversationSummary, setConversationSummary] = useState("");
   const [conversationSummaryMessageCount, setConversationSummaryMessageCount] = useState(0);
@@ -627,6 +708,7 @@ export default function App() {
   const [renamingConversationId, setRenamingConversationId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [deleteConfirmConversationId, setDeleteConfirmConversationId] = useState<string | null>(null);
+  const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activityRecords, setActivityRecords] = useState<ActivityRecordMap>({});
   const [activityPanelMessageIndex, setActivityPanelMessageIndex] = useState<number | null>(null);
@@ -655,6 +737,12 @@ export default function App() {
   const conversationArchiveShadowRef = useRef<ConversationHistoryItem[]>([]);
   const conversationArchivePendingRef = useRef<ConversationHistoryItem[] | null>(null);
   const conversationArchiveSavingRef = useRef(false);
+  const conversationArchiveRestoreInFlightRef = useRef(false);
+  const conversationArchiveGenerationRef = useRef(0);
+  const conversationDetailLoadedIdsRef = useRef<Set<string>>(new Set());
+  const conversationDetailRequestsRef = useRef<
+    Map<string, Promise<ConversationHistoryItem | null>>
+  >(new Map());
   const conversationArchiveSaveTimerRef = useRef<number | null>(null);
   const conversationLocalSaveTimerRef = useRef<number | null>(null);
   const [speechSupported, setSpeechSupported] = useState(false);
@@ -721,6 +809,7 @@ export default function App() {
   const meetingLiveVadRequestActiveRef = useRef(false);
   const [selectedSkill, setSelectedSkill] = useState<SkillInfo | null>(null);
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
+  const [pendingReminder, setPendingReminder] = useState<FridayNotification | null>(null);
   const [lightboxImage, setLightboxImage] = useState<{ path: string; name: string } | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
@@ -734,6 +823,7 @@ export default function App() {
 
   const defaultProfile = models?.default_profile ?? "deepseek-v4-pro";
   const profiles = models?.profiles ?? [];
+  const endpoints = models?.endpoints ?? [];
 
   const [agentForm, setAgentForm] = useState({
     profile: defaultProfile
@@ -765,6 +855,16 @@ export default function App() {
   } | null>(null);
   const [deleteConfirmModelName, setDeleteConfirmModelName] = useState("");
   const [showModelApiKey, setShowModelApiKey] = useState(false);
+  const [endpointEditorMode, setEndpointEditorMode] = useState<"edit" | null>(null);
+  const [endpointForm, setEndpointForm] = useState({
+    endpoint_id: "",
+    name: "",
+    base_url: "",
+    provider: "openai-compatible",
+    api_key: ""
+  });
+  const [deleteConfirmEndpointId, setDeleteConfirmEndpointId] = useState("");
+  const [expandedEndpointId, setExpandedEndpointId] = useState("");
   const [asrSettingsForm, setAsrSettingsForm] = useState({
     profile: "qwen3-asr-mlx-8bit",
     model_id: "meeting_audio_minutes/model_cache/mlx-community/Qwen3-ASR-1.7B-8bit",
@@ -776,7 +876,8 @@ export default function App() {
     occupation: "",
     details: "",
     memory_enabled: true,
-    company_document_format: ""
+    auto_approve: loadAutoApprove(),
+    extra_read_roots_text: ""
   });
 
   useEffect(() => {
@@ -817,6 +918,11 @@ export default function App() {
     conversationArchiveShadowRef.current = [];
     conversationArchivePendingRef.current = null;
     conversationArchiveSavingRef.current = false;
+    conversationArchiveGenerationRef.current += 1;
+    conversationDetailLoadedIdsRef.current.clear();
+    conversationDetailRequestsRef.current.clear();
+    setConversationArchiveLoading(true);
+    setConversationLoadingId(null);
     const localHistory = ensureFridayConversation(
       loadConversationHistory(currentUser.username),
       "Friday"
@@ -946,6 +1052,11 @@ export default function App() {
     if (authState !== "authenticated" || view !== "apple-pim" || currentUser?.role !== "admin") return;
     void refreshApplePim();
   }, [authState, view, currentUser?.role, applePimRangeDays]);
+
+  useEffect(() => {
+    if (authState !== "authenticated" || view !== "more") return;
+    void refreshRememberedApprovalRules();
+  }, [authState, view]);
 
   useEffect(() => {
     if (authState !== "authenticated") return;
@@ -1658,10 +1769,24 @@ export default function App() {
   async function refreshAll() {
     setBusy(true);
     setStatus({ tone: "loading", text: "正在刷新…" });
+    if (!models) setModelsLoadError("");
+    // Model selection is needed by the composer, so commit it as soon as its
+    // own request completes.  It must not wait for the slowest workspace API,
+    // or disappear entirely because an unrelated API in Promise.all failed.
+    const modelsRequest = api.models()
+      .then((nextModels) => {
+        setModels(nextModels);
+        setModelsLoadError("");
+        return nextModels;
+      })
+      .catch((error) => {
+        setModelsLoadError(explainError(error));
+        throw error;
+      });
     try {
       const [
         health,
-        nextModels,
+        ,
         nextAsrSettings,
         nextAgentSettings,
         nextMeetingMinutesSettings,
@@ -1675,7 +1800,7 @@ export default function App() {
         nextProjects
       ] = await Promise.all([
         api.health(),
-        api.models(),
+        modelsRequest,
         api.asrSettings(),
         api.agentSettings(),
         api.meetingMinutesSettings(),
@@ -1689,7 +1814,6 @@ export default function App() {
         api.projects()
       ]);
       setWorkspace(health.workspace);
-      setModels(nextModels);
       setAsrSettings(nextAsrSettings);
       setAsrSettingsForm({
         profile: nextAsrSettings.profile,
@@ -1697,13 +1821,19 @@ export default function App() {
         hotwords: nextAsrSettings.hotwords
       });
       setAgentSettings(nextAgentSettings);
+      setAutoApprove(nextAgentSettings.auto_approve ?? true);
+      window.localStorage.setItem(
+        AUTO_APPROVE_STORAGE_KEY,
+        String(nextAgentSettings.auto_approve ?? true)
+      );
       setAgentSettingsForm({
         assistant_name: nextAgentSettings.assistant_name,
         nickname: nextAgentSettings.nickname,
         occupation: nextAgentSettings.occupation,
         details: nextAgentSettings.details,
         memory_enabled: nextAgentSettings.memory_enabled,
-        company_document_format: nextAgentSettings.company_document_format
+        auto_approve: nextAgentSettings.auto_approve ?? true,
+        extra_read_roots_text: (nextAgentSettings.extra_read_roots ?? []).join("\n")
       });
       setMeetingMinutesSettings(nextMeetingMinutesSettings);
       setWeixinStatus(nextWeixinStatus);
@@ -3354,6 +3484,7 @@ export default function App() {
     const backgroundRunCount = activeChatRunsRef.current.size;
     requestChatScrollToBottom();
     const conversationId = createConversationId();
+    conversationDetailLoadedIdsRef.current.add(conversationId);
     currentConversationIdRef.current = conversationId;
     setCurrentConversationId(conversationId);
     setActiveProjectId(projectId);
@@ -3378,6 +3509,7 @@ export default function App() {
     chatMessagesRef.current = initialMessages;
     setChatMessages(initialMessages);
     setAttachments([]);
+    setPendingReminder(null);
     setSelectedSkill(null);
     setActionMenuOpen(false);
     setActivityRecords({});
@@ -3404,6 +3536,32 @@ export default function App() {
     return conversationId;
   }
 
+  function openTaskConversation() {
+    const currentId = currentConversationIdRef.current;
+    const current = conversationHistoryRef.current.find(
+      (item) => item.id === currentId && item.id !== FRIDAY_CONVERSATION_ID
+    );
+    if (current) {
+      openConversation(current);
+      return;
+    }
+    if (currentId !== FRIDAY_CONVERSATION_ID) {
+      setHistoryMenu(null);
+      setHistoryProjectPickerOpen(false);
+      setSearchOpen(false);
+      setViewWithUrl("agent");
+      return;
+    }
+    const mostRecentTask = conversationHistoryRef.current.find(
+      (item) => item.id !== FRIDAY_CONVERSATION_ID
+    );
+    if (mostRecentTask) {
+      openConversation(mostRecentTask);
+      return;
+    }
+    startNewChat();
+  }
+
   function openFridayConversation() {
     const assistantName = agentSettings?.assistant_name?.trim() || "Friday";
     const next = ensureFridayConversation(conversationHistoryRef.current, assistantName);
@@ -3421,6 +3579,80 @@ export default function App() {
     setViewWithUrl("friday");
   }
 
+  function loadConversationDetail(
+    conversationId: string
+  ): Promise<ConversationHistoryItem | null> {
+    const existing = conversationDetailRequestsRef.current.get(conversationId);
+    if (existing) return existing;
+    const generation = conversationArchiveGenerationRef.current;
+    const request = api.conversation(conversationId)
+      .then((payload) => {
+        if (generation !== conversationArchiveGenerationRef.current) return null;
+        if (!isConversationHistoryItem(payload.item)) {
+          throw new Error("服务端返回的对话内容无效。");
+        }
+        const serverItem = sanitizeConversationHistoryItem(payload.item);
+        conversationDetailLoadedIdsRef.current.add(conversationId);
+        conversationArchiveShadowRef.current = upsertConversation(
+          conversationArchiveShadowRef.current,
+          serverItem
+        );
+        const localItem = conversationHistoryRef.current.find(
+          (item) => item.id === conversationId
+        );
+        const mergedItem = mergeConversationDetail(serverItem, localItem);
+        const nextHistory = upsertConversation(
+          conversationHistoryRef.current,
+          mergedItem
+        );
+        conversationHistoryRef.current = nextHistory;
+        setConversationHistory(nextHistory);
+        return mergedItem;
+      })
+      .finally(() => {
+        if (conversationDetailRequestsRef.current.get(conversationId) === request) {
+          conversationDetailRequestsRef.current.delete(conversationId);
+        }
+      });
+    conversationDetailRequestsRef.current.set(conversationId, request);
+    return request;
+  }
+
+  function refreshOpenConversationDetail(conversationId: string) {
+    if (
+      conversationDetailLoadedIdsRef.current.has(conversationId)
+      || activeChatRunsRef.current.has(conversationId)
+    ) {
+      return;
+    }
+    setConversationLoadingId(conversationId);
+    setBusy(true);
+    setStatus({ tone: "loading", text: "正在加载对话内容…" });
+    void loadConversationDetail(conversationId)
+      .then((item) => {
+        if (!item || currentConversationIdRef.current !== conversationId) return;
+        setConversationLoadingId(null);
+        openConversation(item, {
+          preserveActivityPanel: true,
+          preserveScrollPosition: true
+        });
+      })
+      .catch((error) => {
+        if (currentConversationIdRef.current !== conversationId) return;
+        setConversationLoadingId(null);
+        setBusy(false);
+        const cached = conversationHistoryRef.current.find(
+          (item) => item.id === conversationId
+        );
+        setStatus({
+          tone: "error",
+          text: cached?.messages.length
+            ? `已显示本地缓存；服务端正文加载失败：${explainError(error)}`
+            : `对话内容加载失败：${explainError(error)}`
+        });
+      });
+  }
+
   function openConversation(
     item: ConversationHistoryItem,
     options: { preserveActivityPanel?: boolean; preserveScrollPosition?: boolean } = {}
@@ -3434,6 +3666,11 @@ export default function App() {
     const restoredActivityRecord =
       restoredActivityIndex === null ? null : restoredActivityRecords[restoredActivityIndex] ?? null;
     const activeRun = activeChatRunsRef.current.get(item.id);
+    const needsServerDetail = Boolean(
+      conversationArchiveReadyRef.current
+      && !activeRun
+      && !conversationDetailLoadedIdsRef.current.has(item.id)
+    );
     const taskStatus = conversationTaskStatus(item, Boolean(activeRun));
     if (taskStatus === "completed" || taskStatus === "error") {
       const taskKey = conversationTaskKey(item);
@@ -3444,6 +3681,7 @@ export default function App() {
               ? {
                   ...candidate,
                   acknowledgedTaskKey: taskKey,
+                  unseenTaskKey: undefined,
                   activeTurnId: undefined,
                   activeTurnStatus: undefined
                 }
@@ -3483,17 +3721,20 @@ export default function App() {
     setActivityRunning(Boolean(activeRun));
     setActivityElapsedMs(restoredActivityRecord?.elapsedMs ?? 0);
     setQueuedChatCount(queuedChatMessagesRef.current.get(item.id)?.length ?? 0);
-    setBusy(Boolean(activeRun));
+    setBusy(Boolean(activeRun) || needsServerDetail);
     setViewWithUrl("agent");
     chatMessagesRef.current = item.messages;
     setChatMessages(item.messages);
     setStatus(
       activeRun
         ? { tone: "loading", text: "该对话仍在后台处理中…" }
+        : needsServerDetail
+          ? { tone: "loading", text: "正在加载对话内容…" }
         : item.activeTurnStatus === "waiting_approval"
           ? { tone: "loading", text: "该对话等待工具执行确认" }
         : { tone: "idle", text: "已打开对话" }
     );
+    if (needsServerDetail) refreshOpenConversationDetail(item.id);
   }
 
   function openHistoryMenu(event: MouseEvent<HTMLButtonElement>, id: string) {
@@ -3550,20 +3791,38 @@ export default function App() {
     setStatus({ tone: "success", text: "对话已重命名" });
   }
 
-  function deleteConversation(id: string) {
+  async function deleteConversation(id: string) {
     if (id === FRIDAY_CONVERSATION_ID) return;
     if (deleteConfirmConversationId !== id) {
       setDeleteConfirmConversationId(id);
       return;
     }
-    setConversationHistory((items) => items.filter((item) => item.id !== id));
-    setHistoryMenu(null);
-    setHistoryProjectPickerOpen(false);
-    setDeleteConfirmConversationId(null);
-    if (currentConversationId === id) {
-      startNewChat();
+    if (deletingConversationId) return;
+    setDeletingConversationId(id);
+    setStatus({ tone: "loading", text: "正在彻底删除对话…" });
+    try {
+      const result = await api.deleteConversations([id]);
+      if (!result.ok || !result.deleted_ids.includes(id)) {
+        throw new Error("后端未确认删除该对话。");
+      }
+      conversationArchiveRevisionRef.current = result.revision;
+      conversationArchiveShadowRef.current = conversationArchiveShadowRef.current.filter(
+        (item) => item.id !== id
+      );
+      conversationArchivePendingRef.current = null;
+      setConversationHistory((items) => items.filter((item) => item.id !== id));
+      setHistoryMenu(null);
+      setHistoryProjectPickerOpen(false);
+      setDeleteConfirmConversationId(null);
+      if (currentConversationId === id) {
+        startNewChat();
+      }
+      setStatus({ tone: "success", text: "对话及其后端记录已彻底删除" });
+    } catch (error) {
+      setStatus({ tone: "error", text: `删除失败：${explainError(error)}` });
+    } finally {
+      setDeletingConversationId(null);
     }
-    setStatus({ tone: "success", text: "历史对话已删除" });
   }
 
   async function moveConversationToProject(id: string, projectId: string | null) {
@@ -3697,25 +3956,50 @@ export default function App() {
   }
 
   async function restoreConversationArchive() {
+    // 挂载 effect 与 30 秒轮询会在进入 Friday 视图时同时各调一次，
+    // 两个全量拉取并发跑会互相触发合并与回存——重复劳动还制造 revision 冲突。
+    if (conversationArchiveRestoreInFlightRef.current) return;
+    conversationArchiveRestoreInFlightRef.current = true;
+    const initialRestore = !conversationArchiveLoadedRef.current;
+    if (initialRestore) setConversationArchiveLoading(true);
     let loaded = false;
     try {
-      const payload = await api.conversations();
-      const archivedItems = payload.items
-        .filter(isConversationHistoryItem)
-        .map(sanitizeConversationHistoryItem);
+      const payload = await api.conversations(
+        conversationArchiveLoadedRef.current ? conversationArchiveRevisionRef.current : undefined
+      );
+      const deletedIds = new Set(
+        (payload.deleted_ids ?? []).filter((id): id is string => typeof id === "string")
+      );
+      if (deletedIds.size > 0) {
+        for (const id of deletedIds) conversationDetailLoadedIdsRef.current.delete(id);
+        const withoutDeleted = conversationHistoryRef.current.filter(
+          (item) => !deletedIds.has(item.id)
+        );
+        conversationHistoryRef.current = withoutDeleted;
+        setConversationHistory(withoutDeleted);
+        conversationArchiveShadowRef.current = conversationArchiveShadowRef.current.filter(
+          (item) => !deletedIds.has(item.id)
+        );
+      }
+      if (payload.unchanged) return;
+      const indexedItems = payload.items
+        .filter(isConversationHistoryIndexItem)
+        .filter((item) => !deletedIds.has(item.id));
+      const localItems = conversationHistoryRef.current.filter(
+        (item) => !deletedIds.has(item.id)
+      );
+      const indexedIds = new Set(indexedItems.map((item) => item.id));
       const merged = ensureFridayConversation(
-        conversationArchiveShadowRef.current.length > 0
-          ? mergeConversationArchiveConflict(
-              conversationArchiveShadowRef.current,
-              conversationHistoryRef.current,
-              archivedItems
-            )
-          : mergeConversationHistories(archivedItems, conversationHistoryRef.current),
+        mergeConversationIndexes(indexedItems, localItems),
         agentSettings?.assistant_name?.trim() || "Friday"
       );
+      for (const id of indexedIds) conversationDetailLoadedIdsRef.current.delete(id);
+      for (const item of merged) {
+        if (!indexedIds.has(item.id)) conversationDetailLoadedIdsRef.current.add(item.id);
+      }
       conversationHistoryRef.current = merged;
       setConversationHistory(merged);
-      conversationArchiveShadowRef.current = archivedItems;
+      conversationArchiveShadowRef.current = merged.filter((item) => indexedIds.has(item.id));
       conversationArchiveRevisionRef.current = payload.revision;
       loaded = true;
       if (currentConversationIdRef.current === FRIDAY_CONVERSATION_ID) {
@@ -3730,10 +4014,13 @@ export default function App() {
     } catch (error) {
       setStatus({ tone: "error", text: `聊天存档读取失败：${explainError(error)}` });
     } finally {
+      conversationArchiveRestoreInFlightRef.current = false;
       conversationArchiveReadyRef.current = true;
+      if (initialRestore) setConversationArchiveLoading(false);
       if (loaded) {
         conversationArchiveLoadedRef.current = true;
         queueConversationArchiveSave(conversationHistoryRef.current);
+        refreshOpenConversationDetail(currentConversationIdRef.current);
       }
     }
   }
@@ -3885,13 +4172,15 @@ export default function App() {
     const queuedItem = {
       content,
       attachments,
+      reminder: pendingReminder,
       skill: selectedSkill ?? inferSkillFromText(content, skills),
       autoApprove
     };
-    if (!queuedItem.content && queuedItem.attachments.length === 0) return;
+    if (!queuedItem.content && queuedItem.attachments.length === 0 && !queuedItem.reminder) return;
     setChatInput("");
     setSelectedSkill(null);
     setAttachments([]);
+    setPendingReminder(null);
     const conversationId = currentConversationIdRef.current;
     const activeRun = activeChatRunsRef.current.get(conversationId);
     if (activeRun) {
@@ -3929,9 +4218,14 @@ export default function App() {
     options: RunChatMessageOptions = {}
   ) {
     const content = queuedItem.content.trim();
-    if (!content && queuedItem.attachments.length === 0) return;
+    if (!content && queuedItem.attachments.length === 0 && !queuedItem.reminder) return;
     const outgoingSkill = queuedItem.skill ?? inferSkillFromText(content, skills);
-    const messageContent = formatMessageWithAttachments(content, queuedItem.attachments);
+    const messageContent = formatMessageWithAttachments(
+      queuedItem.reminder
+        ? `${formatReminderCard(queuedItem.reminder)}${content ? `\n\n${content}` : ""}`
+        : content,
+      queuedItem.attachments
+    );
     const conversationId = options.conversationId ?? currentConversationIdRef.current;
     const projectId =
       conversationHistoryRef.current.find((item) => item.id === conversationId)?.projectId ??
@@ -3943,7 +4237,18 @@ export default function App() {
     const baseConversationSummary = options.conversationSummary ?? conversationSummary;
     const baseConversationSummaryMessageCount =
       options.conversationSummaryMessageCount ?? conversationSummaryMessageCount;
-    const nextMessages: ChatMessage[] = [...baseMessages, { role: "user", content: messageContent }];
+    const activityStartedAtMs = Date.now();
+    const userMessage: ChatMessage = {
+      id: createLocalChatMessageId("user", activityStartedAtMs),
+      role: "user",
+      content: messageContent,
+      createdAt: activityStartedAtMs
+    };
+    const assistantMessageIdentity: Pick<ChatMessage, "id" | "createdAt"> = {
+      id: createLocalChatMessageId("assistant", activityStartedAtMs),
+      createdAt: activityStartedAtMs
+    };
+    const nextMessages: ChatMessage[] = [...baseMessages, userMessage];
     const contextFilePaths = collectConversationFileReferences(
       nextMessages,
       queuedItem.attachments,
@@ -3953,7 +4258,6 @@ export default function App() {
     const shouldNameConversation =
       !conversationHistory.some((item) => item.id === conversationId) &&
       baseMessages.every((message) => message.role !== "user");
-    const activityStartedAtMs = Date.now();
     let streamedContent = "";
     let finalReply = "";
     let assistantDraftContent = "";
@@ -3991,6 +4295,7 @@ export default function App() {
       const snapshotMessages: ChatMessage[] = [
         ...nextMessages,
         {
+          ...assistantMessageIdentity,
           role: "assistant",
           content: assistantDraftContent
         }
@@ -4030,7 +4335,8 @@ export default function App() {
           contextSummaryDraft,
           contextSummaryMessageCountDraft,
           projectId,
-          runState
+          runState,
+          isVisibleConversation()
         );
         conversationHistoryRef.current = next;
         return next;
@@ -4042,7 +4348,7 @@ export default function App() {
       syncActivityRecord({ elapsedMs: activityElapsedDraft });
     };
     const appendDraftActivity = (item: AgentActivityEvent) => {
-      activityEventsDraft = [...activityEventsDraft, item];
+      activityEventsDraft = upsertActivityEvent(activityEventsDraft, item);
       if (isVisibleConversation()) setActivityEvents(activityEventsDraft);
       syncActivityRecord({
         events: activityEventsDraft,
@@ -4080,7 +4386,10 @@ export default function App() {
       startedAt: activityStartedAtMs
     });
     if (isVisibleConversation()) {
-      setChatMessages([...nextMessages, { role: "assistant", content: "" }]);
+      setChatMessages([
+        ...nextMessages,
+        { ...assistantMessageIdentity, role: "assistant", content: "" }
+      ]);
       setActivityRecords(activityRecordsDraft);
       setActivityPanelMessageIndex(assistantIndex);
       setActivityEvents([]);
@@ -4175,7 +4484,13 @@ export default function App() {
             if (isVisibleConversation()) {
               setChatMessages((items) =>
                 items.map((message, index) =>
-                  index === assistantIndex ? { ...message, content: streamEvent.content } : message
+                  index === assistantIndex
+                    ? {
+                        ...message,
+                        content: streamEvent.content,
+                        artifacts: streamEvent.artifacts
+                      }
+                    : message
                 )
               );
               setStatus({
@@ -4190,7 +4505,8 @@ export default function App() {
             persistDraftConversation({ force: true, completed: !waitingApprovalDraft });
           } else if (streamEvent.event === "error") {
             const errorMessage = streamErrorMessage(streamEvent);
-            assistantDraftContent = `这次没有成功：${errorMessage}`;
+            const loopStopped = isModelLoopStoppedError(streamEvent);
+            assistantDraftContent = loopStopped ? errorMessage : `这次没有成功：${errorMessage}`;
             activityEventsDraft = mergeStreamErrorActivity(activityEventsDraft, streamEvent, errorMessage);
             if (isVisibleConversation()) setActivityEvents(activityEventsDraft);
             syncActivityRecord({ events: activityEventsDraft, completed: true });
@@ -4202,7 +4518,7 @@ export default function App() {
                     : message
                 )
               );
-              setStatus({ tone: "error", text: errorMessage });
+              setStatus({ tone: loopStopped ? "warning" : "error", text: errorMessage });
               activityRunningRef.current = false;
               setActivityRunning(false);
             }
@@ -4245,6 +4561,7 @@ export default function App() {
       const completedMessages: ChatMessage[] = [
         ...nextMessages,
         {
+          ...assistantMessageIdentity,
           role: "assistant",
           content: assistantContent
         }
@@ -4272,7 +4589,8 @@ export default function App() {
           activities: finalActivityRecords,
           activeActivityIndex: assistantIndex,
           contextSummary: contextSummaryDraft,
-          contextSummaryMessageCount: contextSummaryMessageCountDraft
+          contextSummaryMessageCount: contextSummaryMessageCountDraft,
+          taskSeen: isVisibleConversation()
         });
       } else {
         setConversationHistory((items) => {
@@ -4286,11 +4604,20 @@ export default function App() {
             contextSummaryDraft,
             contextSummaryMessageCountDraft,
             projectId,
-            null
+            null,
+            isVisibleConversation()
           );
           conversationHistoryRef.current = next;
           return next;
         });
+      }
+      // A reminder is considered handled only after the turn completed
+      // normally. Failed, cancelled, or approval-paused turns keep it in the
+      // bell so it cannot disappear before the work is actually done.
+      if (queuedItem.reminder && !waitingApprovalDraft) {
+        void api.deleteNotification(queuedItem.reminder.id)
+          .then(setNotifications)
+          .catch(() => undefined);
       }
     } catch (error) {
       const stoppedByUser = abortController.signal.aborted;
@@ -4380,7 +4707,11 @@ export default function App() {
     });
   }
 
-  async function approvePendingToolBatch(item: AgentActivityEvent, assistantIndex: number) {
+  async function approvePendingToolBatch(
+    item: AgentActivityEvent,
+    assistantIndex: number,
+    remember = false
+  ) {
     const conversationId = currentConversationIdRef.current;
     const isVisibleConversation = () => currentConversationIdRef.current === conversationId;
     if (activeChatRunsRef.current.has(conversationId)) return;
@@ -4430,11 +4761,13 @@ export default function App() {
       if (isVisibleConversation()) setActivityRecords(activityRecordsDraft);
       return activityRecordsDraft;
     };
-    const writeAssistantContent = (content: string) => {
+    const writeAssistantContent = (content: string, artifacts?: DeliveryArtifact[]) => {
       assistantDraftContent = content;
       const base = messagesDraft;
       const next = base.map((message, index) =>
-        index === assistantIndex ? { ...message, content } : message
+        index === assistantIndex
+          ? { ...message, content, ...(artifacts ? { artifacts } : {}) }
+          : message
       );
       messagesDraft = next;
       if (isVisibleConversation()) {
@@ -4475,7 +4808,8 @@ export default function App() {
           contextSummaryDraft,
           contextSummaryMessageCountDraft,
           undefined,
-          runState
+          runState,
+          isVisibleConversation()
         );
         conversationHistoryRef.current = next;
         return next;
@@ -4487,7 +4821,7 @@ export default function App() {
       syncActivityRecord({ elapsedMs: activityElapsedDraft });
     };
     const appendDraftActivity = (event: AgentActivityEvent) => {
-      activityEventsDraft = [...activityEventsDraft, event];
+      activityEventsDraft = upsertActivityEvent(activityEventsDraft, event);
       if (isVisibleConversation()) setActivityEvents(activityEventsDraft);
       syncActivityRecord({
         events: activityEventsDraft,
@@ -4541,15 +4875,17 @@ export default function App() {
     appendDraftActivity({
       event: "activity",
       phase: "action",
-      title: "终端审批已确认",
-      detail: "后端将恢复同一个 pending batch，不再让模型重新生成这批工具调用。",
+      title: remember ? "终端审批已确认并记住此命令" : "终端审批已确认",
+      detail: remember
+        ? "后端将恢复同一个 pending batch；这条命令下次原样出现时自动放行。"
+        : "后端将恢复同一个 pending batch，不再让模型重新生成这批工具调用。",
       approval_resolved: true
     });
 
     try {
       await api.approveAgentTurn(
         turnId,
-        { conversation_id: conversationId },
+        { conversation_id: conversationId, remember },
         (streamEvent) => {
           if ("turn_id" in streamEvent && typeof streamEvent.turn_id === "string") {
             const activeRun = activeChatRunsRef.current.get(conversationId);
@@ -4592,7 +4928,7 @@ export default function App() {
                 setConversationSummaryMessageCount(contextSummaryMessageCountDraft);
               }
             }
-            writeAssistantContent(streamEvent.content);
+            writeAssistantContent(streamEvent.content, streamEvent.artifacts);
             if (isVisibleConversation()) {
               setStatus({
                 tone: "success",
@@ -4602,11 +4938,14 @@ export default function App() {
             persistDraftConversation({ force: true, completed: true });
           } else if (streamEvent.event === "error") {
             const errorMessage = streamErrorMessage(streamEvent);
-            writeAssistantContent(`这次没有成功：${errorMessage}`);
+            const loopStopped = isModelLoopStoppedError(streamEvent);
+            writeAssistantContent(loopStopped ? errorMessage : `这次没有成功：${errorMessage}`);
             activityEventsDraft = mergeStreamErrorActivity(activityEventsDraft, streamEvent, errorMessage);
             if (isVisibleConversation()) setActivityEvents(activityEventsDraft);
             syncActivityRecord({ events: activityEventsDraft, completed: true });
-            if (isVisibleConversation()) setStatus({ tone: "error", text: errorMessage });
+            if (isVisibleConversation()) {
+              setStatus({ tone: loopStopped ? "warning" : "error", text: errorMessage });
+            }
             persistDraftConversation({ force: true, completed: true });
           } else if (streamEvent.event === "cancelled") {
             writeAssistantContent(streamEvent.message || "已停止当前轮处理。");
@@ -4641,7 +4980,8 @@ export default function App() {
           contextSummaryDraft,
           contextSummaryMessageCountDraft,
           undefined,
-          null
+          null,
+          isVisibleConversation()
         );
         conversationHistoryRef.current = next;
           return next;
@@ -4682,7 +5022,8 @@ export default function App() {
     activities,
     activeActivityIndex,
     contextSummary,
-    contextSummaryMessageCount
+    contextSummaryMessageCount,
+    taskSeen
   }: {
     id: string;
     projectId?: string;
@@ -4691,11 +5032,12 @@ export default function App() {
     activeActivityIndex: number;
     contextSummary: string;
     contextSummaryMessageCount: number;
+    taskSeen: boolean;
   }) {
     if (id === FRIDAY_CONVERSATION_ID) {
       const assistantName = agentSettings?.assistant_name?.trim() || "Friday";
       setConversationHistory((items) => {
-        const next = upsertConversation(items, {
+        const next = upsertConversation(items, applyConversationRunState({
           id,
           title: assistantName,
           group: "助理",
@@ -4704,14 +5046,14 @@ export default function App() {
           contextSummaryMessageCount,
           activities,
           activeActivityIndex
-        });
+        }, null, taskSeen));
         conversationHistoryRef.current = next;
         return next;
       });
       return;
     }
     setConversationHistory((items) => {
-      const next = upsertConversation(items, {
+      const next = upsertConversation(items, applyConversationRunState({
         id,
         title: pendingConversationTitle,
         group: "最近",
@@ -4724,7 +5066,7 @@ export default function App() {
         // project association so the chat remains visible in its project and
         // continues to render the project badge in the recent-chat list.
         projectId: items.find((item) => item.id === id)?.projectId ?? projectId
-      });
+      }, null, taskSeen));
       conversationHistoryRef.current = next;
       return next;
     });
@@ -4833,10 +5175,21 @@ export default function App() {
     setShowModelApiKey(false);
   }
 
-  function openAddModel() {
+  function openAddModel(endpoint?: ModelEndpoint) {
     setModelEditorMode("add");
     setEditingModelName("");
-    setModelForm(createDefaultModelForm());
+    setModelForm(
+      endpoint
+        ? {
+            ...createDefaultModelForm(),
+            provider: endpoint.provider || "openai-compatible",
+            base_url: endpoint.base_url,
+            endpoint_id: endpoint.endpoint_id,
+            endpoint_label: endpoint.label,
+            preset: endpoint.models[0] ? presetForModelProfile(endpoint.models[0]) : "openai-compatible"
+          }
+        : createDefaultModelForm()
+    );
     setDiscoveredModelIds([]);
     setModelConnectionResult(null);
     setShowModelApiKey(false);
@@ -4854,8 +5207,11 @@ export default function App() {
       api_key: "",
       temperature: profile.temperature,
       max_tokens: profile.max_tokens,
+      context_length: profile.context_length ?? 256000,
       timeout_seconds: profile.timeout_seconds,
       supports_vision: profile.supports_vision,
+      endpoint_id: profile.endpoint_id ?? "",
+      endpoint_label: profile.endpoint_label ?? "",
       set_default: profile.default,
       source_name: ""
     });
@@ -4876,8 +5232,11 @@ export default function App() {
       api_key: "",
       temperature: profile.temperature,
       max_tokens: profile.max_tokens,
+      context_length: profile.context_length ?? 256000,
       timeout_seconds: profile.timeout_seconds,
       supports_vision: profile.supports_vision,
+      endpoint_id: profile.endpoint_id ?? "",
+      endpoint_label: profile.endpoint_label ?? "",
       set_default: false,
       source_name: profile.name
     });
@@ -4984,6 +5343,98 @@ export default function App() {
     }
   }
 
+  function closeEndpointEditor() {
+    setEndpointEditorMode(null);
+    setEndpointForm({
+      endpoint_id: "",
+      name: "",
+      base_url: "",
+      provider: "openai-compatible",
+      api_key: ""
+    });
+    setDeleteConfirmEndpointId("");
+  }
+
+  function openEditEndpoint(endpoint: ModelEndpoint) {
+    setDeleteConfirmEndpointId("");
+    setEndpointEditorMode("edit");
+    setEndpointForm({
+      endpoint_id: endpoint.endpoint_id,
+      name: endpoint.label,
+      base_url: endpoint.base_url,
+      provider: endpoint.provider,
+      api_key: ""
+    });
+  }
+
+  async function saveEndpointConfiguration(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setStatus({ tone: "loading", text: "正在更新端点配置…" });
+    try {
+      const nextModels = await api.updateEndpoint({
+        endpoint_id: endpointForm.endpoint_id,
+        endpoint_label: endpointForm.name,
+        base_url: endpointForm.base_url,
+        provider: endpointForm.provider,
+        ...(endpointForm.api_key.trim() ? { api_key: endpointForm.api_key } : {})
+      });
+      setModels(nextModels);
+      closeEndpointEditor();
+      setStatus({ tone: "success", text: `端点 ${endpointForm.name || endpointForm.endpoint_id} 已更新` });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importEndpointModels(endpoint: ModelEndpoint) {
+    setBusy(true);
+    setModelConnectionResult(null);
+    setStatus({ tone: "loading", text: `正在从 ${endpoint.label} 拉取模型列表…` });
+    try {
+      const result = await api.importEndpointModels(endpoint.endpoint_id);
+      setModels(result);
+      setModelConnectionResult({
+        tone: "success",
+        text: (result.message ?? "已拉取模型列表") + (result.latency_ms ? ` · ${result.latency_ms} ms` : "")
+      });
+      setStatus({ tone: "success", text: result.message ?? "已拉取模型列表" });
+    } catch (error) {
+      const text = explainError(error);
+      setModelConnectionResult({ tone: "error", text });
+      setStatus({ tone: "error", text });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteEndpointConfiguration(endpoint: ModelEndpoint) {
+    if (deleteConfirmEndpointId !== endpoint.endpoint_id) {
+      setDeleteConfirmEndpointId(endpoint.endpoint_id);
+      return;
+    }
+    setBusy(true);
+    setStatus({ tone: "loading", text: `正在删除端点 ${endpoint.label}…` });
+    try {
+      const nextModels = await api.deleteEndpoint(endpoint.endpoint_id);
+      setModels(nextModels);
+      setDeleteConfirmEndpointId("");
+      if (endpointEditorMode === "edit" && endpointForm.endpoint_id === endpoint.endpoint_id) {
+        closeEndpointEditor();
+      }
+      setStatus({
+        tone: "success",
+        text: `端点 ${endpoint.label} 及其 ${endpoint.profile_count} 个模型已删除`
+      });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function copyPath(path: string) {
     await copyText(path, "路径已复制");
   }
@@ -5020,19 +5471,63 @@ export default function App() {
   async function saveAgentSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
-    setStatus({ tone: "loading", text: "正在保存工作背景与文件格式…" });
+    setStatus({ tone: "loading", text: "正在保存个人与工作设置…" });
     try {
-      const payload = await api.saveAgentSettings(agentSettingsForm);
+      const { extra_read_roots_text, ...formFields } = agentSettingsForm;
+      const payload = await api.saveAgentSettings({
+        ...formFields,
+        extra_read_roots: extra_read_roots_text
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+      });
       setAgentSettings(payload);
+      setAutoApprove(payload.auto_approve ?? true);
+      window.localStorage.setItem(AUTO_APPROVE_STORAGE_KEY, String(payload.auto_approve ?? true));
       setAgentSettingsForm({
         assistant_name: payload.assistant_name,
         nickname: payload.nickname,
         occupation: payload.occupation,
         details: payload.details,
         memory_enabled: payload.memory_enabled,
-        company_document_format: payload.company_document_format
+        auto_approve: payload.auto_approve ?? true,
+        extra_read_roots_text: (payload.extra_read_roots ?? []).join("\n")
       });
-      setStatus({ tone: "success", text: "工作背景与文件格式已保存" });
+      setStatus({ tone: "success", text: "个人与工作设置已保存" });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleAutoApprove() {
+    const next = !autoApprove;
+    setBusy(true);
+    setStatus({
+      tone: "loading",
+      text: next ? "正在开启自动安全审查…" : "正在改为人工审批…"
+    });
+    try {
+      const payload = await api.saveAgentSettings({
+        ...agentSettingsForm,
+        auto_approve: next,
+        extra_read_roots: agentSettingsForm.extra_read_roots_text
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+      });
+      setAgentSettings(payload);
+      setAutoApprove(payload.auto_approve ?? true);
+      window.localStorage.setItem(
+        AUTO_APPROVE_STORAGE_KEY,
+        String(payload.auto_approve ?? true)
+      );
+      setAgentSettingsForm((form) => ({ ...form, auto_approve: payload.auto_approve ?? true }));
+      setStatus({
+        tone: "success",
+        text: payload.auto_approve ?? true ? "自动安全审查已开启" : "已改为人工审批"
+      });
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
     } finally {
@@ -5117,6 +5612,27 @@ export default function App() {
       const payload = await api.memories();
       setCrossChatMemories(payload.memories);
       setStatus({ tone: "success", text: `已载入 ${payload.count} 条核心记忆` });
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    }
+  }
+
+  async function refreshRememberedApprovalRules() {
+    try {
+      const payload = await api.approvalRules();
+      setRememberedApprovalRules(payload.items);
+    } catch (error) {
+      setStatus({ tone: "error", text: explainError(error) });
+    }
+  }
+
+  async function removeRememberedApprovalRule(command: string) {
+    try {
+      const payload = await api.deleteApprovalRule(command);
+      if (payload.ok) {
+        setRememberedApprovalRules((items) => items.filter((item) => item.command !== command));
+      }
+      setStatus({ tone: payload.ok ? "success" : "error", text: payload.message });
     } catch (error) {
       setStatus({ tone: "error", text: explainError(error) });
     }
@@ -5323,17 +5839,37 @@ export default function App() {
         <nav className="nav-list" aria-label="主要区域">
           <button
             type="button"
-            className={`nav-button nav-new-chat ${
-              view === "agent" && chatMessages.length <= 1 && currentConversationId.startsWith("local")
-                ? "is-active"
-                : ""
-            }`}
+            className={`nav-button ${view === "agent" ? "is-active" : ""}`}
+            aria-current={view === "agent" ? "page" : undefined}
+            aria-label="对话"
+            title="返回当前对话"
+            onClick={openTaskConversation}
+          >
+            <MessageCircle aria-hidden="true" />
+            <span>对话</span>
+          </button>
+          <button
+            type="button"
+            className="nav-button nav-new-chat"
             aria-label="新聊天"
             title="新聊天"
             onClick={() => startNewChat()}
           >
             <MessageSquarePlus aria-hidden="true" />
             <span>新聊天</span>
+          </button>
+          <button
+            type="button"
+            className="nav-button nav-history"
+            aria-label="历史对话"
+            title="查看历史对话"
+            onClick={() => {
+              setSearchOpen(true);
+              setConversationSearch("");
+            }}
+          >
+            <Search aria-hidden="true" />
+            <span>历史对话</span>
           </button>
 
           <div className="nav-group">
@@ -5403,7 +5939,12 @@ export default function App() {
         </nav>
 
         <section className="recent-block" aria-label="历史对话">
-          <h2>历史对话</h2>
+          <div className="recent-block-heading">
+            <h2>历史对话</h2>
+            {conversationArchiveLoading ? (
+              <span role="status"><Loader2 className="spin" aria-hidden="true" />同步中</span>
+            ) : null}
+          </div>
           <div className="recent-list">
             {regularConversationHistory.length > 0 ? (
               regularConversationHistory.map((item) => {
@@ -5469,6 +6010,7 @@ export default function App() {
                           >
                             {taskStatus === "running" ? <Loader2 className="spin" aria-hidden="true" /> : null}
                             {taskStatus === "waiting" ? <Clock3 aria-hidden="true" /> : null}
+                            {taskStatus === "paused" ? <Clock3 aria-hidden="true" /> : null}
                             {taskStatus === "completed" ? <CheckCircle2 aria-hidden="true" /> : null}
                             {taskStatus === "error" ? <AlertCircle aria-hidden="true" /> : null}
                           </span>
@@ -5607,7 +6149,7 @@ export default function App() {
                     <div className="notification-popover-heading">
                       <div>
                         <strong>提醒</strong>
-                        <span>无需立即回复的信息</span>
+                        <span>需要留意的事项，点击可进入对应对话</span>
                       </div>
                       {notifications.unread_count > 0 ? (
                         <button
@@ -5628,12 +6170,25 @@ export default function App() {
                             <button
                               type="button"
                               className="notification-item-content"
+                              aria-label={`打开提醒并准备处理：${item.title}`}
                               onClick={() => {
                                 if (!item.read_at) {
                                   void api.markNotificationsRead(item.id).then(setNotifications).catch((error) => {
                                     setStatus({ tone: "error", text: explainError(error) });
                                   });
                                 }
+                                setNotificationsOpen(false);
+                                const targetConversationId =
+                                  item.conversation_id || FRIDAY_CONVERSATION_ID;
+                                if (targetConversationId === FRIDAY_CONVERSATION_ID) {
+                                  openFridayConversation();
+                                } else {
+                                  const conversation = conversationHistoryRef.current.find(
+                                    (candidate) => candidate.id === targetConversationId
+                                  );
+                                  if (conversation) openConversation(conversation);
+                                }
+                                setPendingReminder(item);
                               }}
                             >
                               <span className="notification-dot" aria-hidden="true" />
@@ -6280,6 +6835,7 @@ export default function App() {
     const item = conversationHistory.find((conversation) => conversation.id === historyMenu.id);
     if (!item) return null;
     const confirmingDelete = deleteConfirmConversationId === item.id;
+    const deleting = deletingConversationId === item.id;
     return (
       <div
         className={`history-menu-popover ${historyProjectPickerOpen ? "is-project-picker" : ""}`}
@@ -6372,10 +6928,13 @@ export default function App() {
               type="button"
               role="menuitem"
               className={`history-menu-danger ${confirmingDelete ? "is-confirming" : ""}`}
-              onClick={() => deleteConversation(item.id)}
+              disabled={deleting}
+              onClick={() => void deleteConversation(item.id)}
             >
               <Trash2 aria-hidden="true" />
-              <span>{confirmingDelete ? "确认删除" : "删除"}</span>
+              <span>
+                {deleting ? "正在彻底删除…" : confirmingDelete ? "确认删除" : "删除"}
+              </span>
             </button>
           </>
         )}
@@ -6454,7 +7013,18 @@ export default function App() {
       }`}>
         <div className="chat-workarea">
           <section ref={chatThreadRef} className="chat-thread" aria-label="智能体对话">
-            <div className="chat-messages" aria-live="polite">
+            <div
+              className="chat-messages"
+              aria-live="polite"
+              aria-busy={conversationLoadingId === currentConversationId}
+            >
+              {conversationLoadingId === currentConversationId && chatMessages.length === 0 ? (
+                <div className="conversation-loading-state" role="status">
+                  <Loader2 className="spin" aria-hidden="true" />
+                  <strong>正在加载对话内容</strong>
+                  <span>历史列表已经就绪，正文马上显示。</span>
+                </div>
+              ) : null}
               {chatMessages.map((message, index) => {
                 const activityRecord =
                   message.role === "assistant" ? activityRecordForMessage(index) : null;
@@ -6467,9 +7037,21 @@ export default function App() {
                 const completedCompaction = activityRecord
                   ? latestCompletedRuntimeSummaryEvent(activityRecord.events)
                   : null;
-                const content =
+                const rawContent =
                   displayMessage.content ||
                   (message.role === "assistant" && busy && !isActivityMessage ? "正在生成…" : "");
+                const content =
+                  displayMessage.role === "assistant"
+                    ? normalizeModelLoopStoppedAssistantContent(rawContent)
+                    : rawContent;
+                const modelLoopPaused = Boolean(
+                  message.role === "assistant" &&
+                  index === chatMessages.length - 1 &&
+                  !busy &&
+                  activityRecord?.events.some(isModelLoopStoppedActivity)
+                );
+                const showModelLoopRecoveryNotice =
+                  modelLoopPaused && !isModelLoopStoppedText(content);
                 return (
                   <article
                     key={`${message.role}-${index}`}
@@ -6508,17 +7090,35 @@ export default function App() {
                           </button>
                         </div>
                       </form>
-                    ) : content ? (
+                    ) : content || showModelLoopRecoveryNotice ? (
                       <>
-                        {displayMessage.role === "assistant" ? (
+                        {displayMessage.role === "assistant" && content ? (
                           <div className="chat-bubble">
                             <CachedMarkdownContent content={content} onOpenFile={openLinkedFile} />
+                            <ChatDeliveryFiles
+                              content={content}
+                              artifacts={displayMessage.artifacts}
+                              onOpenFile={openLinkedFile}
+                            />
                           </div>
-                        ) : (
+                        ) : displayMessage.role === "user" && content ? (
                           (() => {
+                            const reminder = parseReminderCard(content);
                             const parsed = parseAttachmentBlock(content);
                             return (
                               <>
+                                {reminder ? (
+                                  <div className="message-reminder-card" aria-label="提醒卡片">
+                                    <span className="message-reminder-icon" aria-hidden="true"><Bell /></span>
+                                    <span className="message-reminder-copy">
+                                      <strong>{reminder.title}</strong>
+                                      <span>{reminder.body}</span>
+                                    </span>
+                                  </div>
+                                ) : null}
+                                {reminder?.extra ? (
+                                  <div className="chat-bubble"><p>{reminder.extra}</p></div>
+                                ) : null}
                                 {parsed.attachments.length > 0 ? (
                                   <div className="message-attachments" aria-label="本条消息的附件">
                                     {parsed.attachments.map((item) => (
@@ -6550,7 +7150,7 @@ export default function App() {
                                     ))}
                                   </div>
                                 ) : null}
-                                {parsed.body ? (
+                                {parsed.body && !reminder ? (
                                   <div className="chat-bubble">
                                     <p>{parsed.body}</p>
                                   </div>
@@ -6558,10 +7158,16 @@ export default function App() {
                               </>
                             );
                           })()
-                        )}
+                        ) : null}
+                        {showModelLoopRecoveryNotice ? (
+                          <div className="chat-recovery-notice" role="status">
+                            <AlertCircle aria-hidden="true" />
+                            <p>{MODEL_LOOP_STOPPED_ASSISTANT_MESSAGE}</p>
+                          </div>
+                        ) : null}
                         {displayMessage.role === "assistant" &&
                         index === chatMessages.length - 1 &&
-                        isRetryableChatFailure(content) ? (
+                        (isRetryableChatFailure(content) || modelLoopPaused) ? (
                           <button
                             type="button"
                             className="chat-retry-button"
@@ -6569,7 +7175,9 @@ export default function App() {
                             onClick={() => void continueFailedTurn()}
                           >
                             <RefreshCw aria-hidden="true" />
-                            继续本轮
+                            {isModelLoopStoppedText(content) || modelLoopPaused
+                              ? "继续处理"
+                              : "继续本轮"}
                           </button>
                         ) : null}
                       </>
@@ -6613,9 +7221,27 @@ export default function App() {
             <form
               className={`chat-compose ${dragActive ? "is-dragging" : ""} ${
                 isListening ? "is-recording" : ""
-              } ${attachments.length > 0 ? "has-attachments" : ""}`}
+              } ${attachments.length > 0 || pendingReminder ? "has-attachments" : ""}`}
               onSubmit={sendChatMessage}
             >
+              {pendingReminder ? (
+                <div className="attachment-card attachment-reminder" title="本轮待处理提醒">
+                  <span className="attachment-thumb" aria-hidden="true"><Bell /></span>
+                  <span className="attachment-copy">
+                    <strong>{pendingReminder.title}</strong>
+                    <small>{pendingReminder.body}</small>
+                  </span>
+                  <button
+                    type="button"
+                    className="attachment-remove"
+                    aria-label="移除提醒卡片"
+                    title="移除提醒卡片"
+                    onClick={() => setPendingReminder(null)}
+                  >
+                    <X aria-hidden="true" />
+                  </button>
+                </div>
+              ) : null}
               {attachments.length > 0 ? (
                 <div className="attachment-list" aria-label="本轮参考附件">
                   {attachments.map((attachment) => (
@@ -6785,13 +7411,19 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className={`auto-approve-toggle ${autoApprove ? "is-active" : ""}`}
+                      className={`auto-approve-toggle ${autoApprove ? "is-active" : "is-off"}`}
+                      onClick={() => void toggleAutoApprove()}
+                      disabled={busy}
+                      title={
+                        autoApprove
+                          ? "自动安全审查已开启：常规风险动作由模型独立审查。点击后改为人工审批。"
+                          : "自动安全审查已关闭：所有待审批命令都会回到人工确认。点击后重新开启。"
+                      }
+                      aria-label={autoApprove ? "关闭自动安全审查" : "开启自动安全审查"}
                       aria-pressed={autoApprove}
-                      title="由独立审查智能体评估需审批动作；固定安全边界与高风险拒绝规则不受模型影响"
-                      onClick={() => setAutoApprove((enabled) => !enabled)}
                     >
                       <ShieldCheck aria-hidden="true" />
-                      替我审批
+                      {autoApprove ? "自动安全审查" : "人工审查"}
                     </button>
                     <div className="compose-input-wrap">
                       <textarea
@@ -6826,7 +7458,13 @@ export default function App() {
                         aria-label="模型和推理强度"
                         aria-expanded={composerModelMenuOpen}
                       >
-                        <span>{formatProfileCompactLabel(currentProfile)}</span>
+                        <span>
+                          {models
+                            ? formatProfileCompactLabel(currentProfile)
+                            : modelsLoadError
+                              ? "模型加载失败"
+                              : "模型加载中"}
+                        </span>
                         <span className="composer-reasoning-short">
                           {reasoningOption(reasoningEffort).shortLabel}
                         </span>
@@ -6898,7 +7536,13 @@ export default function App() {
                             onClick={() => setComposerSubmenu((value) => (value === "model" ? null : "model"))}
                           >
                             <strong>模型</strong>
-                            <span>{formatProfileLabel(currentProfile)}</span>
+                            <span>
+                              {models
+                                ? formatProfileLabel(currentProfile)
+                                : modelsLoadError
+                                  ? "加载失败"
+                                  : "加载中"}
+                            </span>
                             <ChevronRight aria-hidden="true" />
                           </button>
                           <button
@@ -6923,23 +7567,31 @@ export default function App() {
                           </button>
 
                           {composerSubmenu === "model" ? (
-                            <div className="composer-model-submenu is-model" role="menu" aria-label="选择模型">
+                           <div className="composer-model-submenu is-model" role="menu" aria-label="选择模型">
                               <div className="composer-submenu-title">模型</div>
-                              {profiles.map((profile) => (
-                                <button
-                                  key={profile.name}
-                                  type="button"
-                                  onClick={() => {
-                                    setComposerModelMenuOpen(false);
-                                    setComposerSubmenu(null);
-                                    void switchModel(profile.name);
-                                  }}
-                                >
-                                  <span>{formatProfileLabel(profile)}</span>
-                                  {profile.name === agentForm.profile ? <Check aria-hidden="true" /> : null}
-                                </button>
+                              {endpoints.map((endpoint) => (
+                                <div key={endpoint.endpoint_id} className="composer-model-group">
+                                  <div className="composer-model-group-label">
+                                    {endpoint.label}
+                                    <small>{endpoint.profile_count}</small>
+                                  </div>
+                                  {endpoint.models.map((profile) => (
+                                    <button
+                                      key={profile.name}
+                                      type="button"
+                                      onClick={() => {
+                                        setComposerModelMenuOpen(false);
+                                        setComposerSubmenu(null);
+                                        void switchModel(profile.name);
+                                      }}
+                                    >
+                                      <span>{formatModelName(profile)}</span>
+                                      {profile.name === agentForm.profile ? <Check aria-hidden="true" /> : null}
+                                    </button>
+                                  ))}
+                                </div>
                               ))}
-                            </div>
+                           </div>
                           ) : null}
 
                           {composerSubmenu === "reasoning" ? (
@@ -6991,7 +7643,7 @@ export default function App() {
                     <button
                       type="submit"
                       className="composer-send"
-                      disabled={!chatInput.trim() && attachments.length === 0}
+                      disabled={!chatInput.trim() && attachments.length === 0 && !pendingReminder}
                       aria-label={activityRunning ? "发送到等待队列" : "发送"}
                       title={activityRunning ? "当前轮运行中，本条会进入等待队列" : "发送"}
                     >
@@ -7066,7 +7718,8 @@ export default function App() {
     if (record.events.length === 0 && record.elapsedMs === 0 && messageIndex !== activityMessageIndex) return null;
     const isCurrentActivity = messageIndex === activityMessageIndex && activityRunning;
     const isSelected = activityOpen && panelActivityIndex === messageIndex;
-    const label = isCurrentActivity ? "处理中" : "已处理";
+    const loopStopped = record.events.some(isModelLoopStoppedActivity);
+    const label = isCurrentActivity ? "处理中" : loopStopped ? "已暂停" : "已处理";
     const elapsedLabel = formatActivityDuration(record.elapsedMs);
     return (
       <button
@@ -7120,13 +7773,23 @@ export default function App() {
             <code>{preview || commandText}</code>
           </pre>
         )}
-        <button
-          type="button"
-          disabled={activityRunning}
-          onClick={() => void approvePendingToolBatch(item, messageIndex)}
-        >
-          {activityRunning ? "等待本轮结束" : "确认执行"}
-        </button>
+        <div className="chat-approval-actions">
+          <button
+            type="button"
+            disabled={activityRunning}
+            onClick={() => void approvePendingToolBatch(item, messageIndex)}
+          >
+            {activityRunning ? "等待本轮结束" : "确认执行"}
+          </button>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={activityRunning}
+            onClick={() => void approvePendingToolBatch(item, messageIndex, true)}
+          >
+            {activityRunning ? "等待本轮结束" : "确认并记住此命令"}
+          </button>
+        </div>
       </div>
     );
   }
@@ -7376,6 +8039,15 @@ export default function App() {
 
   function renderActivityEvent(item: AgentActivityEvent, key: string) {
     if (item.activity_type === "plan") return null;
+    if (isModelLoopStoppedActivity(item)) {
+      return renderModelLoopStoppedActivity(item, key);
+    }
+    // Model failures may still contain useful reasoning emitted before the
+    // failure. Keep the same expandable model card instead of routing them to
+    // the generic error renderer, which has no reasoning section.
+    if (isModelThinkingActivity(item)) {
+      return renderModelThinkingActivity(item, key);
+    }
     if (item.phase === "error" || item.command_status === "error") {
       return renderActivityError(item, key);
     }
@@ -7405,6 +8077,106 @@ export default function App() {
               {item.content ? <p className="activity-stream-text">{item.content}</p> : null}
             </>
           )}
+        </div>
+      </article>
+    );
+  }
+
+  function renderModelLoopStoppedActivity(item: AgentActivityEvent, key: string) {
+    const reasoning = (item.reasoning_content || "").trim();
+    return (
+      <article key={key} className="activity-item activity-warning activity-model-thinking-item">
+        <span className="activity-marker" aria-hidden="true">
+          <AlertCircle />
+        </span>
+        <div className="activity-content">
+          <details className="activity-model-thinking activity-model-loop-stopped">
+            <summary>
+              <span className="activity-model-thinking-icon" aria-hidden="true"><AlertCircle /></span>
+              <span className="activity-model-thinking-copy">
+                <strong>{item.step ? `第 ${item.step} 轮 · ` : ""}模型陷入循环重复，已停止</strong>
+                <small>系统已阻止继续空转 · 任务可以继续</small>
+              </span>
+              <ChevronRight aria-hidden="true" />
+            </summary>
+            <div className="activity-model-thinking-body">
+              <div className="activity-model-thinking-toolbar">
+                <span>停止前的模型思考{item.step ? ` · 第 ${item.step} 步` : ""}</span>
+                {reasoning ? (
+                  <button
+                    type="button"
+                    onClick={() => void copyText(reasoning, "停止前的模型思考已复制")}
+                    aria-label="复制停止前的模型思考"
+                  >
+                    <Copy aria-hidden="true" />
+                    复制
+                  </button>
+                ) : null}
+              </div>
+              {reasoning ? <p className="activity-stream-text">{reasoning}</p> : null}
+              <p className="activity-model-thinking-status">
+                已完成的操作和文件会保留，但任务尚未完成。点击聊天区的“继续处理”即可接着完成。
+              </p>
+            </div>
+          </details>
+        </div>
+      </article>
+    );
+  }
+
+  function renderModelThinkingActivity(item: AgentActivityEvent, key: string) {
+    const isRunning = item.phase === "thinking" && !modelThinkingCompleted(item);
+    const reasoning = (item.reasoning_content || "").trim();
+    const statusText = modelThinkingStatusText(item);
+    const preview = compactActivityLine(statusText, 180);
+    const reasoningLength = reasoning.length;
+    return (
+      <article key={key} className={`activity-item activity-${item.phase} activity-model-thinking-item`}>
+        <span className="activity-marker" aria-hidden="true">
+          {item.phase === "error" ? <AlertCircle /> : isRunning ? <Loader2 className="spin" /> : "✦"}
+        </span>
+       <div className="activity-content">
+          <details
+            className="activity-model-thinking"
+            open={isRunning || undefined}
+            key={isRunning ? "running" : "done"}
+          >
+            <summary>
+              <span className="activity-model-thinking-icon" aria-hidden="true">✦</span>
+              <span className="activity-model-thinking-copy">
+                <strong>{item.title || "模型思考"}</strong>
+                <small>
+                  {reasoning
+                    ? `${isRunning ? "正在生成" : "已保留"} ${reasoningLength.toLocaleString("zh-CN")} 字 · ${isRunning ? "实时更新" : "展开查看"}`
+                    : isRunning
+                      ? `正在处理${preview ? ` · ${preview}` : ""}`
+                      : `模型未返回可保留的思考 · 展开查看状态`}
+                </small>
+              </span>
+              <ChevronRight aria-hidden="true" />
+            </summary>
+            <div className="activity-model-thinking-body">
+              <div className="activity-model-thinking-toolbar">
+                <span>
+                  模型原始思考{item.step ? ` · 第 ${item.step} 步` : ""}
+                </span>
+                {reasoning ? (
+                  <button
+                    type="button"
+                    onClick={() => void copyText(reasoning, "模型思考已复制")}
+                    aria-label="复制模型思考内容"
+                  >
+                    <Copy aria-hidden="true" />
+                    复制
+                  </button>
+                ) : null}
+              </div>
+              <p className="activity-stream-text" aria-live={isRunning ? "polite" : undefined}>
+                {reasoning || "本轮模型没有返回独立的思考内容；答案或工具调用仍已正常保留。"}
+              </p>
+              <p className="activity-model-thinking-status">{statusText}</p>
+            </div>
+          </details>
         </div>
       </article>
     );
@@ -8652,6 +9424,8 @@ export default function App() {
                   title="内部留档版"
                   description="给自己本地参考，允许保留不确定信息和详细沟通过程。"
                   path={activeMeetingGroup.internal?.path}
+                  downloadUrl={activeMeetingGroup.internal?.download_url}
+                  fileName={activeMeetingGroup.internal?.name}
                   onView={openFileInLibrary}
                   onCopy={copyPath}
                   onOpen={openLocalFile}
@@ -8661,6 +9435,8 @@ export default function App() {
                   title="ASR转写稿"
                   description="录音转文本的标准命名副本，便于追溯和继续整理。"
                   path={activeMeetingGroup.asr?.path}
+                  downloadUrl={activeMeetingGroup.asr?.download_url}
+                  fileName={activeMeetingGroup.asr?.name}
                   onView={openFileInLibrary}
                   onCopy={copyPath}
                   onOpen={openLocalFile}
@@ -8670,6 +9446,8 @@ export default function App() {
                   title="工作提交版Markdown"
                   description="用于工作提交，简要、保守，只写确认过的内容。"
                   path={activeMeetingGroup.work?.path}
+                  downloadUrl={activeMeetingGroup.work?.download_url}
+                  fileName={activeMeetingGroup.work?.name}
                   onView={openFileInLibrary}
                   onCopy={copyPath}
                   onOpen={openLocalFile}
@@ -8679,6 +9457,8 @@ export default function App() {
                   title="工作提交版DOCX"
                   description="按提交格式导出的 Word 文件，可直接交付或继续编辑。"
                   path={activeMeetingGroup.workDocx?.path}
+                  downloadUrl={activeMeetingGroup.workDocx?.download_url}
+                  fileName={activeMeetingGroup.workDocx?.name}
                   onView={openFileInLibrary}
                   onCopy={copyPath}
                   onOpen={openLocalFile}
@@ -9211,30 +9991,35 @@ export default function App() {
           <p className="muted">
             建议控制在 3—6 条。会议纪要专用规则放到“会议纪要设置”，专名纠错同时加入“语音识别热词”。
           </p>
-          <Field label="文档排版偏好" htmlFor="company-document-format">
+          <p className="muted">
+            正式公文及参照公文格式的正式文字材料统一按 GB/T 9704—2012 执行，
+            不再使用账户级“公司文件格式”覆盖。
+          </p>
+          <Field label="工作区外只读目录" htmlFor="extra-read-roots">
             <textarea
-              id="company-document-format"
-              name="company-document-format"
-              rows={7}
-              value={agentSettingsForm.company_document_format}
+              id="extra-read-roots"
+              name="extra-read-roots"
+              rows={3}
+              value={agentSettingsForm.extra_read_roots_text}
               onChange={(event) =>
                 setAgentSettingsForm({
                   ...agentSettingsForm,
-                  company_document_format: event.target.value
+                  extra_read_roots_text: event.target.value
                 })
               }
-              placeholder={"页面设置：上3.5厘米、下3.1厘米、左2.65厘米、右2.65厘米\n行间距：固定值29.6磅\n标题：2号字，方正小标宋简体"}
+              placeholder={"~/Desktop\n~/Downloads"}
             />
           </Field>
           <p className="muted">
-            只写纯文字排版规则。它是文档偏好，不会被系统当作你的自动记忆。
+            每行一个绝对路径（支持 ~）。这些目录只放行读取：读文件、看图片、列目录可以，
+            写入仍只限工作区。保存后下一轮对话生效。
           </p>
           <div className="form-actions">
             <button type="submit" className="primary-button" disabled={busy}>
               <Check aria-hidden="true" />
               保存设置
             </button>
-            {agentSettings?.details || agentSettings?.company_document_format ? (
+            {agentSettings?.details ? (
               <span className="muted">已配置，会在新一轮对话中生效。</span>
             ) : null}
           </div>
@@ -9424,6 +10209,67 @@ export default function App() {
           </div>
         </section>
 
+        <section className="panel security-review-settings" aria-labelledby="security-review-title">
+          <div className="memory-settings-heading">
+            <div className="panel-header">
+              <span className="panel-icon"><ShieldCheck aria-hidden="true" /></span>
+              <div>
+                <h3 id="security-review-title">安全与审批</h3>
+                <p>
+                  开启时常规风险命令由当前模型独立审查；关闭后一律回到人工确认，
+                  只读低风险命令仍直接执行。
+                </p>
+              </div>
+            </div>
+            <div className="memory-manager-status">
+              <label className="skill-switch">
+                <input
+                  type="checkbox"
+                  checked={agentSettingsForm.auto_approve}
+                  onChange={() => void toggleAutoApprove()}
+                  disabled={busy}
+                />
+                <span aria-hidden="true" />
+                <b>{agentSettingsForm.auto_approve ? "自动安全审查" : "人工审查"}</b>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section className="panel approval-rules-settings" aria-labelledby="approval-rules-title">
+          <div className="panel-header">
+            <span className="panel-icon"><ShieldCheck aria-hidden="true" /></span>
+            <div>
+              <h3 id="approval-rules-title">记住的审批</h3>
+              <p>你点过「确认并记住」的命令；同一条命令再次出现时自动放行，删除和系统级命令永远不会被记住。</p>
+            </div>
+            <div className="memory-manager-status">
+              <button type="button" className="text-button" onClick={() => void refreshRememberedApprovalRules()}>
+                刷新
+              </button>
+            </div>
+          </div>
+          <div className="approval-rules-list">
+            {rememberedApprovalRules.length === 0 ? (
+              <p className="muted">还没有记住的审批。审批卡片上选择「确认并记住此命令」即可加入。</p>
+            ) : (
+              rememberedApprovalRules.map((rule) => (
+                <div className="approval-rule-item" key={rule.id}>
+                  <code translate="no">{rule.command}</code>
+                  <span className="approval-rule-meta">{rule.risk_category}</span>
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => void removeRememberedApprovalRule(rule.command)}
+                  >
+                    删除
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+
         <form className="panel settings-meeting-minutes" onSubmit={saveMeetingMinutesSettings}>
           <PanelHeader icon={<FileText aria-hidden="true" />} title="会议纪要设置" />
           <p className="muted">
@@ -9520,7 +10366,7 @@ export default function App() {
               <span className="panel-icon"><Cpu aria-hidden="true" /></span>
               <div>
                 <h3 id="model-manager-title">模型接入</h3>
-                <p>集中切换、测试、复制和修改 OpenAI-compatible 模型配置。</p>
+                <p>按端点组织模型，集中切换、测试、复制和修改 OpenAI-compatible 模型配置。</p>
                 {models?.env_override ? (
                   <p className="model-env-override-note">
                     当前模型由环境变量锁定为 <code translate="no">{models.env_override}</code>，网页内可编辑和测试，但不能切换。
@@ -9528,87 +10374,188 @@ export default function App() {
                 ) : null}
               </div>
             </div>
-            <button type="button" className="primary-button" onClick={openAddModel} disabled={busy}>
+            <button type="button" className="primary-button" onClick={() => openAddModel()} disabled={busy}>
               <Plus aria-hidden="true" />
               新增配置
             </button>
           </div>
 
-          <div className="model-profile-list" role="list">
-            {profiles.map((profile) => {
-              const confirmingDelete = deleteConfirmModelName === profile.name;
+          <div className="model-endpoint-list">
+            {endpoints.length ? endpoints.map((endpoint) => {
+              const endpointDefaultModel =
+                endpoint.models.find((profile) => profile.default) ?? endpoint.models[0];
+              const confirmingDeleteEndpoint = deleteConfirmEndpointId === endpoint.endpoint_id;
+              const isExpanded = expandedEndpointId === endpoint.endpoint_id;
               return (
                 <article
-                  className={`model-profile-row ${profile.default ? "is-current" : ""}`}
-                  role="listitem"
-                  key={profile.name}
+                  className={`model-endpoint-card ${endpoint.default ? "is-current" : ""} ${isExpanded ? "is-expanded" : "is-collapsed"}`}
+                  key={endpoint.endpoint_id}
                 >
-                  <span className="model-profile-mark" aria-hidden="true">
-                    {providerInitial(profile.provider)}
-                  </span>
-                  <span className="model-profile-main">
-                    <span className="model-profile-title">
-                      <strong translate="no">{profile.name}</strong>
-                      {profile.default ? <Badge tone="success">当前</Badge> : null}
-                      <Badge tone={profile.api_key_configured ? "neutral" : "warning"}>
-                        {profile.api_key_configured ? "密钥已配置" : "缺少密钥"}
-                      </Badge>
-                      <Badge tone={profile.supports_vision ? "success" : "neutral"}>
-                        {profile.supports_vision ? "支持图片" : "仅文字"}
-                      </Badge>
+                  <header className="model-endpoint-head">
+                    <button
+                      type="button"
+                      className="model-endpoint-toggle"
+                      aria-expanded={isExpanded}
+                      aria-label={isExpanded ? "折叠模型列表" : "展开模型列表"}
+                      onClick={() => setExpandedEndpointId(isExpanded ? "" : endpoint.endpoint_id)}
+                    >
+                      {isExpanded ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
+                    </button>
+                    <span className="model-profile-mark" aria-hidden="true">
+                      {providerInitial(endpoint.provider)}
                     </span>
-                    <span className="model-profile-route">
-                      <code translate="no">{profile.model}</code>
-                      <small translate="no">{profile.base_url}</small>
+                    <span className="model-endpoint-main">
+                      <span className="model-endpoint-title">
+                        <strong translate="no">{endpoint.label}</strong>
+                        {endpoint.default ? <Badge tone="success">当前</Badge> : null}
+                        <Badge tone="neutral">{endpoint.profile_count} 个模型</Badge>
+                        <Badge tone={endpoint.api_key_configured ? "neutral" : "warning"}>
+                          {endpoint.api_key_configured ? "密钥已配置" : "缺少密钥"}
+                        </Badge>
+                      </span>
+                      <span className="model-endpoint-route">
+                        <code translate="no">{endpoint.base_url}</code>
+                        <small translate="no">{endpoint.provider}</small>
+                      </span>
                     </span>
-                  </span>
-                  <span className="model-profile-params">
-                    <small>温度 {profile.temperature}</small>
-                    <small>{numberFormatter.format(profile.max_tokens)} tokens</small>
-                    <small>{profile.timeout_seconds}s</small>
-                  </span>
-                  <span className="model-profile-actions">
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      disabled={busy || profile.default || Boolean(models?.env_override)}
-                      onClick={() => void switchModel(profile.name)}
-                      title={models?.env_override ? "当前模型由 WORK_AGENT_MODEL_PROFILE 环境变量锁定" : undefined}
-                    >
-                      {profile.default ? <Check aria-hidden="true" /> : null}
-                      {profile.default ? "使用中" : models?.env_override ? "环境锁定" : "设为当前"}
-                    </button>
-                    <button
-                      type="button"
-                      className="text-button"
-                      disabled={busy || !profile.api_key_configured}
-                      onClick={() => void testModelConfiguration(profile)}
-                    >
-                      <RefreshCw aria-hidden="true" />
-                      测试
-                    </button>
-                    <button type="button" className="text-button" disabled={busy} onClick={() => openEditModel(profile)}>
-                      <Pencil aria-hidden="true" />
-                      编辑
-                    </button>
-                    <button type="button" className="text-button" disabled={busy} onClick={() => copyModelProfile(profile)}>
-                      <Copy aria-hidden="true" />
-                      复制
-                    </button>
-                    <button
-                      type="button"
-                      className={`text-button model-profile-delete ${confirmingDelete ? "is-confirming" : ""}`}
-                      disabled={busy || profile.default || profiles.length <= 1}
-                      title={profile.default ? "请先切换到其他模型再删除" : "删除模型配置"}
-                      onClick={() => void deleteModelConfiguration(profile)}
-                    >
-                      <Trash2 aria-hidden="true" />
-                      {confirmingDelete ? "确认删除" : "删除"}
-                    </button>
-                  </span>
+                    <span className="model-endpoint-actions">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={busy || !endpointDefaultModel || endpoint.default || Boolean(models?.env_override)}
+                        onClick={() => endpointDefaultModel && void switchModel(endpointDefaultModel.name)}
+                        title={models?.env_override ? "当前模型由 WORK_AGENT_MODEL_PROFILE 环境变量锁定" : undefined}
+                      >
+                        {endpoint.default ? <Check aria-hidden="true" /> : null}
+                        {endpoint.default ? "使用中" : models?.env_override ? "环境锁定" : "设为当前端点"}
+                      </button>
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={busy || !endpointDefaultModel || !endpoint.api_key_configured}
+                        onClick={() => endpointDefaultModel && void testModelConfiguration(endpointDefaultModel)}
+                      >
+                        <RefreshCw aria-hidden="true" />
+                        测试
+                      </button>
+                     <button type="button" className="text-button" disabled={busy} onClick={() => openAddModel(endpoint)}>
+                       <Plus aria-hidden="true" />
+                       新增模型
+                     </button>
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={busy || !endpoint.api_key_configured}
+                        title={!endpoint.api_key_configured ? "端点缺少密钥，无法拉取" : "GET /models 拉取端点全部模型并接入"}
+                        onClick={() => void importEndpointModels(endpoint)}
+                      >
+                        <Sparkles aria-hidden="true" />
+                        发现模型
+                      </button>
+                     <button type="button" className="text-button" disabled={busy} onClick={() => openEditEndpoint(endpoint)}>
+                        <Pencil aria-hidden="true" />
+                        编辑端点
+                      </button>
+                      <button
+                        type="button"
+                        className={`text-button model-profile-delete ${confirmingDeleteEndpoint ? "is-confirming" : ""}`}
+                        disabled={busy || endpoint.default || endpoints.length <= 1}
+                        title={endpoint.default ? "请先切换到其他端点再删除" : "删除端点及其全部模型"}
+                        onClick={() => void deleteEndpointConfiguration(endpoint)}
+                      >
+                        <Trash2 aria-hidden="true" />
+                        {confirmingDeleteEndpoint ? "确认删除" : "删除端点"}
+                      </button>
+                    </span>
+                  </header>
+
+                  {isExpanded ? (
+                  <div className="model-endpoint-body" role="list">
+                    {endpoint.models.map((profile) => {
+                      const confirmingDelete = deleteConfirmModelName === profile.name;
+                      return (
+                        <article
+                          className={`model-profile-row ${profile.default ? "is-current" : ""}`}
+                          role="listitem"
+                          key={profile.name}
+                        >
+                          <span className="model-profile-mark" aria-hidden="true">
+                            {providerInitial(profile.provider)}
+                          </span>
+                          <span className="model-profile-main">
+                            <span className="model-profile-title">
+                              <strong translate="no">{profile.name}</strong>
+                              {profile.default ? <Badge tone="success">当前</Badge> : null}
+                              <Badge tone={profile.api_key_configured ? "neutral" : "warning"}>
+                                {profile.api_key_configured ? "密钥已配置" : "缺少密钥"}
+                              </Badge>
+                              <Badge tone={profile.supports_vision ? "success" : "neutral"}>
+                                {profile.supports_vision ? "支持图片" : "仅文字"}
+                              </Badge>
+                            </span>
+                            <span className="model-profile-route">
+                              <code translate="no">{profile.model}</code>
+                              <small translate="no">{profile.base_url}</small>
+                            </span>
+                          </span>
+                          <span className="model-profile-params">
+                            <small>温度 {profile.temperature}</small>
+                            <small>输出 {numberFormatter.format(profile.max_tokens)} tokens</small>
+                            <small>
+                              上下文 {numberFormatter.format(profile.context_length ?? 256000)} ·
+                              压缩线 {numberFormatter.format(Math.floor((profile.context_length ?? 256000) * 0.85))}
+                            </small>
+                            <small>{profile.timeout_seconds}s</small>
+                          </span>
+                          <span className="model-profile-actions">
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              disabled={busy || profile.default || Boolean(models?.env_override)}
+                              onClick={() => void switchModel(profile.name)}
+                              title={models?.env_override ? "当前模型由 WORK_AGENT_MODEL_PROFILE 环境变量锁定" : undefined}
+                            >
+                              {profile.default ? <Check aria-hidden="true" /> : null}
+                              {profile.default ? "使用中" : models?.env_override ? "环境锁定" : "设为当前"}
+                            </button>
+                            <button
+                              type="button"
+                              className="text-button"
+                              disabled={busy || !profile.api_key_configured}
+                              onClick={() => void testModelConfiguration(profile)}
+                            >
+                              <RefreshCw aria-hidden="true" />
+                              测试
+                            </button>
+                            <button type="button" className="text-button" disabled={busy} onClick={() => openEditModel(profile)}>
+                              <Pencil aria-hidden="true" />
+                              编辑
+                            </button>
+                            <button type="button" className="text-button" disabled={busy} onClick={() => copyModelProfile(profile)}>
+                              <Copy aria-hidden="true" />
+                              复制
+                            </button>
+                            <button
+                              type="button"
+                              className={`text-button model-profile-delete ${confirmingDelete ? "is-confirming" : ""}`}
+                              disabled={busy || profile.default || profiles.length <= 1}
+                              title={profile.default ? "请先切换到其他模型再删除" : "删除模型配置"}
+                              onClick={() => void deleteModelConfiguration(profile)}
+                            >
+                              <Trash2 aria-hidden="true" />
+                              {confirmingDelete ? "确认删除" : "删除"}
+                            </button>
+                          </span>
+                        </article>
+                      );
+                    })}
+                  </div>
+                  ) : null}
                 </article>
               );
-            })}
+            }) : (
+              <p className="model-empty-note">还没有模型配置，点击“新增配置”创建第一个端点与模型。</p>
+            )}
           </div>
 
           {modelEditorMode ? (
@@ -9645,8 +10592,11 @@ export default function App() {
                         model: preset.model,
                         temperature: preset.temperature,
                         max_tokens: preset.max_tokens,
+                        context_length: preset.context_length,
                         timeout_seconds: preset.timeout_seconds,
-                        supports_vision: preset.supports_vision
+                        supports_vision: preset.supports_vision,
+                        endpoint_id: preset.endpoint_id ?? "",
+                        endpoint_label: preset.endpoint_label ?? ""
                       }));
                       setDiscoveredModelIds([]);
                       setModelConnectionResult(null);
@@ -9709,12 +10659,51 @@ export default function App() {
                   placeholder="例如：https://api.example.com/v1"
                   value={modelForm.base_url}
                   onChange={(event) => {
-                    setModelForm({ ...modelForm, base_url: event.target.value });
+                    const nextBaseUrl = event.target.value;
+                    setModelForm((current) => ({
+                      ...current,
+                      base_url: nextBaseUrl,
+                      endpoint_id: current.endpoint_id
+                        ? current.endpoint_id
+                        : nextBaseUrl
+                          ? endpointKeyForBaseUrl(nextBaseUrl)
+                          : "",
+                      endpoint_label: current.endpoint_label
+                        ? current.endpoint_label
+                        : nextBaseUrl
+                          ? endpointLabelForBaseUrl(nextBaseUrl)
+                          : ""
+                    }));
                     setDiscoveredModelIds([]);
                     setModelConnectionResult(null);
                   }}
                 />
               </Field>
+
+              <div className="form-grid two">
+                <Field label="端点名称" htmlFor="profile-endpoint-label">
+                  <input
+                    id="profile-endpoint-label"
+                    name="profile-endpoint-label"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="例如：Opencode Go"
+                    value={modelForm.endpoint_label}
+                    onChange={(event) => setModelForm({ ...modelForm, endpoint_label: event.target.value })}
+                  />
+                </Field>
+                <Field label="端点 ID" htmlFor="profile-endpoint-id">
+                  <input
+                    id="profile-endpoint-id"
+                    name="profile-endpoint-id"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="留空自动按接口地址归组"
+                    value={modelForm.endpoint_id}
+                    onChange={(event) => setModelForm({ ...modelForm, endpoint_id: event.target.value })}
+                  />
+                </Field>
+              </div>
 
               <Field label="模型名称" htmlFor="profile-model">
                 <div className="model-id-control">
@@ -9766,6 +10755,19 @@ export default function App() {
                       value={modelForm.max_tokens}
                       onChange={(event) => setModelForm({ ...modelForm, max_tokens: Number(event.target.value) })}
                     />
+                  </Field>
+                  <Field label="上下文窗口 Token" htmlFor="profile-context-length">
+                    <input
+                      id="profile-context-length"
+                      type="number"
+                      min={4096}
+                      max={1000000}
+                      value={modelForm.context_length}
+                      onChange={(event) => setModelForm({ ...modelForm, context_length: Number(event.target.value) })}
+                    />
+                    <small>
+                      自动压缩线：{numberFormatter.format(Math.floor(modelForm.context_length * 0.85))} tokens（85%）
+                    </small>
                   </Field>
                   <Field label="超时时间（秒）" htmlFor="profile-timeout">
                     <input
@@ -9845,6 +10847,89 @@ export default function App() {
                 >
                   <Check aria-hidden="true" />
                   {modelEditorMode === "edit" ? "保存修改" : "添加配置"}
+                </button>
+              </div>
+            </form>
+          ) : null}
+
+          {endpointEditorMode === "edit" ? (
+            <form className="model-editor" onSubmit={saveEndpointConfiguration}>
+              <div className="model-editor-heading">
+                <div>
+                  <h4>编辑端点 {endpointForm.name || endpointForm.endpoint_id}</h4>
+                  <p>端点信息会应用到端点下的所有模型；API 密钥留空表示保持不变。</p>
+                </div>
+                <button type="button" className="icon-action-button" aria-label="关闭端点编辑器" onClick={closeEndpointEditor}>
+                  <X aria-hidden="true" />
+                </button>
+              </div>
+
+              <div className="form-grid two">
+                <Field label="端点名称" htmlFor="endpoint-name">
+                  <input
+                    id="endpoint-name"
+                    name="endpoint-name"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="例如：Opencode Go"
+                    value={endpointForm.name}
+                    onChange={(event) => setEndpointForm({ ...endpointForm, name: event.target.value })}
+                  />
+                </Field>
+                <Field label="供应商" htmlFor="endpoint-provider">
+                  <input
+                    id="endpoint-provider"
+                    name="endpoint-provider"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="例如：opencode-go"
+                    value={endpointForm.provider}
+                    onChange={(event) => setEndpointForm({ ...endpointForm, provider: event.target.value })}
+                  />
+                </Field>
+              </div>
+
+              <Field label="接口地址" htmlFor="endpoint-base-url">
+                <input
+                  id="endpoint-base-url"
+                  name="endpoint-base-url"
+                  type="url"
+                  inputMode="url"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="例如：https://api.example.com/v1"
+                  value={endpointForm.base_url}
+                  onChange={(event) => setEndpointForm({ ...endpointForm, base_url: event.target.value })}
+                />
+              </Field>
+
+              <Field label="API 密钥（留空保持不变）" htmlFor="endpoint-api-key">
+                <div className="secret-input">
+                  <input
+                    id="endpoint-api-key"
+                    name="endpoint-api-key"
+                    type="password"
+                    autoComplete="new-password"
+                    spellCheck={false}
+                    placeholder="••••••••（不更换）"
+                    value={endpointForm.api_key}
+                    onChange={(event) => setEndpointForm({ ...endpointForm, api_key: event.target.value })}
+                  />
+                </div>
+              </Field>
+
+              <div className="model-editor-actions">
+                <span className="model-editor-action-spacer" />
+                <button type="button" className="secondary-button" disabled={busy} onClick={closeEndpointEditor}>
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={busy || !endpointForm.endpoint_id.trim() || !endpointForm.base_url.trim()}
+                >
+                  <Check aria-hidden="true" />
+                  保存端点
                 </button>
               </div>
             </form>
@@ -10729,10 +11814,62 @@ type MarkdownContentProps = {
 
 function MarkdownContent({ content, onOpenFile }: MarkdownContentProps) {
   const blocks = parseMarkdownBlocks(content);
+  const localDirectoryHints = extractLocalDirectoryHints(content);
   return (
     <div className="markdown-content">
-      {blocks.map((block, index) => renderMarkdownBlock(block, index, onOpenFile))}
+      {blocks.map((block, index) => renderMarkdownBlock(block, index, onOpenFile, localDirectoryHints))}
     </div>
+  );
+}
+
+function ChatDeliveryFiles({
+  content,
+  artifacts,
+  onOpenFile
+}: Required<Pick<MarkdownContentProps, "content" | "onOpenFile">> & {
+  artifacts?: DeliveryArtifact[];
+}) {
+  const structured = (artifacts ?? []).filter(
+    (item) => item && typeof item.path === "string" && item.path.trim()
+  );
+  // Text extraction remains only for old archived replies. New turns carry
+  // verified artifact metadata from the backend event log.
+  const files: DeliveryArtifact[] = structured.length > 0
+    ? structured
+    : extractDeliveryFileReferences(content).map((path) => ({ artifact_id: path, path }));
+  if (files.length === 0) return null;
+  return (
+    <section className="chat-delivery-files" aria-label="交付文件">
+      <strong>交付文件</strong>
+      <div>
+        {files.map((artifact) => {
+          const path = artifact.path;
+          const name = artifact.title?.trim() || fileNameFromPath(path);
+          const extension = artifact.kind?.trim().toUpperCase()
+            || (name.includes(".") ? name.split(".").pop()?.toUpperCase() : "文件");
+          const status = artifact.verified ? "已验证" : "可预览";
+          return (
+            <article key={artifact.artifact_id || path} className="chat-delivery-file">
+              <button type="button" onClick={() => void onOpenFile(path)} aria-label={`预览 ${name}`}>
+                <span className="chat-delivery-file-icon"><FileText aria-hidden="true" /></span>
+                <span>
+                  <strong>{name}</strong>
+                  <small>{extension || "文件"} · {status} · 点击预览</small>
+                </span>
+              </button>
+              <a
+                href={fileDownloadUrl(path)}
+                download={name}
+                aria-label={`下载 ${name} 到当前电脑`}
+                title="下载到当前电脑"
+              >
+                <Download aria-hidden="true" />
+              </a>
+            </article>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -10746,17 +11883,18 @@ const CachedMarkdownContent = memo(
 function renderMarkdownBlock(
   block: MarkdownBlock,
   index: number,
-  onOpenFile?: MarkdownContentProps["onOpenFile"]
+  onOpenFile?: MarkdownContentProps["onOpenFile"],
+  localDirectoryHints: string[] = []
 ) {
   if (block.type === "heading") {
     const HeadingTag = `h${Math.min(Math.max(block.level, 2), 4)}` as "h2" | "h3" | "h4";
-    return <HeadingTag key={`heading-${index}`}>{renderInlineMarkdown(block.text, `h-${index}`, onOpenFile)}</HeadingTag>;
+    return <HeadingTag key={`heading-${index}`}>{renderInlineMarkdown(block.text, `h-${index}`, onOpenFile, localDirectoryHints)}</HeadingTag>;
   }
   if (block.type === "ul") {
     return (
       <ul key={`ul-${index}`}>
         {block.items.map((item, itemIndex) => (
-          <li key={`ul-${index}-${itemIndex}`}>{renderInlineMarkdown(item, `ul-${index}-${itemIndex}`, onOpenFile)}</li>
+          <li key={`ul-${index}-${itemIndex}`}>{renderInlineMarkdown(item, `ul-${index}-${itemIndex}`, onOpenFile, localDirectoryHints)}</li>
         ))}
       </ul>
     );
@@ -10765,7 +11903,7 @@ function renderMarkdownBlock(
     return (
       <ol key={`ol-${index}`}>
         {block.items.map((item, itemIndex) => (
-          <li key={`ol-${index}-${itemIndex}`}>{renderInlineMarkdown(item, `ol-${index}-${itemIndex}`, onOpenFile)}</li>
+          <li key={`ol-${index}-${itemIndex}`}>{renderInlineMarkdown(item, `ol-${index}-${itemIndex}`, onOpenFile, localDirectoryHints)}</li>
         ))}
       </ol>
     );
@@ -10785,7 +11923,7 @@ function renderMarkdownBlock(
             <tr>
               {block.headers.map((header, cellIndex) => (
                 <th key={`table-${index}-head-${cellIndex}`} scope="col">
-                  {renderInlineMarkdown(header, `table-${index}-head-${cellIndex}`, onOpenFile)}
+                  {renderInlineMarkdown(header, `table-${index}-head-${cellIndex}`, onOpenFile, localDirectoryHints)}
                 </th>
               ))}
             </tr>
@@ -10795,7 +11933,7 @@ function renderMarkdownBlock(
               <tr key={`table-${index}-row-${rowIndex}`}>
                 {row.map((cell, cellIndex) => (
                   <td key={`table-${index}-cell-${rowIndex}-${cellIndex}`}>
-                    {renderInlineMarkdown(cell, `table-${index}-cell-${rowIndex}-${cellIndex}`, onOpenFile)}
+                    {renderInlineMarkdown(cell, `table-${index}-cell-${rowIndex}-${cellIndex}`, onOpenFile, localDirectoryHints)}
                   </td>
                 ))}
               </tr>
@@ -10810,7 +11948,7 @@ function renderMarkdownBlock(
       {block.lines.map((line, lineIndex) => (
         <span key={`paragraph-${index}-${lineIndex}`}>
           {lineIndex > 0 ? <br /> : null}
-          {renderInlineMarkdown(line, `p-${index}-${lineIndex}`, onOpenFile)}
+          {renderInlineMarkdown(line, `p-${index}-${lineIndex}`, onOpenFile, localDirectoryHints)}
         </span>
       ))}
     </p>
@@ -10918,7 +12056,8 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
 function renderInlineMarkdown(
   text: string,
   keyPrefix: string,
-  onOpenFile?: MarkdownContentProps["onOpenFile"]
+  onOpenFile?: MarkdownContentProps["onOpenFile"],
+  localDirectoryHints: string[] = []
 ): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
@@ -10935,10 +12074,10 @@ function renderInlineMarkdown(
     const token = match[0];
     const key = `${keyPrefix}-${nodes.length}`;
     if (token.startsWith("**") && token.endsWith("**")) {
-      nodes.push(<strong key={key}>{renderInlineMarkdown(token.slice(2, -2), `${key}-strong`, onOpenFile)}</strong>);
+      nodes.push(<strong key={key}>{renderInlineMarkdown(token.slice(2, -2), `${key}-strong`, onOpenFile, localDirectoryHints)}</strong>);
     } else if (token.startsWith("`") && token.endsWith("`")) {
       const codeContent = token.slice(1, -1);
-      const localPath = normalizeLocalFileReference(codeContent);
+      const localPath = normalizeLocalFileReference(codeContent, localDirectoryHints);
       nodes.push(
         localPath && onOpenFile ? (
           <button
@@ -10956,7 +12095,7 @@ function renderInlineMarkdown(
     } else {
       const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       if (linkMatch) {
-        const localPath = normalizeLocalFileReference(linkMatch[2]);
+        const localPath = normalizeLocalFileReference(linkMatch[2], localDirectoryHints);
         if (localPath && onOpenFile) {
           nodes.push(
             <button
@@ -10965,14 +12104,14 @@ function renderInlineMarkdown(
               className="markdown-file-link"
               onClick={() => void onOpenFile(localPath)}
             >
-              {renderInlineMarkdown(linkMatch[1], `${key}-link`, onOpenFile)}
+              {renderInlineMarkdown(linkMatch[1], `${key}-link`, onOpenFile, localDirectoryHints)}
             </button>
           );
         } else {
           const href = safeMarkdownHref(linkMatch[2]);
           nodes.push(
             <a key={key} href={href} target={href.startsWith("#") ? undefined : "_blank"} rel="noreferrer">
-              {renderInlineMarkdown(linkMatch[1], `${key}-link`, onOpenFile)}
+              {renderInlineMarkdown(linkMatch[1], `${key}-link`, onOpenFile, localDirectoryHints)}
             </a>
           );
         }
@@ -10996,7 +12135,7 @@ function renderTextWithLocalFileLinks(
   if (!onOpenFile) return [text];
   const nodes: ReactNode[] = [];
   const pathPattern =
-    /((?:(?:file:\/\/)?\/[^\s`'"<>|]*\/)?(?:\.\/)?(?:meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|产出材料|分析材料|学习笔记)\/[^\s`'"<>|]+?\.(?:md|txt|json|ya?ml|csv|log|srt|vtt|py|tsx?|jsx?|css|html|pdf|docx?|pptx?|xlsx?|png|jpe?g|webp|gif|heic|tiff?|m4a|mp3|wav|aac|flac|ogg|opus|wma|amr|aiff?|caf)(?::\d+(?::\d+)?|#L\d+(?:-L\d+)?)?)/giu;
+    /((?:(?:file:\/\/)?\/[^\s`'"<>|]*\/)?(?:\.\/)?(?:meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|work_reports|产出材料|分析材料|学习笔记)\/[^\s`'"<>|]+?\.(?:md|txt|json|ya?ml|csv|log|srt|vtt|py|tsx?|jsx?|css|html|pdf|docx?|pptx?|xlsx?|png|jpe?g|webp|gif|heic|tiff?|m4a|mp3|wav|aac|flac|ogg|opus|wma|amr|aiff?|caf)(?::\d+(?::\d+)?|#L\d+(?:-L\d+)?)?)/giu;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = pathPattern.exec(text)) !== null) {
@@ -11027,7 +12166,7 @@ function renderTextWithLocalFileLinks(
   return nodes;
 }
 
-function normalizeLocalFileReference(value: string) {
+function normalizeLocalFileReference(value: string, localDirectoryHints: string[] = []) {
   const allowedPrefixes = [
     "meet_files/",
     "meeting_audio_minutes/",
@@ -11037,6 +12176,7 @@ function normalizeLocalFileReference(value: string) {
     "config/",
     "schemas/",
     "tmp/",
+    "work_reports/",
     "产出材料/",
     "分析材料/",
     "学习笔记/"
@@ -11052,7 +12192,10 @@ function normalizeLocalFileReference(value: string) {
   } catch {
     // Keep the original path when it is not URL-encoded.
   }
-  const rootMatch = candidate.match(/(?:^|\/)(meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|产出材料|分析材料|学习笔记)\//u);
+  if (!candidate.includes("/") && /^[^/\\]+\.[a-z0-9]+$/i.test(candidate) && localDirectoryHints.length === 1) {
+    candidate = `${localDirectoryHints[0]}${candidate}`;
+  }
+  const rootMatch = candidate.match(/(?:^|\/)(meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|work_reports|产出材料|分析材料|学习笔记)\//u);
   if (rootMatch?.index !== undefined) {
     candidate = candidate.slice(rootMatch.index + (rootMatch[0].startsWith("/") ? 1 : 0));
   }
@@ -11064,6 +12207,37 @@ function normalizeLocalFileReference(value: string) {
   if (!allowedPrefixes.some((prefix) => candidate.startsWith(prefix))) return null;
   if (!/\.[a-z0-9]+$/i.test(candidate)) return null;
   return candidate;
+}
+
+function extractLocalDirectoryHints(content: string) {
+  const hints = new Set<string>();
+  const inlineCodePattern = /`([^`\n]+\/)`/g;
+  let match: RegExpExecArray | null;
+  while ((match = inlineCodePattern.exec(content)) !== null) {
+    const candidate = match[1].trim().replace(/^\.\/+/, "");
+    if (candidate.includes("..")) continue;
+    if (/^(?:meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|work_reports|产出材料|分析材料|学习笔记)\//u.test(candidate)) {
+      hints.add(candidate);
+    }
+  }
+  return Array.from(hints);
+}
+
+function extractDeliveryFileReferences(content: string) {
+  const hints = extractLocalDirectoryHints(content);
+  const paths = new Set<string>();
+  const addCandidate = (value: string) => {
+    const path = normalizeLocalFileReference(value, hints);
+    if (!path || (!path.startsWith("meet_files/") && !path.startsWith("work_reports/"))) return;
+    if (!/\.(?:md|txt|docx?|pdf|xlsx?|pptx?|csv)$/i.test(path)) return;
+    paths.add(path);
+  };
+  for (const match of content.matchAll(/`([^`\n]+)`/g)) addCandidate(match[1]);
+  for (const match of content.matchAll(/\*\*([^*\n]+)\*\*/g)) addCandidate(match[1]);
+  for (const match of content.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)) addCandidate(match[1]);
+  const rawPathPattern = /(?:meet_files|work_reports)\/[^\s`'"<>|]+?\.(?:md|txt|docx?|pdf|xlsx?|pptx?|csv)/giu;
+  for (const match of content.matchAll(rawPathPattern)) addCandidate(match[0]);
+  return Array.from(paths);
 }
 
 function isMarkdownTableStart(lines: string[], index: number) {
@@ -11138,6 +12312,8 @@ function VersionCard({
   title,
   description,
   path,
+  downloadUrl,
+  fileName,
   onView,
   onCopy,
   onOpen,
@@ -11146,6 +12322,8 @@ function VersionCard({
   title: string;
   description: string;
   path?: string;
+  downloadUrl?: string;
+  fileName?: string;
   onView: (path: string) => void | Promise<void>;
   onCopy: (path: string) => void | Promise<void>;
   onOpen?: (path: string) => void | Promise<void>;
@@ -11167,6 +12345,17 @@ function VersionCard({
         <span className="missing-output">暂未找到这一版文件</span>
       )}
       <div className="version-actions">
+        {downloadUrl && fileName ? (
+          <a
+            className="secondary-button"
+            href={downloadUrl}
+            download={fileName}
+            aria-label={`下载 ${fileName} 到当前电脑`}
+          >
+            <Download aria-hidden="true" />
+            下载
+          </a>
+        ) : null}
         <button
           type="button"
           className="secondary-button"
@@ -11436,8 +12625,43 @@ function explainError(error: unknown) {
   return "出现未知错误，请查看本地服务日志。";
 }
 
+const MODEL_LOOP_STOPPED_ASSISTANT_MESSAGE =
+  "模型陷入循环重复，系统已安全停止当前请求，避免继续空转。" +
+  "已完成的操作和文件会保留，但任务尚未完成。点击“继续处理”接着完成。";
+
+function isModelLoopStoppedText(text: string) {
+  const value = String(text || "");
+  return (
+    /检测到模型(?:思考|回答草稿).*(?:陷入循环重复|正在重复此前已输出的长片段).*停止/s.test(value) ||
+    value.includes("模型陷入循环重复，系统已安全停止当前请求")
+  );
+}
+
+function isModelLoopStoppedError(event: Extract<AgentStreamEvent, { event: "error" }>) {
+  return (
+    event.error_code === "model_loop_stopped" ||
+    event.type === "ModelStreamLoopStopped" ||
+    isModelLoopStoppedText(`${event.message} ${event.detail ?? ""}`)
+  );
+}
+
+function isModelLoopStoppedActivity(event: AgentActivityEvent) {
+  return (
+    event.activity_type === "model_loop_stopped" ||
+    /模型(?:陷入循环重复|重复，已自动停止)/.test(event.title || "") ||
+    isModelLoopStoppedText(`${event.detail ?? ""} ${event.content ?? ""}`)
+  );
+}
+
+function normalizeModelLoopStoppedAssistantContent(content: string) {
+  return isModelLoopStoppedText(content) ? MODEL_LOOP_STOPPED_ASSISTANT_MESSAGE : content;
+}
+
 function friendlyRuntimeError(message: string) {
   const normalized = String(message || "").toLowerCase();
+  if (isModelLoopStoppedText(message)) {
+    return MODEL_LOOP_STOPPED_ASSISTANT_MESSAGE;
+  }
   if (normalized.includes("http 402") || normalized.includes("insufficient balance")) {
     return "模型服务余额不足。充值或切换到可用模型后再继续。";
   }
@@ -11470,7 +12694,7 @@ function friendlyRuntimeError(message: string) {
 }
 
 function isRetryableChatFailure(content: string) {
-  return content.trimStart().startsWith("这次没有成功：");
+  return content.trimStart().startsWith("这次没有成功：") || isModelLoopStoppedText(content);
 }
 
 function parseSkillQuery(value: string) {
@@ -11502,7 +12726,7 @@ function orderConversationHistory(items: ConversationHistoryItem[]) {
   });
 }
 
-type ConversationTaskStatus = "idle" | "running" | "waiting" | "completed" | "error";
+type ConversationTaskStatus = "idle" | "running" | "waiting" | "paused" | "completed" | "error";
 
 function conversationTaskStatus(
   item: ConversationHistoryItem,
@@ -11513,11 +12737,21 @@ function conversationTaskStatus(
   const record = activityIndex === null ? undefined : records[activityIndex];
   if (hasActiveRun) return "running";
   const taskKey = conversationTaskKey(item);
-  if (taskKey && item.acknowledgedTaskKey === taskKey) return "idle";
+  // A badge represents an explicitly recorded unseen background result.  Do
+  // not infer one from every historical activity: that made old completed and
+  // failed turns reappear whenever the page or service restarted.
+  if (!taskKey || item.unseenTaskKey !== taskKey) return "idle";
+  if (item.acknowledgedTaskKey === taskKey) return "idle";
   if (!record?.completed && item.activeTurnStatus === "waiting_approval") return "waiting";
   const lastAssistantMessage = [...item.messages]
     .reverse()
     .find((message) => message.role === "assistant")?.content ?? "";
+  if (
+    isModelLoopStoppedText(lastAssistantMessage) ||
+    record?.events.some(isModelLoopStoppedActivity)
+  ) {
+    return "paused";
+  }
   if (isRetryableChatFailure(lastAssistantMessage)) {
     return "error";
   }
@@ -11548,6 +12782,7 @@ function conversationTaskKey(item: ConversationHistoryItem) {
 function conversationTaskStatusLabel(status: ConversationTaskStatus) {
   if (status === "running") return "执行中";
   if (status === "waiting") return "等待确认";
+  if (status === "paused") return "可继续处理";
   if (status === "completed") return "已完成";
   if (status === "error") return "执行失败";
   return "未开始";
@@ -11574,12 +12809,17 @@ function mergeConversationHistories(
   for (const item of localItems) {
     const local = sanitizeConversationHistoryItem(item);
     const archived = byId.get(local.id);
-    if (
-      local.id === FRIDAY_CONVERSATION_ID &&
-      archived &&
-      archived.messages.length > local.messages.length
-    ) {
-      byId.set(local.id, archived);
+    if (archived && archived.messages.length > local.messages.length) {
+      byId.set(local.id, {
+        ...local,
+        messages: archived.messages,
+        contextSummary: archived.contextSummary || local.contextSummary,
+        contextSummaryMessageCount:
+          archived.contextSummaryMessageCount ?? local.contextSummaryMessageCount,
+        projectId: local.projectId ?? archived.projectId,
+        activities: mergeConversationActivities(archived.activities, local.activities),
+        activeActivityIndex: local.activeActivityIndex ?? archived.activeActivityIndex
+      });
       continue;
     }
     if (archived) {
@@ -11595,6 +12835,59 @@ function mergeConversationHistories(
     byId.set(local.id, local);
   }
   return orderConversationHistory(Array.from(byId.values()));
+}
+
+function mergeConversationIndexes(
+  indexedItems: ConversationHistoryIndexItem[],
+  localItems: ConversationHistoryItem[]
+) {
+  const localById = new Map(
+    localItems.map((item) => [item.id, sanitizeConversationHistoryItem(item)])
+  );
+  const indexedIds = new Set(indexedItems.map((item) => item.id));
+  const merged = indexedItems.map((index) => {
+    const local = localById.get(index.id);
+    return {
+      ...(local ?? {
+        id: index.id,
+        title: index.title,
+        group: index.group,
+        messages: []
+      }),
+      id: index.id,
+      title: index.title,
+      group: index.group,
+      pinned: index.pinned,
+      projectId: index.projectId,
+      activeTurnId: index.activeTurnId,
+      activeTurnStatus: index.activeTurnStatus,
+      acknowledgedTaskKey: index.acknowledgedTaskKey,
+      unseenTaskKey: index.unseenTaskKey
+    };
+  });
+  // The manifest order is the durable recency order.  Local-only drafts still
+  // need to remain visible, but they must not pin every known conversation to
+  // an old localStorage position after the server index refreshes.
+  const localOnly = localItems
+    .filter((item) => !indexedIds.has(item.id))
+    .map(sanitizeConversationHistoryItem);
+  return orderConversationHistory([...merged, ...localOnly]);
+}
+
+function mergeConversationDetail(
+  server: ConversationHistoryItem,
+  local?: ConversationHistoryItem
+): ConversationHistoryItem {
+  if (!local) return server;
+  return sanitizeConversationHistoryItem({
+    ...server,
+    ...local,
+    messages: server.messages,
+    contextSummary: server.contextSummary,
+    contextSummaryMessageCount: server.contextSummaryMessageCount,
+    activities: mergeConversationActivities(server.activities, local.activities),
+    activeActivityIndex: local.activeActivityIndex ?? server.activeActivityIndex
+  });
 }
 
 function conversationArchiveChangeSet(
@@ -11741,7 +13034,12 @@ function lastActivityRecordIndex(records: ActivityRecordMap) {
 
 function buildActivityDisplayItems(events: AgentActivityEvent[]): ActivityDisplayItem[] {
   const displayItems: ActivityDisplayItem[] = [];
-  const normalizedEvents = events.map(normalizeActivityEvent);
+  // The durable turn log intentionally keeps every lifecycle update.  Several
+  // updates share one stable ``id`` (prepare -> run -> verify -> complete), so
+  // replaying the raw list as cards made one execution appear dozens of times
+  // after a reload.  Rebuild the same latest-state projection used by the live
+  // stream before rendering it.
+  const normalizedEvents = coalesceActivityEvents(events).map(normalizeActivityEvent);
   const completedToolKeys = new Set(
     normalizedEvents
       .filter((event) => event.phase === "observation" && event.tool_name)
@@ -11869,12 +13167,6 @@ function shouldHideActivityEvent(event: AgentActivityEvent) {
   if (event.title === "载入上下文" || event.title === "准备处理") return true;
   if (/^第 \d+ 轮模型规划$/.test(event.title) || event.title === "请求模型") return true;
   if (event.title === "准备工具") return true;
-  if (
-    /模型思考$/.test(event.title) &&
-    /(?:✓|最终答复已写入|已确定下一步)/.test(event.content ?? "")
-  ) {
-    return true;
-  }
   if (/^已完成 \d+ 轮$/.test(event.title)) return true;
   return false;
 }
@@ -12110,6 +13402,25 @@ function isModelRequestCommand(event: AgentActivityEvent) {
   return Boolean((event.command ?? "").startsWith("LLM tool planning"));
 }
 
+function isModelThinkingActivity(event: AgentActivityEvent) {
+  return /模型思考(?:失败)?$/.test(event.title || "");
+}
+
+function modelThinkingCompleted(event: AgentActivityEvent) {
+  return /(?:✓|最终答复已写入|已确定下一步)/.test(event.content || "") || event.phase !== "thinking";
+}
+
+function modelThinkingStatusText(event: AgentActivityEvent) {
+  const fallback = event.detail || "模型已完成本轮思考。";
+  const content = event.content || fallback;
+  if (!event.reasoning_content) return content;
+  const withoutLegacyReasoning = content.replace(
+    /\n*--- 模型思考 ---\n[\s\S]*?(?=\n--- (?:下一步(?::[^\n]+)?|下一步工具|回答草稿) ---\n|$)/,
+    ""
+  ).trim();
+  return withoutLegacyReasoning || fallback;
+}
+
 function isReadCommand(event: AgentActivityEvent) {
   const command = commandExecutableName(event.command);
   return ["cat", "sed", "nl", "head", "tail"].includes(command);
@@ -12191,6 +13502,80 @@ function pendingApprovalEvent(record: ActivityRecord) {
   return null;
 }
 
+function coalesceActivityEvents(events: AgentActivityEvent[]) {
+  return events.reduce<AgentActivityEvent[]>(
+    (items, event) => upsertActivityEvent(items, event),
+    []
+  );
+}
+
+function upsertActivityEvent(items: AgentActivityEvent[], event: AgentActivityEvent) {
+  const current = event.id ? items.find((item) => item.id === event.id) : undefined;
+  if (!event.id || !current) {
+    return [...items, event];
+  }
+  const merged = appendActivityDelta(items, {
+    ...event,
+    event: "activity_delta",
+    id: event.id,
+    content: event.content ?? "",
+    append_mode: "replace"
+  });
+  return merged.map((item) =>
+    item.id === event.id
+      ? {
+          ...item,
+          // Browser snapshots keep the first item in place and update it with
+          // the final delta, while later lifecycle snapshots may still follow
+          // it. Do not let an older "running" snapshot downgrade that terminal
+          // state during replay.
+          phase: strongerActivityPhase(current.phase, event.phase),
+          command_status: strongerCommandStatus(current.command_status, event.command_status),
+          execution_status: strongerExecutionStatus(
+            current.execution_status,
+            event.execution_status
+          ),
+          activity_type:
+            current.activity_type === "command" || event.activity_type === "command"
+              ? "command"
+              : item.activity_type
+        }
+      : item
+  );
+}
+
+function strongerActivityPhase(
+  first: AgentActivityEvent["phase"],
+  second: AgentActivityEvent["phase"]
+) {
+  const rank: Record<AgentActivityEvent["phase"], number> = {
+    thinking: 0,
+    action: 1,
+    observation: 2,
+    complete: 3,
+    error: 4
+  };
+  return rank[first] >= rank[second] ? first : second;
+}
+
+function strongerCommandStatus(
+  first: AgentActivityEvent["command_status"],
+  second: AgentActivityEvent["command_status"]
+) {
+  if (!first) return second;
+  if (!second) return first;
+  if (first === "error" || second === "error") return "error";
+  if (second === "running" && first !== "running") return first;
+  return second;
+}
+
+function strongerExecutionStatus(first?: string, second?: string) {
+  const terminal = new Set(["succeeded", "failed", "cancelled", "conflicted"]);
+  if (first && terminal.has(first)) return first;
+  if (second && terminal.has(second)) return second;
+  return second ?? first;
+}
+
 function appendActivityDelta(
   items: AgentActivityEvent[],
   delta: Extract<AgentStreamEvent, { event: "activity_delta" }>
@@ -12205,6 +13590,7 @@ function appendActivityDelta(
         phase: delta.phase,
         title: delta.title,
         content: delta.content,
+        reasoning_content: delta.reasoning_content,
         detail: delta.detail,
         input_summary:
           delta.input_summary ?? (delta.phase === "action" ? delta.detail : undefined),
@@ -12236,7 +13622,19 @@ function appendActivityDelta(
         execution_status: delta.execution_status,
         delivery_status: delta.delivery_status,
         change_set_id: delta.change_set_id,
-        receipt_id: delta.receipt_id
+        receipt_id: delta.receipt_id,
+        context_estimated_tokens: delta.context_estimated_tokens,
+        context_pre_compaction_tokens: delta.context_pre_compaction_tokens,
+        context_post_compaction_tokens: delta.context_post_compaction_tokens,
+        context_trigger_tokens: delta.context_trigger_tokens,
+        context_serialized_bytes: delta.context_serialized_bytes,
+        context_serialized_bytes_trigger: delta.context_serialized_bytes_trigger,
+        context_tool_result_chars: delta.context_tool_result_chars,
+        context_tool_result_chars_trigger: delta.context_tool_result_chars_trigger,
+        context_post_compaction_serialized_bytes: delta.context_post_compaction_serialized_bytes,
+        context_post_compaction_tool_result_chars: delta.context_post_compaction_tool_result_chars,
+        context_pressure_reasons: delta.context_pressure_reasons,
+        context_token_count_source: delta.context_token_count_source
       }
     ];
   }
@@ -12248,8 +13646,14 @@ function appendActivityDelta(
           title: delta.title ?? item.title,
           content:
             delta.append_mode === "replace"
-              ? delta.content
+              ? (delta.content || item.content || "")
               : `${item.content ?? ""}${delta.content}`,
+          // Empty recovery/status snapshots must never erase reasoning that
+          // has already arrived for this stable model-request id.
+          reasoning_content:
+            delta.reasoning_content?.trim()
+              ? delta.reasoning_content
+              : item.reasoning_content,
           detail: delta.detail ?? item.detail,
           input_summary:
             delta.input_summary ??
@@ -12284,7 +13688,26 @@ function appendActivityDelta(
           execution_status: delta.execution_status ?? item.execution_status,
           delivery_status: delta.delivery_status ?? item.delivery_status,
           change_set_id: delta.change_set_id ?? item.change_set_id,
-          receipt_id: delta.receipt_id ?? item.receipt_id
+          receipt_id: delta.receipt_id ?? item.receipt_id,
+          context_estimated_tokens: delta.context_estimated_tokens ?? item.context_estimated_tokens,
+          context_pre_compaction_tokens:
+            delta.context_pre_compaction_tokens ?? item.context_pre_compaction_tokens,
+          context_post_compaction_tokens:
+            delta.context_post_compaction_tokens ?? item.context_post_compaction_tokens,
+          context_trigger_tokens: delta.context_trigger_tokens ?? item.context_trigger_tokens,
+          context_serialized_bytes: delta.context_serialized_bytes ?? item.context_serialized_bytes,
+          context_serialized_bytes_trigger:
+            delta.context_serialized_bytes_trigger ?? item.context_serialized_bytes_trigger,
+          context_tool_result_chars: delta.context_tool_result_chars ?? item.context_tool_result_chars,
+          context_tool_result_chars_trigger:
+            delta.context_tool_result_chars_trigger ?? item.context_tool_result_chars_trigger,
+          context_post_compaction_serialized_bytes:
+            delta.context_post_compaction_serialized_bytes ?? item.context_post_compaction_serialized_bytes,
+          context_post_compaction_tool_result_chars:
+            delta.context_post_compaction_tool_result_chars ?? item.context_post_compaction_tool_result_chars,
+          context_pressure_reasons: delta.context_pressure_reasons ?? item.context_pressure_reasons,
+          context_token_count_source:
+            delta.context_token_count_source ?? item.context_token_count_source
         }
       : item
   );
@@ -12341,11 +13764,26 @@ function browserConversationHistoryItem(item: ConversationHistoryItem): Conversa
 }
 
 function sanitizeConversationHistoryItem(item: ConversationHistoryItem): ConversationHistoryItem {
-  const sanitized = {
+  let sanitized = {
     ...item,
-    messages: item.messages.map(sanitizeChatMessage),
+    // Older builds stringified the private read_file image bridge and stored
+    // its Base64 payload as a fake user message in localStorage. Filter it
+    // before archive merging; otherwise the longer stale browser snapshot
+    // wins over the already-clean server copy and resurrects the bad bubble.
+    messages: sanitizeConversationMessages(item.messages),
     activities: item.activities ? sanitizeActivityRecords(item.activities) : item.activities
   };
+  // A persisted active turn has no live browser run after a reload. Preserve
+  // one actionable interruption/waiting badge, then opening the chat clears
+  // unseenTaskKey permanently. Historical terminal records without this
+  // explicit marker remain quiet.
+  if (
+    !sanitized.unseenTaskKey
+    && sanitized.activeTurnId
+    && (sanitized.activeTurnStatus === "running" || sanitized.activeTurnStatus === "waiting_approval")
+  ) {
+    sanitized = { ...sanitized, unseenTaskKey: `turn:${sanitized.activeTurnId}` };
+  }
   const records = sanitized.activities ?? {};
   const activityIndex = sanitized.activeActivityIndex ?? lastActivityRecordIndex(records);
   const activeRecord = activityIndex === null ? undefined : records[activityIndex];
@@ -12355,13 +13793,60 @@ function sanitizeConversationHistoryItem(item: ConversationHistoryItem): Convers
   return sanitized;
 }
 
+function sanitizeConversationMessages(messages: ChatMessage[]): ChatMessage[] {
+  const sanitized: ChatMessage[] = [];
+  for (const message of messages) {
+    if (isInternalToolImageMessage(message)) continue;
+    const next = sanitizeChatMessage(message);
+    const previous = sanitized[sanitized.length - 1];
+    const legacyDuplicate = Boolean(
+      previous
+      && previous.role === "user"
+      && next.role === "user"
+      && previous.content === next.content
+      && !previous.id?.trim()
+      && !next.id?.trim()
+      && !previous.createdAt
+      && !next.createdAt
+    );
+    if (!legacyDuplicate) sanitized.push(next);
+  }
+  return sanitized;
+}
+
 function sanitizeChatMessage(message: ChatMessage): ChatMessage {
-  if (message.role !== "assistant" || !containsToolCallMarkup(message.content)) return message;
+  const artifacts = Array.isArray(message.artifacts)
+    ? message.artifacts.filter(
+        (item): item is DeliveryArtifact =>
+          Boolean(item)
+          && typeof item.artifact_id === "string"
+          && typeof item.path === "string"
+          && item.path.trim().length > 0
+      )
+    : undefined;
+  const sanitized = artifacts ? { ...message, artifacts } : { ...message, artifacts: undefined };
+  if (message.role !== "assistant" || !containsToolCallMarkup(message.content)) return sanitized;
   const content = stripToolCallMarkup(message.content).trim();
   return {
-    ...message,
+    ...sanitized,
     content: content || "工具调用过程已隐藏。请重新发送上一条请求继续。"
   };
+}
+
+function isInternalToolImageMessage(message: ChatMessage) {
+  if (message.role !== "user") return false;
+  const content = message.content.trim();
+  if (
+    !content.startsWith("[") ||
+    !content.slice(0, 240).includes("以下是刚才用 read_file 载入的图片。")
+  ) {
+    return false;
+  }
+  return (
+    (content.includes("'type': 'image_url'") || content.includes('"type": "image_url"')) &&
+    content.includes("data:image/") &&
+    content.includes(";base64,")
+  );
 }
 
 function sanitizeActivityRecords(records: ActivityRecordMap): ActivityRecordMap {
@@ -12429,6 +13914,26 @@ function isConversationHistoryItem(value: unknown): value is ConversationHistory
       item.activeActivityIndex === null ||
       typeof item.activeActivityIndex === "number") &&
     (item.acknowledgedTaskKey === undefined || typeof item.acknowledgedTaskKey === "string") &&
+    (item.unseenTaskKey === undefined || typeof item.unseenTaskKey === "string") &&
+    (item.pinned === undefined || typeof item.pinned === "boolean") &&
+    (item.projectId === undefined || typeof item.projectId === "string")
+  );
+}
+
+function isConversationHistoryIndexItem(value: unknown): value is ConversationHistoryIndexItem {
+  if (!value || typeof value !== "object") return false;
+  const item = value as ConversationHistoryIndexItem;
+  return (
+    typeof item.id === "string" &&
+    typeof item.title === "string" &&
+    typeof item.group === "string" &&
+    (item.messageCount === undefined || typeof item.messageCount === "number") &&
+    (item.activeTurnId === undefined || typeof item.activeTurnId === "string") &&
+    (item.activeTurnStatus === undefined ||
+      item.activeTurnStatus === "running" ||
+      item.activeTurnStatus === "waiting_approval") &&
+    (item.acknowledgedTaskKey === undefined || typeof item.acknowledgedTaskKey === "string") &&
+    (item.unseenTaskKey === undefined || typeof item.unseenTaskKey === "string") &&
     (item.pinned === undefined || typeof item.pinned === "boolean") &&
     (item.projectId === undefined || typeof item.projectId === "string")
   );
@@ -12466,13 +13971,11 @@ function isAgentActivityEvent(value: unknown): value is AgentActivityEvent {
     (event.id === undefined || typeof event.id === "string") &&
     (event.detail === undefined || typeof event.detail === "string") &&
     (event.content === undefined || typeof event.content === "string") &&
-    (event.activity_type === undefined ||
-      event.activity_type === "command" ||
-      event.activity_type === "file_edit" ||
-      event.activity_type === "work_note" ||
-      event.activity_type === "runtime_summary" ||
-      event.activity_type === "plan" ||
-      event.activity_type === "approval_review") &&
+    (event.reasoning_content === undefined || typeof event.reasoning_content === "string") &&
+    // The backend may add new activity metadata without changing the archived
+    // conversation schema. Unknown string values render through the generic
+    // activity row; rejecting the whole item here made valid chats disappear.
+    (event.activity_type === undefined || typeof event.activity_type === "string") &&
     (event.plan === undefined ||
       (Array.isArray(event.plan) && event.plan.every((item) =>
         item && typeof item.step === "string" &&
@@ -12526,7 +14029,8 @@ function updateConversationMessages(
   contextSummary = "",
   contextSummaryMessageCount = 0,
   projectId?: string,
-  runState?: ConversationRunState
+  runState?: ConversationRunState,
+  taskSeen = false
 ) {
   const current = items.find((item) => item.id === id);
   if (!current) {
@@ -12540,7 +14044,7 @@ function updateConversationMessages(
       activities,
       activeActivityIndex,
       projectId
-    }, runState));
+    }, runState, taskSeen));
   }
   return upsertConversation(items, applyConversationRunState({
     ...current,
@@ -12549,21 +14053,32 @@ function updateConversationMessages(
     contextSummaryMessageCount,
     activities,
     activeActivityIndex
-  }, runState));
+  }, runState, taskSeen));
 }
 
 function applyConversationRunState(
   item: ConversationHistoryItem,
-  runState: ConversationRunState | undefined
+  runState: ConversationRunState | undefined,
+  taskSeen = false
 ): ConversationHistoryItem {
   if (runState === undefined) return item;
   if (runState === null) {
-    return { ...item, activeTurnId: undefined, activeTurnStatus: undefined };
+    const taskKey = conversationTaskKey(item);
+    return {
+      ...item,
+      activeTurnId: undefined,
+      activeTurnStatus: undefined,
+      acknowledgedTaskKey: taskSeen && taskKey ? taskKey : item.acknowledgedTaskKey,
+      unseenTaskKey: !taskSeen && taskKey ? taskKey : undefined
+    };
   }
   return {
     ...item,
     activeTurnId: runState.turnId,
-    activeTurnStatus: runState.status
+    activeTurnStatus: runState.status,
+    // A new run supersedes the previous result badge. While it is genuinely
+    // active the sidebar uses the in-memory run handle for its spinner.
+    unseenTaskKey: undefined
   };
 }
 
@@ -12685,6 +14200,21 @@ function formatMessageWithAttachments(content: string, items: AttachmentItem[]) 
   return `${body}\n\n参考附件：\n${attachmentLines.join("\n")}`;
 }
 
+function formatReminderCard(item: FridayNotification): string {
+  return `【提醒卡片】\n标题：${item.title}\n内容：${item.body}\n【提醒卡片结束】\n\n请基于这条提醒继续处理，并给出结果。`;
+}
+
+function parseReminderCard(content: string): { title: string; body: string; extra: string } | null {
+  const match = content.match(/^【提醒卡片】\s*\n标题：([^\n]*)\n内容：([\s\S]*?)\n【提醒卡片结束】([\s\S]*)$/);
+  if (match) {
+    const remainder = match[3].replace(/^\s*\n?请基于这条提醒继续处理，并给出结果。\s*/, "").trim();
+    return { title: match[1].trim(), body: match[2].trim(), extra: remainder };
+  }
+  // Read cards saved by the previous format without swallowing unrelated text.
+  const legacy = content.match(/^【提醒卡片】\s*\n标题：([^\n]*)\n内容：([\s\S]*?)\n\n请基于这条提醒继续处理，并给出结果。([\s\S]*)$/);
+  return legacy ? { title: legacy[1].trim(), body: legacy[2].trim(), extra: legacy[3].trim() } : null;
+}
+
 function collectConversationFileReferences(
   messages: ChatMessage[],
   attachments: AttachmentItem[],
@@ -12737,7 +14267,7 @@ function collectConversationFileReferences(
 
 function extractLocalFileReferences(text: string) {
   const pattern =
-    /(?:file:\/\/)?(?:\/[^\s`'"<>|]*\/)?(?:meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|产出材料|分析材料|学习笔记)\/[^\s`'"<>|\\\u0000-\u001f]+/giu;
+    /(?:file:\/\/)?(?:\/[^\s`'"<>|]*\/)?(?:meet_files|meeting_audio_minutes|work_agent_skills|web_frontend|work_agent_core|config|schemas|tmp|work_reports|产出材料|分析材料|学习笔记)\/[^\s`'"<>|\\\u0000-\u001f]+/giu;
   return Array.from(text.matchAll(pattern), (match) => match[0]);
 }
 
@@ -12768,6 +14298,10 @@ const ATTACHMENT_KIND_BY_LABEL: Record<string, AttachmentItem["kind"]> = {
 
 function fileRawUrl(path: string) {
   return `/api/file/raw?path=${encodeURIComponent(path)}`;
+}
+
+function fileDownloadUrl(path: string) {
+  return `/api/file/download?path=${encodeURIComponent(path)}`;
 }
 
 export type ParsedAttachmentReference = {
@@ -12833,6 +14367,7 @@ function activityPhaseLabel(phase: AgentActivityEvent["phase"]) {
 
 
 function formatStreamErrorDetail(event: Extract<AgentStreamEvent, { event: "error" }>) {
+  if (isModelLoopStoppedError(event)) return "";
   const lines: string[] = [];
   if (event.type) lines.push(`错误类型：${event.type}`);
   if (event.detail && event.detail !== event.message) lines.push(`原始错误：${event.detail}`);
@@ -12844,6 +14379,9 @@ function formatStreamErrorDetail(event: Extract<AgentStreamEvent, { event: "erro
 }
 
 function streamErrorMessage(event: Extract<AgentStreamEvent, { event: "error" }>) {
+  if (isModelLoopStoppedError(event)) {
+    return MODEL_LOOP_STOPPED_ASSISTANT_MESSAGE;
+  }
   const rawText = `${event.message} ${event.detail ?? ""}`.toLowerCase();
   if (rawText.includes("http 402") || rawText.includes("insufficient balance")) {
     return "模型服务余额不足，本轮已停止。充值或切换到可用模型后重试。";
@@ -12856,9 +14394,14 @@ function mergeStreamErrorActivity(
   event: Extract<AgentStreamEvent, { event: "error" }>,
   errorMessage: string
 ) {
+  const loopStopped = isModelLoopStoppedError(event);
   let errorIndex = -1;
   for (let index = items.length - 1; index >= 0; index -= 1) {
-    if (items[index].phase === "error" || items[index].command_status === "error") {
+    if (
+      (loopStopped && isModelLoopStoppedActivity(items[index])) ||
+      items[index].phase === "error" ||
+      items[index].command_status === "error"
+    ) {
       errorIndex = index;
       break;
     }
@@ -12871,15 +14414,28 @@ function mergeStreamErrorActivity(
       {
         event: "activity" as const,
         phase: "error" as const,
-        title: "处理失败",
+        title: loopStopped ? "模型陷入循环重复，已停止" : "处理失败",
         detail: errorMessage,
-        content: errorDetail
+        content: errorDetail,
+        activity_type: loopStopped ? "model_loop_stopped" : undefined
       }
     ];
   }
 
   return items.map((item, index) => {
     if (index !== errorIndex) return item;
+    if (loopStopped) {
+      return {
+        ...item,
+        phase: "error" as const,
+        title: item.step
+          ? `第 ${item.step} 轮 · 模型陷入循环重复，已停止`
+          : "模型陷入循环重复，已停止",
+        detail: errorMessage,
+        content: "",
+        activity_type: "model_loop_stopped"
+      };
+    }
     const existingContent = (item.content ?? "").trimEnd();
     const content =
       errorDetail && !existingContent.includes(errorDetail)

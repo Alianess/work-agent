@@ -224,11 +224,16 @@ def compact_messages_for_archive(
                     content += "\n关键引用：" + "；".join(refs)
                 compacted.append({**message, "content": content})
             else:
-                compacted.append(dict(message))
+                clean = dict(message)
+                if role == "assistant":
+                    clean.pop("reasoning_content", None)
+                    clean.pop("reasoning", None)
+                compacted.append(clean)
             continue
 
         clean = dict(message)
         clean.pop("reasoning_content", None)
+        clean.pop("reasoning", None)
         clean["tool_calls"] = [
             compact_tool_call(call) for call in message.get("tool_calls") or []
             if isinstance(call, dict)

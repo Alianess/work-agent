@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
+import ipaddress
 import json
 import socket
 import threading
@@ -77,19 +78,74 @@ def is_deepseek_profile(profile: ModelProfile) -> bool:
     return endpoint_host(profile) in DEEPSEEK_OFFICIAL_HOSTS
 
 
-def should_prefer_direct_connection(profile: ModelProfile) -> bool:
-    """Identify the official DeepSeek endpoint for proxy-independent access.
+def is_local_or_private_endpoint(profile: ModelProfile) -> bool:
+    """Return whether the endpoint is reached over a local/private network."""
 
-    Official DeepSeek API requests must not be handed to HTTP_PROXY or
-    HTTPS_PROXY.  Model selection is a user decision and is not a substitute
-    for a stable route to this endpoint.
+    host = endpoint_host(profile).rstrip(".")
+    if host == "localhost" or host.endswith((".localhost", ".local", ".ts.net")):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    tailscale_cgnat = ipaddress.ip_network("100.64.0.0/10")
+    return bool(
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address in tailscale_cgnat
+    )
+
+
+def should_prefer_direct_connection(profile: ModelProfile) -> bool:
+    """Identify endpoints that must never be sent through the process proxy.
+
+    Official DeepSeek and local/private endpoints need a stable direct route.
+    Tailscale IPv4 addresses live in 100.64.0.0/10: handing them to a desktop
+    HTTP proxy produces a proxy-generated blank HTTP 503 even when the peer is
+    reachable directly.
     """
-    return is_deepseek_profile(profile)
+
+    return is_deepseek_profile(profile) or is_local_or_private_endpoint(profile)
+
+
+def recovery_request_timeout_seconds(profile: ModelProfile) -> int:
+    """Give a local model enough time to prefill the same context again.
+
+    A cloud recovery is deliberately short. A local/private model can spend
+    longer than that merely rebuilding a large prompt KV cache, so a fixed
+    60-second recovery turns a recoverable transport interruption into a
+    guaranteed second timeout.
+    """
+
+    if is_local_or_private_endpoint(profile):
+        return max(10, stream_start_timeout_seconds(profile))
+    return max(10, min(RECOVERY_REQUEST_TIMEOUT_SECONDS, profile.timeout_seconds))
+
+
+def stream_start_timeout_seconds(profile: ModelProfile) -> int:
+    """Return the budget for connect, queueing, and prompt prefill.
+
+    ``stream_idle_timeout_seconds`` used to be passed directly to urllib,
+    accidentally shortening a larger request timeout. Treat an explicit value
+    only as an extension: it must never reduce the model's start budget.
+    """
+
+    configured = int(getattr(profile, "stream_idle_timeout_seconds", 0) or 0)
+    return max(1, profile.timeout_seconds, configured)
 
 
 def is_dots_profile(profile: ModelProfile) -> bool:
     identity = " ".join([profile.name, profile.provider, profile.model]).lower()
     return "dots" in identity or "askdiandian" in profile.base_url.lower()
+
+
+def is_lmstudio_qwen38_profile(profile: ModelProfile) -> bool:
+    """Qwen3.8 sampling and thinking controls served through LM Studio."""
+
+    provider = profile.provider.strip().lower().replace("_", "-")
+    model = profile.model.strip().lower().replace("_", "-")
+    return provider == "lm-studio" and "qwen3.8" in model
 
 
 SENSENOVA_HOSTS = frozenset({"token.sensenova.cn"})
@@ -99,12 +155,28 @@ def is_sensenova_profile(profile: ModelProfile) -> bool:
     return endpoint_host(profile) in SENSENOVA_HOSTS
 
 
+def is_minimax_m3_profile(profile: ModelProfile) -> bool:
+    """MiniMax M3 uses ``thinking`` plus ``reasoning_split`` controls."""
+
+    return profile.model.strip().lower() in {"minimax-m3", "minimaxai/minimax-m3"}
+
+
+def is_glm_thinking_profile(profile: ModelProfile) -> bool:
+    """GLM reasoning models that accept the ``thinking.type`` control."""
+
+    model = profile.model.strip().lower().split("/")[-1]
+    return model.startswith(("glm-4.5", "glm-4.6", "glm-4.7", "glm-5"))
+
+
 def supports_reasoning_effort(profile: ModelProfile) -> bool:
     identity = " ".join([profile.name, profile.provider, profile.model]).lower()
     return (
         is_deepseek_profile(profile)
+        or is_lmstudio_qwen38_profile(profile)
         or is_dots_profile(profile)
         or is_sensenova_profile(profile)
+        or is_minimax_m3_profile(profile)
+        or is_glm_thinking_profile(profile)
         or any(marker in identity for marker in ("gpt-5", "o3", "o4"))
     )
 
@@ -116,6 +188,49 @@ def apply_reasoning_controls(
     reasoning_effort: str | None,
 ) -> dict[str, Any]:
     """Map the UI's four generic levels to provider-specific API controls."""
+    # MiniMax M3 supports thinking independently of the generic
+    # ``reasoning_effort`` field. Always request split reasoning so the model's
+    # internal trace is returned in ``reasoning_details`` rather than mixed
+    # into the visible answer (unless the caller explicitly asks for light).
+    if is_minimax_m3_profile(profile):
+        effort = normalize_reasoning_effort(reasoning_effort or "medium")
+        payload["reasoning_split"] = True
+        payload["thinking"] = {"type": "disabled" if effort == "light" else "adaptive"}
+        return payload
+    if is_lmstudio_qwen38_profile(profile):
+        prepared_messages = payload.get("messages")
+        preserve_thinking = qwen_history_has_reasoning(
+            prepared_messages if isinstance(prepared_messages, list) else []
+        )
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": True,
+            # Qwen3.8 requires earlier assistant reasoning to be replayed when
+            # preservation is enabled.  Old Work Agent sessions retained only
+            # the visible answer, so keep those conversations usable instead
+            # of asking LM Studio to preserve history that is no longer there.
+            "preserve_thinking": preserve_thinking,
+        }
+        if reasoning_effort is None:
+            return payload
+        effort = normalize_reasoning_effort(reasoning_effort)
+        payload.update(
+            {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 0.0,
+                # LM Studio names Qwen's repetition_penalty field repeat_penalty.
+                "repeat_penalty": 1.0,
+            }
+        )
+        payload["reasoning_effort"] = {
+            "light": "low",
+            "medium": "low",
+            "high": "medium",
+            "very_high": "xhigh",
+        }[effort]
+        return payload
     if reasoning_effort is None or not supports_reasoning_effort(profile):
         return payload
     effort = normalize_reasoning_effort(reasoning_effort)
@@ -140,12 +255,57 @@ def apply_reasoning_controls(
         # Dots 只有开/关两档（该模型固定 max 思考档），没有 reasoning_effort。
         payload["chat_template_kwargs"] = {"enable_thinking": effort != "light"}
         return payload
+    if is_glm_thinking_profile(profile):
+        # GLM-5 is thinking-only on current providers (including routes whose
+        # configured model name is still ``glm-5.2`` but whose upstream has
+        # advanced to GLM-5.3).  Sending ``disabled`` is rejected with HTTP
+        # 400, so its compaction safety must come from the larger output budget
+        # rather than pretending that the model supports no-thinking mode.
+        model = profile.model.strip().lower().split("/")[-1]
+        payload["thinking"] = {
+            "type": "enabled" if model.startswith("glm-5") or effort != "light" else "disabled"
+        }
+        return payload
     payload["reasoning_effort"] = {
         "light": "low",
         "medium": "medium",
         "high": "high",
         "very_high": "max",
     }[effort]
+    return payload
+
+
+def build_chat_tools_payload(
+    messages: list[Message],
+    *,
+    profile: ModelProfile,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    reasoning_effort: str | None = None,
+    request_usage: bool = True,
+) -> dict[str, Any]:
+    """Build the exact JSON body used by ``chat_tools_stream``.
+
+    Diagnostics and production share this function so a context-analysis
+    script cannot drift away from what the frontend really sends. Authentication
+    headers are deliberately not part of the returned body.
+    """
+
+    payload: dict[str, Any] = {
+        "model": profile.model,
+        "messages": prepare_messages_for_profile(messages, profile),
+        "temperature": profile.temperature if temperature is None else temperature,
+        "max_tokens": profile.max_tokens if max_tokens is None else max_tokens,
+        "stream": True,
+    }
+    if request_usage:
+        payload["stream_options"] = {"include_usage": True}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice or "auto"
+    apply_reasoning_controls(payload, profile=profile, reasoning_effort=reasoning_effort)
     return payload
 
 
@@ -224,10 +384,10 @@ class OpenAICompatibleClient:
     ) -> Any:
         """Open one request without changing the selected model or route.
 
-        The official DeepSeek endpoint always uses the no-proxy opener.  It
-        never tries the process proxy first and never falls back to it after a
-        direct failure.  This also avoids reusing a Request that urllib has
-        mutated with proxy/tunnel state.
+        Endpoints selected by ``should_prefer_direct_connection`` always use
+        the no-proxy opener. They never try the process proxy first and never
+        fall back to it after a direct failure. This also avoids reusing a
+        Request that urllib has mutated with proxy/tunnel state.
         """
         if should_prefer_direct_connection(profile):
             return self._direct_opener.open(request, timeout=timeout)
@@ -371,22 +531,20 @@ class OpenAICompatibleClient:
         on_delta: Any | None = None,
         reasoning_effort: str | None = None,
         cancel_event: threading.Event | None = None,
+        on_heartbeat: Callable[[], None] | None = None,
         _allow_recovery: bool = True,
         _request_usage: bool = True,
     ) -> LLMResponse:
-        payload: dict[str, Any] = {
-            "model": profile.model,
-            "messages": prepare_messages_for_profile(messages, profile),
-            "temperature": profile.temperature if temperature is None else temperature,
-            "max_tokens": profile.max_tokens if max_tokens is None else max_tokens,
-            "stream": True,
-        }
-        if _request_usage:
-            payload["stream_options"] = {"include_usage": True}
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = tool_choice or "auto"
-        apply_reasoning_controls(payload, profile=profile, reasoning_effort=reasoning_effort)
+        payload = build_chat_tools_payload(
+            messages,
+            profile=profile,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            reasoning_effort=reasoning_effort,
+            request_usage=_request_usage,
+        )
 
         endpoint = chat_completions_endpoint(profile.base_url)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -402,14 +560,20 @@ class OpenAICompatibleClient:
         tool_calls: dict[int, dict[str, Any]] = {}
         finish_reason = None
         usage: dict[str, Any] = {}
-        stream_error: RuntimeError | None = None
-        idle_timeout_seconds = min(
-            profile.timeout_seconds,
-            int(getattr(profile, "stream_idle_timeout_seconds", 0) or STREAM_IDLE_TIMEOUT_SECONDS),
-        )
+        stream_error: BaseException | None = None
+        # urllib applies this value while waiting for response headers / the
+        # first body byte as well as between later reads. Before the first SSE
+        # line, a local model is still doing prompt prefill, not an idle stream.
+        # The ReAct watchdog enforces the shorter raw-SSE idle lease after data
+        # starts arriving, so the transport must retain the full start budget.
+        request_timeout_seconds = stream_start_timeout_seconds(profile)
         response_finished = threading.Event()
         try:
-            with self._open_request(request, profile=profile, timeout=idle_timeout_seconds) as response:
+            with self._open_request(
+                request,
+                profile=profile,
+                timeout=request_timeout_seconds,
+            ) as response:
                 def close_response_when_cancelled() -> None:
                     if cancel_event is None:
                         return
@@ -433,6 +597,8 @@ class OpenAICompatibleClient:
                 for raw_line in response:
                     if cancel_event is not None and cancel_event.is_set():
                         raise RuntimeError("模型流请求已取消。")
+                    if on_heartbeat is not None:
+                        on_heartbeat()
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line or not line.startswith("data:"):
                         continue
@@ -536,10 +702,10 @@ class OpenAICompatibleClient:
         except (TimeoutError, socket.timeout) as error:
             stream_error = RuntimeError(
                 llm_timeout_message(
-                    action="stream idle",
+                    action="stream request",
                     profile=profile,
                     endpoint=endpoint,
-                    timeout_seconds=idle_timeout_seconds,
+                    timeout_seconds=request_timeout_seconds,
                 )
             )
         except OSError as error:
@@ -548,12 +714,17 @@ class OpenAICompatibleClient:
             if "timed out" in str(error).lower():
                 stream_error = RuntimeError(
                     llm_timeout_message(
-                        action="stream idle",
+                        action="stream request",
                         profile=profile,
                         endpoint=endpoint,
-                        timeout_seconds=idle_timeout_seconds,
+                        timeout_seconds=request_timeout_seconds,
                     )
                 )
+            elif is_transport_failure(error):
+                # ``http.client.RemoteDisconnected`` is both an OSError and a
+                # ConnectionError.  Let it enter the same-endpoint recovery
+                # path instead of escaping before the retry policy can see it.
+                stream_error = error
             else:
                 raise
         finally:
@@ -577,6 +748,7 @@ class OpenAICompatibleClient:
                 cause=stream_error,
                 on_delta=on_delta,
                 cancel_event=cancel_event,
+                on_heartbeat=on_heartbeat,
                 primary_finish_reason=finish_reason,
                 primary_usage=usage,
                 request_usage=_request_usage,
@@ -591,9 +763,9 @@ class OpenAICompatibleClient:
             "role": "assistant",
             "content": "".join(content_parts),
         }
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
         if valid_tool_calls:
-            if reasoning_parts:
-                message["reasoning_content"] = "".join(reasoning_parts)
             message["tool_calls"] = valid_tool_calls
         raw = {
             "choices": [
@@ -625,6 +797,7 @@ class OpenAICompatibleClient:
                 cause=None,
                 on_delta=on_delta,
                 cancel_event=cancel_event,
+                on_heartbeat=on_heartbeat,
                 primary_finish_reason=finish_reason,
                 primary_usage=usage,
                 request_usage=_request_usage,
@@ -646,6 +819,7 @@ class OpenAICompatibleClient:
         cause: Exception | None,
         on_delta: Any | None,
         cancel_event: threading.Event | None,
+        on_heartbeat: Callable[[], None] | None = None,
         primary_finish_reason: str | None = None,
         primary_usage: dict[str, Any] | None = None,
         request_usage: bool = True,
@@ -656,10 +830,7 @@ class OpenAICompatibleClient:
         # reasoning, subtracting the whole primary-stream duration from that
         # timeout incorrectly makes recovery impossible. Recovery is a separate,
         # bounded phase with its own request budget.
-        recovery_timeout = max(
-            10,
-            min(RECOVERY_REQUEST_TIMEOUT_SECONDS, profile.timeout_seconds),
-        )
+        recovery_timeout = recovery_request_timeout_seconds(profile)
         recovery_profile = replace(profile, timeout_seconds=recovery_timeout)
         recovery_effort = reduced_recovery_reasoning_effort(reasoning_effort)
         if cancel_event is not None and cancel_event.is_set():
@@ -739,6 +910,7 @@ class OpenAICompatibleClient:
                     reasoning_effort=recovery_effort,
                     on_delta=forward_recovery_delta,
                     cancel_event=cancel_event,
+                    on_heartbeat=on_heartbeat,
                     _allow_recovery=False,
                     _request_usage=request_usage,
                 )
@@ -920,6 +1092,7 @@ def extract_reasoning_delta(delta: dict[str, Any], choice: dict[str, Any]) -> st
             "reasoning_content",
             "reasoning",
             "reasoning_summary",
+            "reasoning_details",
             "thinking",
             "thought",
         ):
@@ -985,8 +1158,10 @@ def prepare_messages_for_profile(
     messages: list[Message],
     profile: ModelProfile,
 ) -> list[Message]:
-    """Repair legacy DeepSeek tool-call history for thinking-mode replay."""
-    if not profile_requires_reasoning_content(profile):
+    """Prepare provider-specific assistant history without mutating storage."""
+    needs_deepseek_repair = profile_requires_reasoning_content(profile)
+    needs_qwen_reasoning_alias = is_lmstudio_qwen38_profile(profile)
+    if not needs_deepseek_repair and not needs_qwen_reasoning_alias:
         return messages
 
     prepared: list[Message] = []
@@ -996,6 +1171,8 @@ def prepare_messages_for_profile(
             continue
         clean = dict(message)
         if (
+            needs_deepseek_repair
+            and
             clean.get("role") == "assistant"
             and clean.get("tool_calls")
             and not str(clean.get("reasoning_content") or "").strip()
@@ -1003,8 +1180,28 @@ def prepare_messages_for_profile(
             clean["reasoning_content"] = (
                 "Tool-call reasoning was not retained by an earlier client version."
             )
+        if needs_qwen_reasoning_alias and clean.get("role") == "assistant":
+            reasoning = str(
+                clean.get("reasoning_content") or clean.get("reasoning") or ""
+            )
+            if reasoning:
+                # Qwen's official multi-turn example sends both aliases.  Keep
+                # one canonical field on disk and add the compatibility alias
+                # only to the provider request.
+                clean["reasoning_content"] = reasoning
+                clean["reasoning"] = reasoning
         prepared.append(clean)
     return prepared
+
+
+def qwen_history_has_reasoning(messages: list[Message]) -> bool:
+    """Whether every historical assistant answer can preserve its thinking."""
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if not str(message.get("reasoning_content") or message.get("reasoning") or "").strip():
+            return False
+    return True
 
 
 def profile_requires_reasoning_content(profile: ModelProfile) -> bool:

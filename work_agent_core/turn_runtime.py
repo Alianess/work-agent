@@ -60,6 +60,15 @@ class TurnRuntime:
     def drain_messages(self) -> list[str]:
         return self.store.drain_messages(self.turn.id)
 
+    def drain_message_events(self) -> list[dict[str, Any]]:
+        return self.store.drain_message_events(self.turn.id)
+
+    def peek_message_events(self) -> list[dict[str, Any]]:
+        return self.store.peek_message_events(self.turn.id)
+
+    def ack_message_events(self, event_ids: list[str]) -> int:
+        return self.store.ack_message_events(self.turn.id, event_ids)
+
     def raise_if_cancelled(self) -> None:
         if self.cancelled():
             raise TurnCancelled("用户停止了当前轮。")

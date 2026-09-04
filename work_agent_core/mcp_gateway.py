@@ -17,10 +17,7 @@ class MCPGateway:
     def as_tool(self) -> Tool:
         return Tool(
             name="mcporter",
-            description=(
-                "外部 MCP 能力分层入口。用 list 查看已连接服务和工具名，show 按需读取单个工具参数，"
-                "call 调用该工具。外部 MCP 工具不会直接铺在顶层 tools。"
-            ),
+            description="MCP gateway: list tools, show one schema, or call a tool.",
             parameters={
                 "type": "object",
                 "properties": {

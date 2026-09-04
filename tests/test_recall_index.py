@@ -198,6 +198,14 @@ class ExpandTests(unittest.TestCase):
     def test_an_unknown_node_fails_loudly(self) -> None:
         self.assertFalse(expand(self.index, "doc:nope#0000")["ok"])
 
+    def test_a_malformed_hash_recovers_to_the_known_source_root(self) -> None:
+        opened = expand(self.index, "doc:报市稿#transposed-hash", max_tokens=100_000)
+
+        self.assertTrue(opened["ok"])
+        self.assertEqual(opened["title"], "报市稿")
+        self.assertEqual(opened["recovered_from"], "doc:报市稿#transposed-hash")
+        self.assertIn("已按同一来源恢复", opened["note"])
+
     def test_an_oversized_expansion_degrades_to_an_outline(self) -> None:
         index = fresh_index()
         big = "# 大文件\n\n" + "\n\n".join(

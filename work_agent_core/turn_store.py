@@ -32,8 +32,8 @@ class AgentTurn:
     final_message: str = ""
     error: str = ""
     cancel_requested: bool = False
-    queued_messages: list[str] = field(default_factory=list)
-    """What the user said while this turn was already running."""
+    queued_messages: list[dict[str, Any]] = field(default_factory=list)
+    """Structured inbox events received while this turn is running."""
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -54,7 +54,7 @@ class AgentTurn:
             "final_message": self.final_message,
             "error": self.error,
             "cancel_requested": self.cancel_requested,
-            "queued_messages": [str(item) for item in self.queued_messages],
+            "queued_messages": [sanitize_json_value(item) for item in self.queued_messages],
             "metadata": sanitize_json_value(self.metadata),
         }
 
@@ -77,9 +77,9 @@ class AgentTurn:
             error=str(payload.get("error") or ""),
             cancel_requested=bool(payload.get("cancel_requested")),
             queued_messages=[
-                str(item)
+                normalize_queued_message(item)
                 for item in (payload.get("queued_messages") or [])
-                if str(item or "").strip()
+                if normalize_queued_message(item)
             ],
             metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
         )
@@ -278,6 +278,36 @@ class TurnStore:
         del conversation_id, keep_recent
         return 0
 
+    def fail_interrupted_running_all(self, reason: str | None = None) -> int:
+        """Retire running turns across every conversation.
+
+        Called once at service startup: a restart can kill requests mid-run,
+        and those records say ``running`` forever on disk. The chat route only
+        reconciles per conversation when the *next* message arrives, so without
+        this sweep the UI stays hung on a stream nobody will ever continue.
+        """
+
+        message = reason or "服务重启中断，已标记失败，可安全重新继续。"
+        retired = 0
+        with _TURN_LOCK:
+            if not self.turn_dir.is_dir():
+                return 0
+            for path in self.turn_dir.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                turn = AgentTurn.from_payload(payload, fallback_id=path.stem)
+                if turn.status != "running":
+                    continue
+                turn.status = "failed"
+                turn.error = message
+                self._write(turn)
+                retired += 1
+        return retired
+
     def fail_interrupted_running_for_conversation(
         self,
         conversation_id: str,
@@ -339,7 +369,15 @@ class TurnStore:
             turn = self.load(turn_id)
             if not text or turn.status in TERMINAL_STATUSES:
                 return turn
-            turn.queued_messages.append(text)
+            turn.queued_messages.append(
+                {
+                    "event_id": f"external-{uuid.uuid4().hex}",
+                    "kind": "user_followup",
+                    "payload": {"content": text},
+                    "source": "chat",
+                    "queued_at": int(time.time() * 1000),
+                }
+            )
             turn.updated_at = int(time.time())
             self._write(turn)
             return turn
@@ -347,15 +385,49 @@ class TurnStore:
     def drain_messages(self, turn_id: str) -> list[str]:
         """Take everything queued so far. Draining twice must not repeat them."""
 
+        return [
+            str((item.get("payload") or {}).get("content") or "").strip()
+            for item in self.drain_message_events(turn_id)
+            if str((item.get("payload") or {}).get("content") or "").strip()
+        ]
+
+    def drain_message_events(self, turn_id: str) -> list[dict[str, Any]]:
+        """Atomically take structured inbox events for event-log ingestion."""
+
+        queued = self.peek_message_events(turn_id)
+        self.ack_message_events(
+            turn_id,
+            [str(item.get("event_id") or "") for item in queued],
+        )
+        return queued
+
+    def peek_message_events(self, turn_id: str) -> list[dict[str, Any]]:
+        """Read the inbox without acknowledging it."""
+
         with _TURN_LOCK:
             turn = self.load(turn_id)
-            queued = list(turn.queued_messages)
-            if not queued:
-                return []
-            turn.queued_messages = []
+            return [dict(item) for item in turn.queued_messages]
+
+    def ack_message_events(self, turn_id: str, event_ids: list[str]) -> int:
+        """Remove only events that have reached the conversation log."""
+
+        acknowledged = {str(item) for item in event_ids if str(item)}
+        if not acknowledged:
+            return 0
+        with _TURN_LOCK:
+            turn = self.load(turn_id)
+            before = len(turn.queued_messages)
+            turn.queued_messages = [
+                item
+                for item in turn.queued_messages
+                if str(item.get("event_id") or "") not in acknowledged
+            ]
+            removed = before - len(turn.queued_messages)
+            if not removed:
+                return 0
             turn.updated_at = int(time.time())
             self._write(turn)
-            return queued
+            return removed
 
     def mark_cancelled(self, turn_id: str, *, reason: str = "用户停止了当前轮。") -> AgentTurn:
         with _TURN_LOCK:
@@ -466,6 +538,35 @@ def sanitize_turn_event(raw_event: Any) -> dict[str, Any]:
     if not isinstance(raw_event, dict):
         return {}
     return sanitize_json_value(raw_event)
+
+
+def normalize_queued_message(raw_item: Any) -> dict[str, Any]:
+    """Accept legacy strings and the current structured inbox schema."""
+
+    if isinstance(raw_item, str):
+        content = raw_item.strip()
+        if not content:
+            return {}
+        return {
+            "event_id": f"legacy-{uuid.uuid4().hex}",
+            "kind": "user_followup",
+            "payload": {"content": content},
+            "source": "chat",
+            "queued_at": 0,
+        }
+    if not isinstance(raw_item, dict):
+        return {}
+    payload = raw_item.get("payload") if isinstance(raw_item.get("payload"), dict) else {}
+    content = str(payload.get("content") or raw_item.get("content") or "").strip()
+    if not content:
+        return {}
+    return {
+        "event_id": str(raw_item.get("event_id") or f"external-{uuid.uuid4().hex}"),
+        "kind": str(raw_item.get("kind") or "user_followup"),
+        "payload": {**payload, "content": content},
+        "source": str(raw_item.get("source") or "chat"),
+        "queued_at": max(0, int(raw_item.get("queued_at") or 0)),
+    }
 
 
 def compact_turn_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

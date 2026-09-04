@@ -33,3 +33,33 @@ class ChatTitlePayloadTests(unittest.TestCase):
             payload = web_server.generate_chat_title_payload({"messages": self.messages})
 
         self.assertNotEqual(payload["title"], web_server.PENDING_CONVERSATION_TITLE)
+
+    def test_audio_fallback_prefers_explicit_meeting_subject_over_wrong_filename(self) -> None:
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "合肥市包河区教体局。先与蔡主任洽谈。\n\n参考附件：\n"
+                    "- [音频] 包河区农林水务局 2.m4a: "
+                    "meet_files/attachments/包河区农林水务局 2.m4a"
+                ),
+            },
+            {"role": "assistant", "content": "开始整理三段录音。"},
+        ]
+        self.assertEqual(
+            web_server.fallback_conversation_title_from_messages(messages),
+            "合肥市包河区教体局洽谈纪要",
+        )
+
+    def test_numbered_robot_tasks_get_semantic_fallback_title(self) -> None:
+        messages = [
+            {
+                "role": "user",
+                "content": "1.明确分年度目标。2.编制安徽机器人产业细分赛道路径。两份工作。",
+            },
+            {"role": "assistant", "content": "开始编制。"},
+        ]
+        self.assertEqual(
+            web_server.fallback_conversation_title_from_messages(messages),
+            "安徽机器人产业细分赛道两项工作",
+        )

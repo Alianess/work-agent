@@ -7,7 +7,10 @@ from unittest.mock import Mock, patch
 from work_agent_core.config import ModelProfile
 from work_agent_core.llm import (
     OpenAICompatibleClient,
+    is_local_or_private_endpoint,
+    recovery_request_timeout_seconds,
     should_prefer_direct_connection,
+    stream_start_timeout_seconds,
 )
 
 
@@ -25,7 +28,7 @@ class LLMProxyRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.request = urllib.request.Request("https://api.deepseek.com/chat/completions")
 
-    def test_only_official_deepseek_endpoint_prefers_direct_connection(self) -> None:
+    def test_official_deepseek_and_private_endpoints_prefer_direct_connection(self) -> None:
         self.assertTrue(
             should_prefer_direct_connection(
                 profile(
@@ -44,6 +47,58 @@ class LLMProxyRoutingTests(unittest.TestCase):
                 )
             )
         )
+        for base_url in (
+            "http://100.86.69.1:1234/v1",
+            "http://192.168.1.20:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://desktop.tailnet.ts.net:1234/v1",
+        ):
+            with self.subTest(base_url=base_url):
+                self.assertTrue(
+                    should_prefer_direct_connection(
+                        profile(name="local-qwen", base_url=base_url, model="qwen3.8-27b")
+                    )
+                )
+
+    def test_local_model_recovery_keeps_full_prefill_budget(self) -> None:
+        current = ModelProfile(
+            name="lmstudio-qwen3.8-27b",
+            provider="lm-studio",
+            base_url="http://100.86.69.1:1234/v1",
+            model="qwen3.8-27b",
+            api_key_env="TEST_API_KEY",
+            timeout_seconds=300,
+            stream_idle_timeout_seconds=30,
+        )
+
+        self.assertTrue(is_local_or_private_endpoint(current))
+        self.assertEqual(recovery_request_timeout_seconds(current), 300)
+
+    def test_cloud_model_recovery_remains_bounded(self) -> None:
+        current = ModelProfile(
+            name="cloud-model",
+            provider="openai-compatible",
+            base_url="https://api.example.com/v1",
+            model="cloud-model",
+            api_key_env="TEST_API_KEY",
+            timeout_seconds=300,
+        )
+
+        self.assertFalse(is_local_or_private_endpoint(current))
+        self.assertEqual(recovery_request_timeout_seconds(current), 60)
+
+    def test_stream_idle_override_never_shortens_prefill_budget(self) -> None:
+        current = ModelProfile(
+            name="local-model",
+            provider="lm-studio",
+            base_url="http://127.0.0.1:1234/v1",
+            model="local-model",
+            api_key_env="TEST_API_KEY",
+            timeout_seconds=300,
+            stream_idle_timeout_seconds=75,
+        )
+
+        self.assertEqual(stream_start_timeout_seconds(current), 300)
 
     def test_official_deepseek_ignores_configured_system_proxy(self) -> None:
         client = OpenAICompatibleClient()
@@ -61,6 +116,25 @@ class LLMProxyRoutingTests(unittest.TestCase):
 
         self.assertIs(response, direct_response)
         client._direct_opener.open.assert_called_once_with(self.request, timeout=12)
+        urlopen.assert_not_called()
+
+    def test_tailscale_endpoint_ignores_configured_system_proxy(self) -> None:
+        client = OpenAICompatibleClient()
+        direct_response = object()
+        client._direct_opener = Mock()
+        client._direct_opener.open.return_value = direct_response
+        current = profile(
+            name="lmstudio-qwen3.8-27b",
+            base_url="http://100.86.69.1:1234/v1",
+            model="qwen3.8-27b",
+        )
+        request = urllib.request.Request("http://100.86.69.1:1234/v1/chat/completions")
+
+        with patch("work_agent_core.llm.urllib.request.urlopen") as urlopen:
+            response = client._open_request(request, profile=current, timeout=12)
+
+        self.assertIs(response, direct_response)
+        client._direct_opener.open.assert_called_once_with(request, timeout=12)
         urlopen.assert_not_called()
 
     def test_official_deepseek_never_falls_back_to_system_proxy(self) -> None:

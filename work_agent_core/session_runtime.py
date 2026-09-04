@@ -5,11 +5,11 @@ There is one durable log; the provider message list is derived from it on every
 step, and per-request assembly is recorded so a later reader can reconstruct
 exactly what the model received.
 
-Surface events are history: user turns, assistant replies, tool results, and
-compaction replacements. The system prompt, the resumed task plan, and the
-per-request context block are *not* history — they are re-rendered each step
-and belong in ``request/header``, which is why they are recorded there instead
-of being appended as conversation messages.
+Surface events are history: append-only turn runtime contexts, user turns,
+assistant replies, tool results, and compaction replacements. The fixed system
+prompt and genuinely request-only compatibility blocks belong in
+``request/header``; a timestamp or other turn context must never be re-rendered
+over an earlier position in the model-visible timeline.
 """
 
 from __future__ import annotations
@@ -23,11 +23,20 @@ from .session_log import (
     AGENT_ERROR,
     APPROVAL_REQUESTED,
     APPROVAL_RESOLVED,
+    ARTIFACT_CREATED,
+    ARTIFACT_VERIFIED,
     ASSISTANT_MESSAGE,
     COMPACTION_REPLACEMENT,
     CONTEXT_INJECTED,
+    DELIVERY_UPDATED,
+    EXTERNAL_EVENT_CONSUMED,
+    EXTERNAL_EVENT_QUEUED,
+    MESSAGE_READ,
     PLAN_UPDATED,
+    PROACTIVE_MESSAGE,
     REQUEST_HEADER,
+    SESSION_CHECKPOINT,
+    SESSION_METADATA_UPDATED,
     SessionEvent,
     SessionLog,
     STEP_END,
@@ -89,6 +98,17 @@ class ConversationRuntime:
         self._open_turn_id = str(turn_id)
         return self._append(TURN_START, {"turn_id": self._open_turn_id, **meta})
 
+    def resume_turn(self, turn_id: str, *, open_step: int | None = None) -> None:
+        """Attach a live runtime to a deliberately parked durable turn.
+
+        Approval is a pause, not a second user turn.  No event is appended
+        here: the original ``turn/start`` (and optional ``step/start``) is
+        already durable and must remain the sole opening boundary.
+        """
+
+        self._open_turn_id = str(turn_id)
+        self._open_step = int(open_step) if open_step is not None else None
+
     def end_turn(self, kind: str = TURN_END_COMPLETED, detail: str = "") -> SessionEvent | None:
         """Close the open turn, closing a dangling step first.
 
@@ -124,8 +144,18 @@ class ConversationRuntime:
 
     # -- history ---------------------------------------------------------
 
-    def record_user(self, content: str, *, source: str = "human", **extra: Any) -> SessionEvent:
-        return self._append(USER_MESSAGE, {"content": str(content or ""), "source": source, **extra})
+    def record_user(self, content: Any, *, source: str = "human", **extra: Any) -> SessionEvent:
+        """Record text or an OpenAI-compatible multimodal user payload.
+
+        Tool-loaded images are injected for one model step as ``content``
+        blocks.  Coercing that list with ``str(...)`` destroys the native
+        image semantics and turns the Base64 payload into a fake human chat
+        message.  The event log already snapshots JSON values, so preserve the
+        blocks here and let the web persistence boundary dehydrate them.
+        """
+
+        normalized = content if isinstance(content, list) else str(content or "")
+        return self._append(USER_MESSAGE, {"content": normalized, "source": source, **extra})
 
     def record_assistant(
         self,
@@ -182,7 +212,7 @@ class ConversationRuntime:
             return None
         role = str(message.get("role") or "")
         if role == "user":
-            return self.record_user(str(message.get("content") or ""))
+            return self.record_user(message.get("content"))
         if role == "assistant":
             tool_calls = list(message.get("tool_calls") or ())
             event = self.record_assistant(
@@ -291,6 +321,143 @@ class ConversationRuntime:
             },
         )
 
+    # -- human timeline and product state --------------------------------
+
+    def record_proactive_message(
+        self,
+        content: str,
+        *,
+        message_id: str,
+        channel: str = "friday",
+        unread: bool = True,
+        source: str = "assistant",
+    ) -> SessionEvent:
+        return self._append(
+            PROACTIVE_MESSAGE,
+            {
+                "message_id": str(message_id),
+                "content": str(content or ""),
+                "channel": str(channel or "friday"),
+                "unread": bool(unread),
+                "source": str(source or "assistant"),
+            },
+        )
+
+    def record_message_read(self, message_id: str, *, read: bool = True) -> SessionEvent:
+        return self._append(
+            MESSAGE_READ,
+            {"message_id": str(message_id), "read": bool(read)},
+        )
+
+    def record_artifact(
+        self,
+        path: str,
+        *,
+        artifact_id: str = "",
+        kind: str = "file",
+        title: str = "",
+        origin: str = "tool",
+        tool_name: str = "",
+        turn_id: str = "",
+        status: str = "created",
+        **extra: Any,
+    ) -> SessionEvent:
+        resolved_id = str(artifact_id or path).strip()
+        return self._append(
+            ARTIFACT_CREATED,
+            {
+                "artifact_id": resolved_id,
+                "path": str(path),
+                "kind": str(kind or "file"),
+                "title": str(title or ""),
+                "origin": str(origin or "tool"),
+                "tool_name": str(tool_name or ""),
+                "turn_id": str(turn_id or self._open_turn_id),
+                "status": str(status or "created"),
+                **extra,
+            },
+        )
+
+    def record_artifact_verification(
+        self,
+        artifact_id: str,
+        *,
+        verified: bool,
+        verification: str = "",
+    ) -> SessionEvent:
+        return self._append(
+            ARTIFACT_VERIFIED,
+            {
+                "artifact_id": str(artifact_id),
+                "verified": bool(verified),
+                "verification": str(verification or ""),
+            },
+        )
+
+    def record_delivery(
+        self,
+        artifact_id: str,
+        *,
+        status: str,
+        channel: str = "chat",
+        detail: str = "",
+    ) -> SessionEvent:
+        return self._append(
+            DELIVERY_UPDATED,
+            {
+                "artifact_id": str(artifact_id),
+                "status": str(status),
+                "channel": str(channel or "chat"),
+                "detail": str(detail or ""),
+            },
+        )
+
+    def record_checkpoint(self, checkpoint: Mapping[str, Any]) -> SessionEvent:
+        return self._append(SESSION_CHECKPOINT, dict(checkpoint))
+
+    def record_metadata_update(
+        self,
+        values: Mapping[str, Any] | None = None,
+        *,
+        removed: Sequence[str] = (),
+    ) -> SessionEvent:
+        return self._append(
+            SESSION_METADATA_UPDATED,
+            {
+                "values": dict(values or {}),
+                "removed": [str(key) for key in removed],
+            },
+        )
+
+    def queue_external_event(
+        self,
+        event_id: str,
+        *,
+        kind: str,
+        payload: Mapping[str, Any],
+        priority: str = "normal",
+        source: str = "external",
+    ) -> SessionEvent:
+        return self._append(
+            EXTERNAL_EVENT_QUEUED,
+            {
+                "event_id": str(event_id),
+                "kind": str(kind),
+                "payload": dict(payload),
+                "priority": str(priority or "normal"),
+                "source": str(source or "external"),
+            },
+        )
+
+    def consume_external_event(self, event_id: str, *, turn_id: str = "") -> SessionEvent:
+        return self._append(
+            EXTERNAL_EVENT_CONSUMED,
+            {
+                "event_id": str(event_id),
+                "turn_id": str(turn_id or self._open_turn_id),
+            },
+        )
+
     # -- request assembly ------------------------------------------------
 
     def build_request_messages(
@@ -300,10 +467,9 @@ class ConversationRuntime:
     ) -> list[dict[str, Any]]:
         """Assemble the exact provider message list for one step.
 
-        Late blocks sit immediately before the newest user message. Anything
-        that changes per turn — a timestamp, a resumed plan — would otherwise
-        invalidate prompt-cache coverage for the whole history instead of just
-        the newest turn.
+        Legacy late blocks sit immediately before the newest user message.
+        Normal per-turn context is already an append-only surface event beside
+        its user message, so later requests replay it byte-for-byte.
         """
 
         derived = self.log.derive_messages()

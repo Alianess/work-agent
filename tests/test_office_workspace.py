@@ -107,6 +107,36 @@ class PdfWorkspaceTests(unittest.TestCase):
         self.assertTrue(library_items[merged["output"]["path"]]["download_url"].startswith("/api/file/download?path="))
         self.assertTrue((self.root / PDF_INPUTS_RELATIVE_ROOT).is_dir())
 
+    def test_account_private_work_report_is_available_through_the_file_preview_contract(self) -> None:
+        workspace_root = self.root / "workspace"
+        account_root = self.root / "account"
+        report = account_root / "work_reports" / "biweekly" / "2026-08-15_2026-08-28.md"
+        report.parent.mkdir(parents=True)
+        report.write_text("# 双周报\n\n已完成工作。\n", encoding="utf-8")
+
+        with (
+            patch.object(web_server, "account_workspace_root", return_value=workspace_root),
+            patch.object(web_server, "user_data_dir", return_value=account_root),
+        ):
+            payload = web_server.read_file_payload(
+                "work_reports/biweekly/2026-08-15_2026-08-28.md",
+                max_chars=50_000,
+            )
+            resolved, storage_root = web_server.resolve_user_visible_file(
+                "work_reports/biweekly/2026-08-15_2026-08-28.md"
+            )
+            with self.assertRaises(ValueError):
+                web_server.resolve_user_visible_file(
+                    "work_reports/../conversation_history/private.json"
+                )
+
+        self.assertEqual(resolved, report)
+        self.assertEqual(storage_root, account_root)
+        self.assertEqual(payload["path"], "work_reports/biweekly/2026-08-15_2026-08-28.md")
+        self.assertEqual(payload["preview_mode"], "markdown")
+        self.assertIn("已完成工作", payload["content"])
+        self.assertIn("path=work_reports/biweekly/", payload["download_url"])
+
 
 if __name__ == "__main__":
     unittest.main()

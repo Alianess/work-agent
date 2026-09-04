@@ -20,6 +20,7 @@ import time
 from ..session_log import (
     ASSISTANT_MESSAGE,
     SessionLog,
+    TOOL_RESULT,
     TURN_START,
     USER_MESSAGE,
 )
@@ -58,6 +59,56 @@ MAX_FILE_BYTES = 20 * 1024 * 1024
 
 
 _DATA_URL = re.compile(r"data:[a-z]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+_PROJECT_DIR = re.compile(r"projects[/\\]project-([0-9a-f]{6,})")
+
+# 版本家族的文件名线索：日期、"N号"、vN、第N版、修订稿类词。主干去掉它们
+# 之后相同才算候选家族——比如 "17号可研报告" 和 "20号可研报告" 的主干都是
+# "可研报告"。主干只是线索，最终折叠与否由内容重叠决定（见 index 层）。
+_VERSION_NOISE = re.compile(
+    r"(?:19|20)\d{2}(?:[._-]?\d{1,2}){2}"  # 20260817 / 2026-08-17 / 2026.8.17
+    r"|\d{1,4}(?=[_.\s（(\[【]*号)"  # 17号 / 0817号
+    r"|[（(\[【\s]*第?\d{1,3}[）)\]】\s]*版"
+    r"|[\s_-]*v\d{1,3}\b"
+    r"|final|终稿|定稿|最终版|最新版|修订版|修改版|报送版|提交版|送审版|初稿|草稿",
+    flags=re.IGNORECASE,
+)
+
+
+def project_id_from_path(path: str | Path) -> str:
+    """项目语料按约定住在 projects/project-<id>/ 下，归属就在路径里。
+
+    会话的归属在会话元数据里，文件的归属在路径里——两处都是各自正本
+    已有的结构，不需要再维护一份映射。
+    """
+
+    match = _PROJECT_DIR.search(str(path))
+    return match.group(1) if match else ""
+
+
+def version_family_key(uri: str) -> str:
+    """同名主干的归并键：目录 + 去噪后的文件主干 + 扩展名。
+
+    家族只在同一目录内成立——跨目录的同名是巧合不是版本。扩展名编进
+    key 是为了让 md/docx 渲染对（同一份稿子的源文件和导出）不成家族：
+    它们是同一份的两种载体，不是两版；折叠其一会让另一种载体从检索里
+    消失。返回空串表示不参与归并（无扩展名、主干去噪后为空等）。
+    """
+
+    text = str(uri or "").strip()
+    if not text:
+        return ""
+    stem = text.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    directory = text[: max(0, len(text) - len(stem))]
+    suffix = ""
+    if "." in stem:
+        stem, suffix = stem.rsplit(".", 1)
+        suffix = "." + suffix.casefold()
+    cleaned = _VERSION_NOISE.sub("", stem)
+    cleaned = re.sub(r"[\s_\-—（）()【】\[\]]+", "", cleaned).casefold()
+    if len(cleaned) < 2:
+        return ""
+    return f"{directory}{cleaned}{suffix}"
 
 
 def readable_content(value: Any) -> str:
@@ -98,13 +149,21 @@ def turns_from_log(log: SessionLog) -> list[dict[str, Any]]:
             }
             turns.append(current)
             continue
-        if event.type not in {USER_MESSAGE, ASSISTANT_MESSAGE}:
+        if event.type not in {USER_MESSAGE, ASSISTANT_MESSAGE, TOOL_RESULT}:
             continue
         if current is None:
             current = {"title": "第 1 轮", "occurred_at": int(event.ts_ms or 0), "messages": []}
             turns.append(current)
         content = readable_content(dict(event.data).get("content"))
         if not content:
+            continue
+        if event.type == TOOL_RESULT:
+            # 工具结果进词法不进向量（chunking 按 title 标记、index 按标记
+            # 排除向量补算）：90% 是协议回显，语义索引收它只会稀释对话；
+            # 但"上次那个命令报的错""那个路径叫什么"要靠词法精确找回。
+            name = str(dict(event.data).get("name") or "tool")
+            content = f"工具结果 {name}：{content[:4000]}"
+            current["messages"].append({"role": "tool", "content": content})
             continue
         role = "user" if event.type == USER_MESSAGE else "assistant"
         if role == "user" and not current["title"]:
@@ -175,6 +234,7 @@ class RecallSync:
         log: SessionLog,
         *,
         title: str = "",
+        project_id: str = "",
     ) -> UpsertReport:
         """一轮结束时调用。只做本地词法索引，不碰网络。"""
 
@@ -191,7 +251,10 @@ class RecallSync:
         if root is not None and not root.occurred_at:
             root.occurred_at = max(int(turn["occurred_at"] or 0) for turn in turns)
         return self.index.upsert_tree(
-            tree, uri=f"conversation/{conversation_id}", aliases_for=self.aliases_for
+            tree,
+            uri=f"conversation/{conversation_id}",
+            aliases_for=self.aliases_for,
+            project_id=project_id,
         )
 
     # ------------------------------------------------------------------
@@ -208,9 +271,17 @@ class RecallSync:
         except OSError:
             return UpsertReport(skipped=True)
         tree = build_file_tree(resolved, source_id=source_id, relative_to=self.workspace_root)
-        return self.index.upsert_tree(
-            tree, uri=resolved.as_posix(), aliases_for=self.aliases_for
+        report = self.index.upsert_tree(
+            tree,
+            uri=resolved.as_posix(),
+            aliases_for=self.aliases_for,
+            project_id=project_id_from_path(resolved),
         )
+        if report.touched:
+            # 新文件可能改变版本家族的格局（比如第 3 版可研入库），
+            # 趁写入路径还在顺手重算一次；幂等，几毫秒。
+            self.index.reconcile_version_families(version_family_key)
+        return report
 
     def index_directory(
         self,
@@ -245,6 +316,12 @@ class RecallSync:
                 report.absorb(self.index_file(path))
             except Exception as error:
                 report.failures.append(f"{path.name}: {type(error).__name__}: {error}")
+        # 全量同步结束时统一归并一次版本家族：index_file 内部的逐文件归并
+        # 在批量场景下是重复劳动，这里收尾兜底（含删除文件后的解除折叠）。
+        try:
+            self.index.reconcile_version_families(version_family_key)
+        except Exception as error:
+            report.failures.append(f"version-families: {type(error).__name__}: {error}")
         return report
 
     # ------------------------------------------------------------------

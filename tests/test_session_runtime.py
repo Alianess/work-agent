@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from work_agent_core.session_log import (
     REQUEST_HEADER,
     SessionHeader,
     SessionLog,
+    SessionLogError,
     TURN_END_ABORTED,
     check_session_invariants,
 )
@@ -51,6 +53,18 @@ class RequestAssemblyTests(unittest.TestCase):
         runtime.begin_step(1)
         messages = runtime.build_request_messages("系统提示", [{"role": "system", "content": "上下文"}])
         self.assertEqual([item["role"] for item in messages], ["system", "system"])
+
+    def test_multimodal_user_blocks_keep_native_provider_shape(self) -> None:
+        runtime = new_runtime()
+        blocks = [
+            {"type": "text", "text": "以下是刚才用 read_file 载入的图片。"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}},
+        ]
+
+        runtime.append_message({"role": "user", "content": blocks})
+
+        self.assertEqual(runtime.log.derive_messages(), [{"role": "user", "content": blocks}])
+        self.assertEqual(runtime.log.derive_transcript(), [{"role": "user", "content": blocks}])
 
 
 class TurnLifecycleTests(unittest.TestCase):
@@ -145,7 +159,11 @@ class MigrationTests(unittest.TestCase):
                  "function": {"name": "read_file", "arguments": "{\"path\": \"a.md\"}"}}
             ]},
             {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": "正文"},
-            {"role": "assistant", "content": "整理好了"},
+            {
+                "role": "assistant",
+                "content": "整理好了",
+                "reasoning_content": "按用户要求整理",
+            },
             {"role": "user", "content": "再改一版"},
             {"role": "assistant", "content": "改好了"},
         ]
@@ -293,13 +311,73 @@ class DurableMirrorTests(unittest.TestCase):
             self.assertEqual(dict(ends[-1].data)["reason"]["kind"], "interrupted")
             self.assertEqual(check_session_invariants(recovered), [])
 
-    def test_mirror_failure_never_propagates_into_the_turn(self) -> None:
+    def test_mirror_failure_is_explicit_and_retains_the_batch(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             store = SessionLogStore(Path(root) / "log.sqlite3")
             runtime, mirror = self._turn(store, "conv-2", [{"role": "user", "content": "问"}], "问")
             runtime.append_message({"role": "assistant", "content": "答"})
-            # Force a contiguity rejection by advancing the durable log underneath.
-            mirror.skip_before_seq = 10_000
-            mirror._offset = -10_000
-            mirror.flush()
+            with patch.object(
+                store,
+                "append_at_tail",
+                side_effect=SessionLogError("forced write failure"),
+            ):
+                with self.assertRaisesRegex(SessionLogError, "forced write failure"):
+                    mirror.flush()
             self.assertIsNotNone(mirror.last_error)
+            self.assertGreater(len(mirror._pending), 0)
+
+    def test_mirror_rebases_when_another_writer_appends_between_flushes(self) -> None:
+        """Regression for stored next=227 while the turn still started at 225."""
+
+        with tempfile.TemporaryDirectory() as root:
+            store = SessionLogStore(Path(root) / "log.sqlite3")
+            cid = "conv-interleaved"
+            runtime, mirror = self._turn(store, cid, [], "把文件整理好")
+            mirror.flush()
+
+            # A plan/checkpoint writer used to advance the durable tail here,
+            # leaving the mirror's fixed offset stale for the next model batch.
+            store.append_event(cid, "session/metadata_updated", {"values": {"plan": "done"}})
+            store.append_event(cid, "session/checkpoint", {"working_messages": []})
+
+            runtime.append_message({"role": "assistant", "content": "四份文件已经完成。"})
+            runtime.end_turn()
+            mirror.flush()
+
+            recovered = store.load_live(cid)
+            self.assertEqual(
+                [event.seq for event in recovered.events],
+                list(range(len(recovered.events))),
+            )
+            self.assertEqual(
+                [item["content"] for item in recovered.derive_transcript()],
+                ["把文件整理好", "四份文件已经完成。"],
+            )
+            self.assertEqual(check_session_invariants(recovered), [])
+
+    def test_mirror_keeps_event_references_correct_across_rebased_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            store = SessionLogStore(Path(root) / "log.sqlite3")
+            cid = "conv-rebased-sources"
+            runtime, mirror = self._turn(store, cid, [], "继续处理")
+            answer = runtime.record_assistant("较长的中间过程")
+            mirror.flush()
+
+            inserted = store.append_event(cid, "session/checkpoint", {"working_messages": []})
+            runtime.record_compaction([answer.seq], "中间过程摘要")
+            runtime.end_turn()
+            mirror.flush()
+
+            recovered = store.load_live(cid)
+            durable_answer = next(
+                event
+                for event in recovered.events
+                if event.type == "assistant/message"
+                and dict(event.data).get("content") == "较长的中间过程"
+            )
+            replacement = next(
+                event for event in recovered.events if event.type == "compaction/replacement"
+            )
+            self.assertGreater(replacement.seq, inserted.seq)
+            self.assertEqual(replacement.source_event_seqs, (durable_answer.seq,))
+            self.assertEqual(check_session_invariants(recovered), [])

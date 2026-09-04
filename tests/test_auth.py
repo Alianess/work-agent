@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -98,16 +99,16 @@ class AuthStoreTests(unittest.TestCase):
             self.assertEqual(web_server.cross_chat_memories_payload()["count"], 1)
 
             web_server.REQUEST_AUTH.user = second
-            self.assertEqual(web_server.load_conversations_payload(), {"items": [], "revision": 0})
+            self.assertEqual(
+                web_server.load_conversations_payload(),
+                {"items": [], "deleted_ids": [], "revision": 0},
+            )
             self.assertEqual(web_server.cross_chat_memories_payload()["count"], 0)
             self.assertNotEqual(
                 web_server.load_agent_settings()["work_background"],
                 "first background",
             )
-            self.assertNotEqual(
-                web_server.load_agent_settings()["company_document_format"],
-                "标题：二号小标宋",
-            )
+            self.assertNotIn("company_document_format", web_server.load_agent_settings())
             web_server.save_conversations_payload({"items": [{"id": "second-chat", "messages": []}]})
 
             web_server.REQUEST_AUTH.user = first
@@ -116,18 +117,20 @@ class AuthStoreTests(unittest.TestCase):
             self.assertEqual(web_server.load_agent_settings()["details"], "first background")
             self.assertEqual(web_server.load_agent_settings()["work_background"], "")
             self.assertEqual(web_server.load_agent_settings()["assistant_name"], "周五")
-            self.assertEqual(
-                web_server.load_agent_settings()["company_document_format"],
-                "标题：二号小标宋",
+            self.assertNotIn("company_document_format", web_server.load_agent_settings())
+            persisted_settings = json.loads(
+                web_server.user_agent_settings_path().read_text(encoding="utf-8")
             )
+            self.assertNotIn("company_document_format", persisted_settings)
             context = web_server.agent_system_context(mode="friday")
             self.assertIn("项目经理助理“周五”", context)
             self.assertNotIn("系统当前本地日期时间（本轮提示词生成时读取，含时区偏移）", context)
             turn_time_context = web_server.agent_turn_time_context()
-            self.assertIn("系统当前本地日期时间（本轮提示词生成时读取，含时区偏移）", turn_time_context)
+            self.assertTrue(turn_time_context.startswith("系统当前时间："))
             self.assertIn(datetime.now().astimezone().date().isoformat(), turn_time_context)
-            self.assertIn("公司标准文件格式（纯文字设置）", context)
-            self.assertIn("official-document", context)
+            self.assertRegex(turn_time_context, r"，星期[一二三四五六日]。$")
+            self.assertNotIn("相对日期", turn_time_context)
+            self.assertNotIn("标题：二号小标宋", context)
             task_context = web_server.agent_system_context(mode="task")
             self.assertNotIn("周五", task_context)
             self.assertNotIn("微信", task_context)

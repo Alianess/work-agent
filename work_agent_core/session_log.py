@@ -63,6 +63,20 @@ PLAN_UPDATED = "plan/updated"
 AGENT_ERROR = "agent/error"
 FACT_RECORDED = "memory/fact"
 
+# Human timeline and business state.  These are durable facts, but they are not
+# provider messages.  The model-facing projection and the human/product
+# projections deliberately diverge here: a delivery receipt or a bell reminder
+# must survive a restart without being replayed as if the user had said it.
+PROACTIVE_MESSAGE = "message/proactive"
+MESSAGE_READ = "message/read"
+ARTIFACT_CREATED = "artifact/created"
+ARTIFACT_VERIFIED = "artifact/verified"
+DELIVERY_UPDATED = "delivery/updated"
+SESSION_CHECKPOINT = "session/checkpoint"
+SESSION_METADATA_UPDATED = "session/metadata_updated"
+EXTERNAL_EVENT_QUEUED = "external/queued"
+EXTERNAL_EVENT_CONSUMED = "external/consumed"
+
 DEFAULT_SURFACE_OPS: dict[str, str] = {
     SESSION_CREATED: SURFACE_NONE,
     TURN_START: SURFACE_NONE,
@@ -82,6 +96,15 @@ DEFAULT_SURFACE_OPS: dict[str, str] = {
     PLAN_UPDATED: SURFACE_NONE,
     AGENT_ERROR: SURFACE_NONE,
     FACT_RECORDED: SURFACE_NONE,
+    PROACTIVE_MESSAGE: SURFACE_NONE,
+    MESSAGE_READ: SURFACE_NONE,
+    ARTIFACT_CREATED: SURFACE_NONE,
+    ARTIFACT_VERIFIED: SURFACE_NONE,
+    DELIVERY_UPDATED: SURFACE_NONE,
+    SESSION_CHECKPOINT: SURFACE_NONE,
+    SESSION_METADATA_UPDATED: SURFACE_NONE,
+    EXTERNAL_EVENT_QUEUED: SURFACE_NONE,
+    EXTERNAL_EVENT_CONSUMED: SURFACE_NONE,
 }
 
 # ``interrupted`` is the one turn-end reason no loop emits. Recovery synthesizes
@@ -291,6 +314,102 @@ class SessionLog:
             if not is_replacement_entry(self._events[entry.seq])
         ]
 
+    def derive_timeline(self) -> list[dict[str, Any]]:
+        """Project the human chat timeline from the same durable log.
+
+        Provider-only context and tool protocol messages are intentionally
+        absent.  Proactive messages are present even though they never enter
+        ``derive_messages``.  Read state is folded from later immutable events
+        rather than mutating an earlier message in place.
+        """
+
+        messages: list[dict[str, Any]] = []
+        by_id: dict[str, dict[str, Any]] = {}
+        for event in self._events:
+            item = project_timeline_message(self.header.session_id, event)
+            if item is not None:
+                messages.append(item)
+                by_id[str(item["id"])] = item
+                continue
+            if event.type != MESSAGE_READ:
+                continue
+            message_id = str(event.data.get("message_id") or "").strip()
+            target = by_id.get(message_id)
+            if target is not None:
+                target["read"] = bool(event.data.get("read", True))
+                target["read_at"] = int(event.ts_ms)
+        return [dict(item) for item in messages]
+
+    def derive_artifacts(self) -> list[dict[str, Any]]:
+        """Fold artifact lifecycle events into the current artifact ledger."""
+
+        order: list[str] = []
+        ledger: dict[str, dict[str, Any]] = {}
+        for event in self._events:
+            if event.type not in {ARTIFACT_CREATED, ARTIFACT_VERIFIED, DELIVERY_UPDATED}:
+                continue
+            data = thaw_json_value(event.data)
+            artifact_id = str(data.get("artifact_id") or data.get("path") or "").strip()
+            if not artifact_id:
+                continue
+            if artifact_id not in ledger:
+                order.append(artifact_id)
+                ledger[artifact_id] = {
+                    "artifact_id": artifact_id,
+                    "path": str(data.get("path") or ""),
+                    "status": "created",
+                    "created_at": int(event.ts_ms),
+                }
+            item = ledger[artifact_id]
+            if event.type == ARTIFACT_CREATED:
+                item.update({key: value for key, value in data.items() if value is not None})
+                item["status"] = str(data.get("status") or item.get("status") or "created")
+            elif event.type == ARTIFACT_VERIFIED:
+                item["verified"] = bool(data.get("verified", True))
+                item["verification"] = str(data.get("verification") or "")
+                item["status"] = "verified" if item["verified"] else "verification_failed"
+                item["verified_at"] = int(event.ts_ms)
+            else:
+                item["delivery_status"] = str(data.get("status") or "")
+                item["delivery_channel"] = str(data.get("channel") or "")
+                item["delivery_detail"] = str(data.get("detail") or "")
+                item["delivery_updated_at"] = int(event.ts_ms)
+        return [dict(ledger[key]) for key in order]
+
+    def latest_checkpoint(self) -> dict[str, Any]:
+        event = self.latest(SESSION_CHECKPOINT)
+        return thaw_json_value(event.data) if event is not None else {}
+
+    def derive_metadata(self) -> dict[str, Any]:
+        """Fold immutable metadata updates into one current metadata view."""
+
+        metadata: dict[str, Any] = {}
+        if self.header.project_id:
+            metadata["project_id"] = self.header.project_id
+        for event in self.iter_type(SESSION_METADATA_UPDATED):
+            data = thaw_json_value(event.data)
+            values = data.get("values") if isinstance(data.get("values"), dict) else {}
+            removed = data.get("removed") if isinstance(data.get("removed"), list) else []
+            metadata.update(values)
+            for key in removed:
+                metadata.pop(str(key), None)
+        return metadata
+
+    def pending_external_events(self) -> list[dict[str, Any]]:
+        """Return queued user/timer/channel events not yet consumed by a turn."""
+
+        consumed = {
+            str(event.data.get("event_id") or "")
+            for event in self.iter_type(EXTERNAL_EVENT_CONSUMED)
+        }
+        pending: list[dict[str, Any]] = []
+        for event in self.iter_type(EXTERNAL_EVENT_QUEUED):
+            data = thaw_json_value(event.data)
+            event_id = str(data.get("event_id") or "")
+            if event_id and event_id not in consumed:
+                pending.append({**data, "queued_at": int(event.ts_ms), "seq": event.seq})
+        return pending
+
     @property
     def surface(self) -> tuple[SurfaceEntry, ...]:
         return tuple(self._surface)
@@ -300,8 +419,11 @@ def project_event_message(event: SessionEvent) -> dict[str, Any] | None:
     """Canonical per-event projection shared by derivation and reconstruction."""
     data = event.data
     if event.type == USER_MESSAGE:
-        content = str(data.get("content") or "")
-        return {"role": "user", "content": content} if content.strip() else None
+        content = thaw_json_value(data.get("content"))
+        if isinstance(content, list):
+            return {"role": "user", "content": content} if content else None
+        text = str(content or "")
+        return {"role": "user", "content": text} if text.strip() else None
     if event.type == CONTEXT_INJECTED:
         content = str(data.get("content") or "")
         role = str(data.get("role") or "system")
@@ -314,9 +436,9 @@ def project_event_message(event: SessionEvent) -> dict[str, Any] | None:
         tool_calls = thaw_json_value(data.get("tool_calls") or ())
         if tool_calls:
             message["tool_calls"] = tool_calls
-            reasoning = str(data.get("reasoning_content") or "")
-            if reasoning:
-                message["reasoning_content"] = reasoning
+        reasoning = str(data.get("reasoning_content") or "")
+        if reasoning:
+            message["reasoning_content"] = reasoning
         if not message["content"] and not tool_calls:
             return None
         return message
@@ -337,6 +459,50 @@ def project_event_message(event: SessionEvent) -> dict[str, Any] | None:
         content = str(data.get("content") or "")
         return {"role": "assistant", "content": content} if content.strip() else None
     return None
+
+
+def project_timeline_message(session_id: str, event: SessionEvent) -> dict[str, Any] | None:
+    """Project one event into a human-visible message, when it is one."""
+
+    data = event.data
+    role = ""
+    content: Any = ""
+    channel = str(data.get("channel") or "chat")
+    unread = False
+    if event.type == USER_MESSAGE:
+        role = "user"
+        content = thaw_json_value(data.get("content"))
+    elif event.type == ASSISTANT_MESSAGE:
+        role = "assistant"
+        content = str(data.get("content") or "")
+    elif event.type == PROACTIVE_MESSAGE:
+        role = "assistant"
+        content = str(data.get("content") or "")
+        channel = str(data.get("channel") or "friday")
+        unread = bool(data.get("unread", True))
+    else:
+        return None
+    if isinstance(content, list):
+        # The browser timeline stores text plus attachment references, never raw
+        # image bytes.  Multimodal provider blocks remain available in the event.
+        content = "\n".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, Mapping) and block.get("type") == "text"
+        )
+    text = str(content or "")
+    if not text.strip():
+        return None
+    message_id = str(data.get("message_id") or f"{session_id}:{event.seq}")
+    return {
+        "id": message_id,
+        "event_seq": event.seq,
+        "role": role,
+        "content": text,
+        "channel": channel,
+        "createdAt": int(event.ts_ms),
+        "read": not unread,
+    }
 
 
 def is_replacement_entry(event: SessionEvent) -> bool:

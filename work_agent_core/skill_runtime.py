@@ -263,7 +263,7 @@ def register_skill_runtime_tools(
             name="create_docx_from_markdown",
             description=(
                 "Compatibility converter that creates a fixed-layout Chinese .docx from Markdown content or a Markdown file. "
-                "Use the complete docx skill for company-format documents, official documents, templates, editing, comments, "
+                "Use the complete docx skill for GB/T 9704—2012 official-layout documents, templates, editing, comments, "
                 "tracked changes, and render QA; do not treat this converter as the whole Word capability."
             ),
             parameters={

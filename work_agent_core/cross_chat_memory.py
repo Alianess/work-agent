@@ -44,6 +44,66 @@ FILE_DETAIL_PATTERN = re.compile(
 )
 
 
+def _query_bigrams(text: str) -> set[str]:
+    """查询侧的匹配单元：CJK 二元组 + 拉丁词。记忆条目短，这够用且零依赖。"""
+
+    units: set[str] = set()
+    for chunk in re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9]+", str(text or "")):
+        if re.match(r"[\u4e00-\u9fff]", chunk):
+            units.update(chunk[i : i + 2] for i in range(len(chunk) - 1))
+        else:
+            units.add(chunk.casefold())
+    return units
+
+
+def rank_memories_for_query(
+    memories: list[dict[str, Any]],
+    query: str,
+    *,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """按查询相关性给核心记忆排序，供 recall 工具附带返回。
+
+    L0 每轮注入的是"始终在场"的全量核心记忆；这里做的是另一件事——
+    模型主动检索时，把与查询相关的记忆条目跟原文一起给，省一次来回。
+    记忆条目最多几十条，二元组匹配零成本，不值得为此养一套向量。
+    """
+
+    query_units = _query_bigrams(query)
+    if not query_units:
+        return []
+    exact = re.sub(r"\s+", "", str(query or ""))
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for memory in memories:
+        content = str(memory.get("content") or "")
+        if not content:
+            continue
+        content_units = _query_bigrams(content)
+        if not content_units:
+            continue
+        overlap = query_units & content_units
+        if not overlap:
+            continue
+        coverage = len(overlap) / max(1, len(query_units))
+        exact_hit = 1.0 if len(exact) >= 4 and exact in re.sub(r"\s+", "", content) else 0.0
+        corrected_boost = 0.25 if str(memory.get("state") or "") == "corrected" else 0.0
+        score = coverage + exact_hit + corrected_boost
+        ranked.append(
+            (
+                score,
+                {
+                    "memory_id": str(memory.get("id") or ""),
+                    "project_id": str(memory.get("project_id") or ""),
+                    "state": str(memory.get("state") or "automatic"),
+                    "score": round(score, 4),
+                    "content": content,
+                },
+            )
+        )
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return [payload for score, payload in ranked[: max(0, int(limit))]]
+
+
 class CrossChatMemoryStore:
     """Account-local memory records, separate from raw chats and summaries."""
 
@@ -258,15 +318,14 @@ class CrossChatMemoryStore:
                 raise ValueError("没有找到这条可删除的记忆。")
 
     def delete_for_conversation(self, conversation_id: str) -> int:
-        """Hide every derived memory whose source conversation was deleted."""
+        """Permanently delete every memory derived from a deleted conversation."""
         source_id = str(conversation_id or "").strip()
         if not source_id:
             return 0
         with self._connect() as connection:
             cursor = connection.execute(
-                """UPDATE memory_items SET state='deleted', updated_at=?
-                WHERE conversation_id=? AND state <> 'deleted'""",
-                (int(time.time()), source_id),
+                "DELETE FROM memory_items WHERE conversation_id=?",
+                (source_id,),
             )
             return int(cursor.rowcount)
 
@@ -470,3 +529,169 @@ def memory_payload(row: sqlite3.Row) -> dict[str, Any]:
 
 def profile_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {"project_id": str(row["project_id"]), "content": str(row["content"]), "updated_at": int(row["updated_at"])}
+
+
+def _memory_guard_rejection(content: str) -> str:
+    """Shared anti-pollution checks for model-initiated writes.
+
+    The model calls remember in the open, so the user can audit it — but a
+    visible tool call is still a write, and these checks are what keeps the
+    core store free of paths, transient task state and one-off details.
+    """
+
+    if len(content) < 8:
+        return "内容太短（不足 8 字），不值得进核心记忆。"
+    if FILE_DETAIL_PATTERN.search(content):
+        return "内容包含文件路径或文件名细节——这类信息走检索（recall），不进核心记忆。"
+    matched = next((marker for marker in TRANSIENT_MEMORY_MARKERS if marker in content), "")
+    if matched:
+        return f"内容含瞬时标记（{matched}），像一次性任务状态而非长期事实。"
+    return ""
+
+
+def register_memory_tools(
+    registry: Any,
+    *,
+    session_store: SessionStore,
+    conversation_id: str,
+    conversation_title: str = "",
+    project_id: str = "",
+) -> None:
+    """Give the model its own hand for core memory: remember and forget.
+
+    Two write paths already existed — the explicit regex (user said 记住) and
+    the conservative background extractor.  This is the third: the model
+    deciding, mid-conversation, that something deserves a permanent home.
+    The call is visible to the user, writes land as state=explicit with a
+    source excerpt, and the guard checks below still apply.  A memory nobody
+    can audit is how the v2 store filled with salaries and paths.
+    """
+
+    store = CrossChatMemoryStore(session_store)
+
+    def _remember(args: dict[str, Any]) -> str:
+        content = normalize_memory_content(str(args.get("content") or ""))
+        kind = str(args.get("kind") or "").strip().lower() or (
+            "project" if str(args.get("scope") or "") == "project" and project_id else "preference"
+        )
+        if kind not in MEMORY_KINDS:
+            raise ValueError(f"kind 必须是 {'/'.join(sorted(MEMORY_KINDS))} 之一。")
+        scope = str(args.get("scope") or ("project" if project_id else "account")).strip()
+        target_project = project_id if (scope == "project" and project_id) else ""
+        rejection = _memory_guard_rejection(content)
+        if rejection:
+            return json.dumps({"saved": False, "reason": rejection}, ensure_ascii=False)
+        # upsert_many 对已存在的显式记忆返回原条目而非空表，所以"是否新写"
+        # 要靠自己比对：同一 scope 下已有逐字相同的内容就不再打扰账本。
+        already = next(
+            (
+                item
+                for item in store.list(project_id=target_project, limit=500)
+                if str(item["content"]).casefold() == content.casefold()
+            ),
+            None,
+        )
+        if already is not None:
+            return json.dumps(
+                {"saved": False, "items": [already], "note": "已存在相同记忆，未重复写入。"},
+                ensure_ascii=False,
+            )
+        saved = store.upsert_many(
+            [{
+                "kind": kind,
+                "content": content,
+                "importance": 1.0,
+                "confidence": 1.0,
+                "durability": "permanent",
+                "evidence": "explicit",
+            }],
+            conversation_id=conversation_id,
+            conversation_title=conversation_title or conversation_id,
+            project_id=target_project,
+            source_excerpt=str(args.get("source_excerpt") or "")[:1600],
+            state="explicit",
+        )
+        return json.dumps(
+            {"saved": bool(saved), "items": saved, "note": "已记入核心记忆。"},
+            ensure_ascii=False,
+        )
+
+    def _forget(args: dict[str, Any]) -> str:
+        query = normalize_memory_content(str(args.get("content") or ""))
+        if len(query) < 4:
+            raise ValueError("content 至少 4 个字，用于定位要忘记的记忆。")
+        scope = str(args.get("scope") or "all").strip()
+        candidates = [
+            item
+            for item in store.list(project_id=project_id if scope == "project" else "", limit=200)
+            + (store.list(project_id="", limit=200) if scope != "project" and project_id else [])
+            if item.get("state") != "deleted"
+        ]
+        best: tuple[float, dict[str, Any]] | None = None
+        seen: set[str] = set()
+        for item in candidates:
+            if item["id"] in seen:
+                continue
+            seen.add(item["id"])
+            score = SequenceMatcher(None, query.casefold(), str(item["content"]).casefold()).ratio()
+            if score >= 0.5 and (best is None or score > best[0]):
+                best = (score, item)
+        if best is None:
+            return json.dumps({"deleted": False, "reason": "没有找到足够相近的记忆。"}, ensure_ascii=False)
+        store.delete(best[1]["id"])
+        return json.dumps({"deleted": True, "item": best[1]}, ensure_ascii=False)
+
+    from .tools import Tool  # local import: tools.py imports nothing from this module
+
+    registry.register(
+        Tool(
+            name="remember",
+            description=(
+                "Persist one stable cross-session fact. Runtime rejects transient state, "
+                "file details, and other one-off information."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "One stable fact, at most 120 Chinese characters.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["identity", "preference", "goal", "project", "fact"],
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["account", "project"],
+                        "description": "account=global; project=current project.",
+                    },
+                    "source_excerpt": {
+                        "type": "string",
+                        "description": "Optional supporting user quote.",
+                    },
+                },
+                "required": ["content"],
+            },
+            handler=_remember,
+        )
+    )
+    registry.register(
+        Tool(
+            name="forget",
+            description="Delete the closest matching core memory.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Memory content to match."},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "project"],
+                        "description": "project=current project; all=account.",
+                    },
+                },
+                "required": ["content"],
+            },
+            handler=_forget,
+        )
+    )

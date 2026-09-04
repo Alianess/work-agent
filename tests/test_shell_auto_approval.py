@@ -39,7 +39,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
         self.assertFalse(payload["auto_approvable"])
         self.assertTrue(payload["reviewable_by_model"])
 
-    def test_package_install_is_not_delegatable(self) -> None:
+    def test_project_package_install_is_delegatable(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             payload = json.loads(
                 trusted_shell_tools_for_test(workspace).execute({"command": "npm install"})
@@ -47,7 +47,67 @@ class ShellAutoApprovalTests(unittest.TestCase):
 
         self.assertEqual(payload["status"], "approval_required")
         self.assertFalse(payload["auto_approvable"])
+        self.assertTrue(payload["reviewable_by_model"])
+
+    def test_dependency_install_requests_the_scoped_network_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            pending = json.loads(
+                tools.execute(
+                    {
+                        "command": "npm install",
+                        "_approval_source": "reviewer",
+                        "_approval_action_id": approval_action_id(
+                            command="npm install",
+                            cwd=str(Path(workspace).resolve()),
+                            timeout_seconds=120,
+                        ),
+                        "_approval_grant": issue_internal_approval_grant(
+                            action_id=approval_action_id(
+                                command="npm install",
+                                cwd=str(Path(workspace).resolve()),
+                                timeout_seconds=120,
+                            ),
+                            source="reviewer",
+                        ),
+                    }
+                )
+            )
+            record = tools.execution_orchestrator.store.get(pending["execution_id"])
+
+        self.assertEqual(record.contract["capabilities"]["network"]["mode"], "domain_allowlist")
+        self.assertIn("registry.npmjs.org", record.contract["capabilities"]["network"]["allowed_domains"])
+
+    def test_dependency_install_from_external_source_is_not_delegatable(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            payload = json.loads(
+                trusted_shell_tools_for_test(workspace).execute(
+                    {"command": "pip install https://example.invalid/pkg.whl"}
+                )
+            )
+
+        self.assertEqual(payload["status"], "approval_required")
         self.assertFalse(payload["reviewable_by_model"])
+
+    def test_dependency_install_tls_override_is_not_delegatable(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            payload = json.loads(
+                trusted_shell_tools_for_test(workspace).execute(
+                    {"command": "pip install --trusted-host pypi.org requests"}
+                )
+            )
+
+        self.assertEqual(payload["status"], "approval_required")
+        self.assertFalse(payload["reviewable_by_model"])
+
+    def test_sandbox_auto_allow_bypasses_model_for_workspace_modification(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            tools = trusted_shell_tools_for_test(workspace)
+            tools.sandbox_auto_allow = True
+            payload = json.loads(tools.execute({"command": "mkdir generated"}))
+
+        self.assertEqual(payload["status"], "executed")
+        self.assertEqual(payload["permission"], "allow")
 
     def test_public_approved_by_user_flag_cannot_bypass_policy(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -133,7 +193,7 @@ class ShellAutoApprovalTests(unittest.TestCase):
             self.assertFalse(result["reviewable_by_model"])
             self.assertTrue(target.exists())
 
-    def test_multiple_scoped_file_deletes_are_reviewable(self) -> None:
+    def test_multiple_scoped_file_deletes_require_explicit_user_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             first = Path(workspace) / "first.txt"
             second = Path(workspace) / "second.txt"
@@ -274,8 +334,8 @@ class InlinePythonReadOnlyTests(unittest.TestCase):
             }
         self.assertTrue(reviewable["python script.py"])
         self.assertTrue(reviewable["node build.js"])
-        self.assertFalse(reviewable["pip install requests"])
-        self.assertFalse(reviewable["npm install"])
+        self.assertTrue(reviewable["pip install requests"])
+        self.assertTrue(reviewable["npm install"])
         self.assertFalse(reviewable["pdftotext a.pdf -"])
 
 

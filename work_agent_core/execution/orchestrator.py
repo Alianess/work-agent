@@ -57,6 +57,7 @@ class ExecutionOrchestrator:
         policy: PolicyEngine | None = None,
         backends: dict[BackendKind, ExecutionBackend] | None = None,
         validator: ValidationService | None = None,
+        extra_read_roots: tuple[Path, ...] = (),
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.runtime_workspace_root = Path(runtime_workspace_root or self.workspace_root).resolve()
@@ -70,6 +71,7 @@ class ExecutionOrchestrator:
             BackendKind.MACOS_SEATBELT: SeatbeltBackend(
                 runtime_workspace_root=self.runtime_workspace_root,
                 readable_source_root=self.workspace_root,
+                extra_read_roots=extra_read_roots,
             ),
             BackendKind.TRUSTED_HOST: TrustedHostBackend(),
         }

@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import http.client
+import json
+import os
 import socket
 import time
 import unittest
@@ -22,6 +25,20 @@ from work_agent_core.llm import (
     is_transport_failure,
     retryable_status,
 )
+
+
+class _StreamingResponse:
+    def __init__(self, lines: list[bytes]) -> None:
+        self.lines = lines
+
+    def __enter__(self) -> "_StreamingResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def __iter__(self):
+        return iter(self.lines)
 
 
 class TransportFailureClassificationTests(unittest.TestCase):
@@ -76,6 +93,40 @@ class TransportFailureClassificationTests(unittest.TestCase):
     def test_retry_budget_is_bounded(self) -> None:
         # An unreachable host must not be retried forever.
         self.assertEqual(TRANSPORT_RETRIES, 3)
+
+    def test_remote_disconnect_before_headers_enters_same_endpoint_recovery(self) -> None:
+        profile = ModelProfile(
+            name="remote-disconnect-test",
+            provider="openai-compatible",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            api_key_env="UNUSED",
+            timeout_seconds=10,
+        )
+        success = _StreamingResponse([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b"data: [DONE]\n",
+        ])
+        statuses: list[str] = []
+
+        with (
+            mock.patch.dict(os.environ, {"UNUSED": "test-key"}),
+            mock.patch(
+                "work_agent_core.llm.urllib.request.urlopen",
+                side_effect=[http.client.RemoteDisconnected("closed"), success],
+            ) as urlopen,
+        ):
+            response = OpenAICompatibleClient().chat_tools_stream(
+                [{"role": "user", "content": "reply"}],
+                profile=profile,
+                on_delta=lambda chunk: statuses.append(str(chunk.status or "")),
+            )
+
+        self.assertEqual(response.content, "ok")
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertIn("recovery_started", statuses)
+        recovery_payload = json.loads(urlopen.call_args_list[1].args[0].data.decode("utf-8"))
+        self.assertIn("恢复阶段", recovery_payload["messages"][0]["content"])
 
 
 class RecoveryRetryBudgetTests(unittest.TestCase):

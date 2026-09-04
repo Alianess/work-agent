@@ -41,7 +41,5 @@ DeepFilterNet 因 Python 版本冲突不进主运行环境，音频降噪默认�
 两条规矩：
 
 - **不要往 `meet_files/` 根目录直接写文件。** 转写稿进 `文字稿/`，成品进 `材料/`。
-  曾经根目录散着 141 个文件，找不着也备份不动。
-- **机器产物不进检索索引。** 沙箱快照曾占索引 82% 的节点——每次 `shell_exec`
-  复制一份工作区，同一段内容出现 882 次。排除规则见
-  `work_agent_core/recall/sync.py` 的 `DEFAULT_SKIP_DIRECTORIES`。
+- **机器产物不进检索索引。** 排除规则见 `work_agent_core/recall/sync.py` 的
+  `DEFAULT_SKIP_DIRECTORIES`。

@@ -7,7 +7,7 @@ import json
 import os
 import sys
 
-from .config import DEFAULT_CONFIG_PATH, ModelProfile, ModelRegistry
+from .config import DEFAULT_CONFIG_PATH, ModelProfile, ModelRegistry, normalized_endpoint_key
 from .llm import OpenAICompatibleClient
 from .mcp_provider import build_mcp_tool_provider
 from .mcp_gateway import MCPGateway
@@ -17,7 +17,7 @@ from .shell_tools import register_shell_tools
 from .skills.meeting_minutes import MeetingMinutesSkill, register_meeting_minutes_skill
 from .skill_runtime import register_skill_runtime_tools
 from .skill_gateway import SkillGateway
-from .history_recall import register_history_recall_tool
+from .cross_chat_memory import register_memory_tools
 from .host_services.apple_pim import ApplePimService, register_apple_pim_tools
 from .session_store import SessionStore
 from .tool_bus import LocalToolProvider, ToolBus
@@ -126,8 +126,11 @@ def build_default_tools(
     friday_notification_handler: Callable[[dict[str, Any]], str] | None = None,
     agent_reminder_source: Callable[[], list[dict[str, Any]]] | None = None,
     file_change_handler: Callable[[Path], None] | None = None,
-    sandbox_auto_allow: bool = False,
+    sandbox_auto_allow: bool = True,
     recall_data_root: str | Path | None = None,
+    extra_read_roots: tuple[Path, ...] = (),
+    approval_rules_path: str | Path | None = None,
+    skill_contexts: dict[str, str] | None = None,
 ) -> ToolBus:
     bus = ToolBus()
     private_workspace = data_workspace or workspace
@@ -137,6 +140,7 @@ def build_default_tools(
         core_tools.registry,
         private_workspace,
         on_file_changed=file_change_handler,
+        extra_read_roots=extra_read_roots,
     )
     register_shell_tools(
         core_tools.registry,
@@ -147,25 +151,40 @@ def build_default_tools(
         conversation_id=str(conversation_id or ""),
         project_id=str(project_id or ""),
         sandbox_auto_allow=sandbox_auto_allow,
+        extra_read_roots=extra_read_roots,
+        approval_rules_path=approval_rules_path,
     )
     if session_store is not None and conversation_id:
-        register_history_recall_tool(
+        # 记忆的手：模型在对话里发现值得长期记住的事，当场写入核心记忆。
+        # 只在有会话正本的运行时注册——一次性 agent 没有可追溯的对话载体。
+        try:
+            conversation_title = str(
+                session_store.load(conversation_id).metadata.get("title") or conversation_id
+            )
+        except Exception:
+            conversation_title = conversation_id
+        register_memory_tools(
             core_tools.registry,
-            session_store,
-            conversation_id,
+            session_store=session_store,
+            conversation_id=conversation_id,
+            conversation_title=conversation_title,
             project_id=str(project_id or ""),
         )
     # 统一检索：材料、纪要、聊天走同一个索引，命中最小片段并给出标价的展开地图。
-    register_recall_tools(core_tools.registry, Path(recall_data_root or private_workspace))
+    # 会话正本在时连带核心记忆：检索命中附带 memory_results，不必另开一问。
+    register_recall_tools(
+        core_tools.registry,
+        Path(recall_data_root or private_workspace),
+        project_id=str(project_id or ""),
+        session_store=session_store if conversation_id else None,
+        conversation_id=str(conversation_id or ""),
+    )
     if friday_notification_handler is not None:
         core_tools.registry.register(
             Tool(
                 name="notify_user",
                 description=(
-                    "Deliver something to the user outside this reply. Use kind=reminder for a one-way "
-                    "bell notification that needs no answer — available in any chat. Use kind=conversation "
-                    "for an important proactive message in the persistent assistant conversation; runtimes "
-                    "without that capability are refused and should send a reminder instead."
+                    "Send an external reminder or a persistent assistant-conversation message."
                 ),
                 parameters={
                     "type": "object",
@@ -178,10 +197,7 @@ def build_default_tools(
                         "body": {"type": "string"},
                         "deliver_at": {
                             "type": "string",
-                            "description": (
-                                "Optional Unix seconds or ISO 8601 timestamp with timezone. "
-                                "Omit for immediate delivery."
-                            ),
+                            "description": "Unix seconds or ISO 8601; omit for immediate delivery.",
                         },
                     },
                     "required": ["kind", "body"],
@@ -244,6 +260,7 @@ def build_default_tools(
             workspace,
             [core_tools, apple_pim_tools, work_report_tools, meeting_tools, skill_tools, mcp_tools],
             enabled_skill_ids=enabled_skill_ids,
+            skill_contexts=skill_contexts,
         ).as_tool()
     )
     bus.add_provider(skill_gateway)
@@ -282,10 +299,10 @@ def add_model_profile(config_path: str | Path, profile_data: dict, *, set_defaul
 def update_model_profile(config_path: str | Path, name: str, profile_data: dict) -> None:
     path = Path(config_path)
     data = json.loads(path.read_text(encoding="utf-8"))
-    profile = ModelProfile.from_dict({**profile_data, "name": name})
     for index, existing in enumerate(data.get("profiles", [])):
         if existing.get("name") != name:
             continue
+        profile = ModelProfile.from_dict({**existing, **profile_data, "name": name})
         data["profiles"][index] = {
             "name": name,
             "provider": profile.provider,
@@ -294,12 +311,77 @@ def update_model_profile(config_path: str | Path, name: str, profile_data: dict)
             "api_key_env": profile.api_key_env,
             "temperature": profile.temperature,
             "max_tokens": profile.max_tokens,
+            "context_length": profile.context_length,
             "timeout_seconds": profile.timeout_seconds,
             "supports_vision": profile.supports_vision,
+            "auth_header": profile.auth_header,
+            "auth_scheme": profile.auth_scheme,
+            "stream_idle_timeout_seconds": profile.stream_idle_timeout_seconds,
+            "endpoint_id": profile.endpoint_id,
+            "endpoint_label": profile.endpoint_label,
         }
         write_model_config(path, data)
         return
     raise ValueError(f"Unknown model profile {name!r}")
+
+
+def _endpoint_key_for_config_item(item: dict[str, Any]) -> str:
+    return normalized_endpoint_key(
+        str(item.get("base_url") or ""),
+        str(item.get("endpoint_id") or ""),
+    )
+
+
+def update_model_endpoint(
+    config_path: str | Path,
+    endpoint_id: str,
+    endpoint_data: dict,
+) -> list[str]:
+    """更新某个端点的名称、供应商和接口地址，端点下所有模型一起变化。"""
+
+    path = Path(config_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    profiles = data.get("profiles", [])
+    matched = [item for item in profiles if _endpoint_key_for_config_item(item) == endpoint_id]
+    if not matched:
+        raise ValueError(f"Unknown model endpoint {endpoint_id!r}")
+
+    base_url = str(endpoint_data.get("base_url") or "").rstrip("/")
+    endpoint_label = str(endpoint_data.get("endpoint_label") or "").strip()
+    provider = str(endpoint_data.get("provider") or "").strip()
+    for item in matched:
+        if base_url:
+            item["base_url"] = base_url
+        if "endpoint_label" in endpoint_data:
+            item["endpoint_label"] = endpoint_label
+        if provider:
+            item["provider"] = provider
+    write_model_config(path, data)
+    return [str(item["name"]) for item in matched]
+
+
+def delete_model_endpoint(
+    config_path: str | Path,
+    endpoint_id: str,
+) -> list[dict]:
+    """删除端点及其全部模型；默认模型也在端点里时自动切到剩余模型。"""
+
+    path = Path(config_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    profiles = data.get("profiles", [])
+    matched = [item for item in profiles if _endpoint_key_for_config_item(item) == endpoint_id]
+    if not matched:
+        raise ValueError(f"Unknown model endpoint {endpoint_id!r}")
+    if len(matched) == len(profiles):
+        raise ValueError("至少需要保留一个端点。")
+
+    removed_names = {str(item["name"]) for item in matched}
+    remaining = [item for item in profiles if item["name"] not in removed_names]
+    if data.get("default_profile") in removed_names:
+        data["default_profile"] = str(remaining[0]["name"])
+    data["profiles"] = remaining
+    write_model_config(path, data)
+    return matched
 
 
 def delete_model_profile(config_path: str | Path, name: str) -> dict:

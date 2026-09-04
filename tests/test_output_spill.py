@@ -101,13 +101,16 @@ class ReadTextOffsetTests(unittest.TestCase):
 
 
 class SkillCatalogTests(unittest.TestCase):
-    def test_catalog_carries_ids_and_descriptions_only(self) -> None:
+    def test_prompt_keeps_only_skill_ids_and_descriptions(self) -> None:
         block = web_server.render_chat_skill_catalog()
 
         self.assertIn("- meeting-minutes：", block)
-        # Frontend-only fields cost more than the descriptions themselves.
+        self.assertIn("- anysearch：", block)
+        self.assertNotIn("任务明确匹配某技能时", block)
+        self.assertNotIn("无法判断对应技能时", block)
+        # when_to_use remains lazy and is available through list/open.
+        self.assertNotIn("当用户提到联网、Web、网页", block)
         self.assertNotIn("mention", block)
-        self.assertNotIn("@会议纪要", block)
         self.assertNotIn('"enabled"', block)
 
 

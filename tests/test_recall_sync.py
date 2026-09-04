@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from work_agent_core.recall.index import RecallIndex
 from work_agent_core.recall.sync import RecallSync, turns_from_log
@@ -59,6 +62,41 @@ class TurnBoundaryTests(unittest.TestCase):
         log.append("turn/start", {"turn_id": "t1"})
         log.append("turn/end", {"reason": "aborted"})
         self.assertEqual(turns_from_log(log), [])
+
+    def test_tool_results_enter_lexical_but_never_vectors(self) -> None:
+        """命令回显要能被词法找回，但不该花 embedding 钱、稀释语义索引。"""
+
+        log = SessionLog(SessionHeader(session_id="c1"))
+        log.append("turn/start", {"turn_id": "t1"})
+        log.append("user/message", {"content": "查一下构建为什么失败"})
+        log.append("tool/call", {"call_id": "a", "name": "run_command", "arguments": "{}"})
+        log.append(
+            "tool/result",
+            {"call_id": "a", "name": "run_command", "content": "Error: xcodebuild exit 65 见 meet_files 目录"},
+        )
+        log.append("assistant/message", {"content": "构建失败的原因是签名配置缺失。"})
+        index, sync = fresh()
+        sync.index_conversation("c1", log, title="构建排查")
+        turns = turns_from_log(log)
+        self.assertEqual(
+            [message["role"] for message in turns[0]["messages"]],
+            ["user", "tool", "assistant"],
+        )
+        # 词法找得到回显原文
+        hits = index.lexical_candidates("xcodebuild exit", limit=5)
+        self.assertTrue(hits)
+        # 向量补算名单里没有工具结果叶子
+        pending = index.leaves_without_vectors("bge-m3")
+        with index._connect() as connection:
+            titles = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT title FROM recall_nodes WHERE id IN"
+                    f" ({','.join('?' * len(pending))})",
+                    [item["id"] for item in pending],
+                )
+            }
+        self.assertNotIn("工具结果", titles)
 
 
 class IncrementalConversationTests(unittest.TestCase):
@@ -229,6 +267,287 @@ class TranscriptClassificationTests(unittest.TestCase):
 
         for path in ("meet_files/材料/报市稿.docx", "meet_files/材料/0707会议纪要.docx"):
             self.assertEqual(classify_source(Path(path), Path(".")), "document", path)
+
+
+class ProjectScopeTests(unittest.TestCase):
+    """项目隔离：归属是过滤条件，不是语义问题。"""
+
+    def _source_project(self, index: RecallIndex, source_id: str) -> str:
+        with index._connect() as connection:  # noqa: SLF001 - 测试读同包内部
+            row = connection.execute(
+                "SELECT project_id FROM recall_sources WHERE source_id = ?", (source_id,)
+            ).fetchone()
+        return str(row["project_id"]) if row else ""
+
+    def test_conversation_carries_its_project(self) -> None:
+        index, sync = fresh()
+        sync.index_conversation("c1", conversation(2), title="x", project_id="abc123def456")
+        self.assertEqual(self._source_project(index, "chat:c1"), "abc123def456")
+
+    def test_unchanged_content_still_backfills_project(self) -> None:
+        """内容跳过省的是向量钱，不该把归属一起省掉。"""
+
+        index, sync = fresh()
+        sync.index_conversation("c1", conversation(2), title="x")
+        self.assertEqual(self._source_project(index, "chat:c1"), "")
+
+        report = sync.index_conversation(
+            "c1", conversation(2), title="x", project_id="abc123def456"
+        )
+
+        self.assertTrue(report.skipped)
+        self.assertEqual(self._source_project(index, "chat:c1"), "abc123def456")
+
+    def test_empty_project_does_not_wipe_existing_attribution(self) -> None:
+        index, sync = fresh()
+        sync.index_conversation("c1", conversation(3), title="x", project_id="abc123def456")
+
+        # 换了一轮内容重索引，但调用方没带项目信息——已有归属不能丢。
+        sync.index_conversation("c1", conversation(4), title="x")
+
+        self.assertEqual(self._source_project(index, "chat:c1"), "abc123def456")
+
+    def test_project_files_are_recognised_by_path(self) -> None:
+        from work_agent_core.recall.sync import project_id_from_path
+
+        self.assertEqual(
+            project_id_from_path("meet_files/projects/project-79da7d7ce843/sources/政策依据.txt"),
+            "79da7d7ce843",
+        )
+        self.assertEqual(project_id_from_path("meet_files/材料/报市稿.docx"), "")
+
+    def test_file_under_a_project_dir_inherits_its_project(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project_dir = base / "projects" / "project-abc123def456" / "sources"
+            project_dir.mkdir(parents=True)
+            target = project_dir / "政策依据.txt"
+            target.write_text("项目政策依据：专项债支持。\n", encoding="utf-8")
+            outside = base / "材料.md"
+            outside.write_text("散装材料。\n", encoding="utf-8")
+
+            index, sync = fresh()
+            sync.index_directory(base)
+
+            self.assertEqual(
+                self._source_project(index, f"doc:{target.relative_to(base).as_posix()}"),
+                "abc123def456",
+            )
+            self.assertEqual(
+                self._source_project(index, f"doc:{outside.relative_to(base).as_posix()}"),
+                "",
+            )
+
+    def test_project_filter_limits_search_to_project_sources(self) -> None:
+        from work_agent_core.recall.index import NodeFilter
+        from work_agent_core.recall.search import RecallDeps, search
+
+        index, sync = fresh()
+        sync.index_conversation("c-in", conversation(2), title="项目内", project_id="abc123def456")
+        sync.index_conversation("c-out", conversation(2), title="项目外")
+
+        outcome = search(
+            RecallDeps(index=index),
+            "中试基地的场地",
+            filters=NodeFilter(project_ids=("abc123def456",)),
+        )
+
+        self.assertTrue(outcome["results"])
+        self.assertTrue(
+            all(item["source_id"] == "chat:c-in" for item in outcome["results"])
+        )
+
+    def test_recall_tool_scope_project_requires_a_project(self) -> None:
+        from work_agent_core.recall.tools import register_recall_tools
+        from work_agent_core.tools import ToolRegistry
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry()
+            register_recall_tools(registry, Path(directory))
+
+            tool = registry.get("recall")
+            self.assertEqual(tool.parameters["properties"]["scope"]["enum"], ["all"])
+            with self.assertRaises(ValueError):
+                registry.get("recall").handler({"query": "中试基地", "scope": "project"})
+
+    def test_recall_excludes_the_fully_replayed_current_conversation_and_bounds_text(self) -> None:
+        from work_agent_core.recall.tools import recall_index_for, register_recall_tools
+        from work_agent_core.tools import ToolRegistry
+
+        class _SessionStore:
+            def load(self, _conversation_id: str):
+                return SimpleNamespace(summary="", summary_message_count=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index = recall_index_for(root)
+            sync = RecallSync(index)
+            current = SessionLog(SessionHeader(session_id="current"))
+            current.append("turn/start", {"turn_id": "t1"})
+            current.append("user/message", {"content": "寻找中试基地方案"})
+            current.append(
+                "assistant/message",
+                {"content": "当前会话里经过核验的中试基地方案" * 10},
+            )
+            current.append("turn/end", {"reason": "completed"})
+            other = SessionLog(SessionHeader(session_id="other"))
+            other.append("turn/start", {"turn_id": "t1"})
+            other.append("user/message", {"content": "寻找中试基地方案"})
+            other.append(
+                "assistant/message",
+                {"content": "其他会话的中试基地方案：" + "经过核验的内容" * 200},
+            )
+            other.append("turn/end", {"reason": "completed"})
+            sync.index_conversation("current", current, title="当前会话")
+            sync.index_conversation("other", other, title="其他会话")
+            registry = ToolRegistry()
+            with (
+                patch("work_agent_core.recall.tools.embedding_backend", return_value=None),
+                patch("work_agent_core.recall.tools.rerank_backend", return_value=None),
+                patch("work_agent_core.recall.tools.RECALL_RESULT_MAX_TEXT_CHARS", 20),
+            ):
+                register_recall_tools(
+                    registry,
+                    root,
+                    session_store=_SessionStore(),
+                    conversation_id="current",
+                )
+                outcome = json.loads(
+                    registry.get("recall").handler({"query": "经过核验的内容 中试基地"})
+                )
+
+            self.assertTrue(outcome["results"])
+            self.assertTrue(all(item["source_id"] != "chat:current" for item in outcome["results"]))
+            self.assertTrue(any(item.get("text_truncated") for item in outcome["results"]))
+            self.assertTrue(all(len(item["text"]) <= 21 for item in outcome["results"]))
+
+
+class VersionFamilyTests(unittest.TestCase):
+    """版本折叠：文件名是线索，内容重叠才是判决。"""
+
+    def _write_doc(self, base: Path, name: str, paragraphs: list[str]) -> Path:
+        target = base / name
+        target.write_text("\n\n".join(paragraphs) + "\n", encoding="utf-8")
+        return target
+
+    def test_family_key_normalises_version_noise(self) -> None:
+        from work_agent_core.recall.sync import version_family_key
+
+        self.assertEqual(
+            version_family_key("材料/17号可研报告.docx"),
+            version_family_key("材料/20号可研报告.docx"),
+        )
+        self.assertEqual(
+            version_family_key("材料/可行性研究报告_v1.md"),
+            version_family_key("材料/可行性研究报告_终稿.md"),
+        )
+        self.assertEqual(
+            version_family_key("材料/20260817-汇报.docx"),
+            version_family_key("材料/20260820-汇报.docx"),
+        )
+        # 跨目录的同名是巧合不是版本
+        self.assertNotEqual(
+            version_family_key("材料/17号可研报告.docx"),
+            version_family_key("归档/20号可研报告.docx"),
+        )
+        # "新材料"这类主干词不该被单字噪声吃掉
+        self.assertEqual(
+            version_family_key("材料/新材料产业报告.docx"),
+            version_family_key("材料/新材料产业报告.docx"),
+        )
+
+    def test_high_overlap_folds_and_search_hides_old_versions(self) -> None:
+        from work_agent_core.recall.index import NodeFilter
+        from work_agent_core.recall.search import RecallDeps, search
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            # 真实规模：足够切成多个窗口，改写只影响尾部窗口，前部窗口跨文件
+            # 共享——这正是"大部分没改、只改一段"的用户场景。
+            filler = "低空经济发展的政策依据与产业现状，涉及空域管理、适航审定和基础设施建设多个方面。"
+            shared = [f"共享段落{n}：{filler}" for n in range(8)]
+            self._write_doc(base, "17号可研报告.md", shared + [f"旧版独有结论：{filler}"])
+            index, sync = fresh()
+            sync.index_directory(base)
+            newer = self._write_doc(base, "20号可研报告.md", shared + [f"新版改写后的结论：{filler}"])
+            import os
+            os.utime(newer, (1_800_000_000, 1_800_000_000))
+            sync.index_file(newer)
+
+            outcome = search(
+                RecallDeps(index=index), "共享段落", filters=NodeFilter()
+            )
+            sources = {item["source_id"] for item in outcome["results"]}
+            self.assertTrue(sources)
+            self.assertTrue(all("20号" in s for s in sources), sources)
+            self.assertTrue(outcome["retrieval"]["superseded_excluded"])
+
+            unfolded = search(
+                RecallDeps(index=index),
+                "旧版独有结论",
+                filters=NodeFilter(include_superseded=True),
+            )
+            self.assertTrue(any("17号" in item["source_id"] for item in unfolded["results"]))
+
+    def test_low_overlap_does_not_fold(self) -> None:
+        """名字像版本、内容完全不同 → 两份独立材料，谁也不压谁。"""
+
+        from work_agent_core.recall.index import NodeFilter
+        from work_agent_core.recall.search import RecallDeps, search
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            filler_a = "甲方案聚焦整机集成，围绕飞行平台与载荷的协同设计展开论证。"
+            filler_b = "乙方案聚焦空管系统，围绕通信导航监视设施的建设标准展开论证。"
+            self._write_doc(
+                base, "17号可研报告.md",
+                [f"可研甲段落{n}：{filler_a}" for n in range(8)],
+            )
+            index, sync = fresh()
+            sync.index_directory(base)
+            newer = self._write_doc(
+                base, "20号可研报告.md",
+                [f"可研乙段落{n}：{filler_b}" for n in range(8)],
+            )
+            import os
+            os.utime(newer, (1_800_000_000, 1_800_000_000))
+            sync.index_file(newer)
+
+            outcome = search(
+                RecallDeps(index=index), "方案聚焦展开论证", filters=NodeFilter()
+            )
+            sources = {item["source_id"] for item in outcome["results"]}
+            self.assertTrue(any("17号" in s for s in sources), sources)
+            self.assertTrue(any("20号" in s for s in sources), sources)
+
+    def test_reconcile_is_idempotent_and_recovers_after_forget(self) -> None:
+        from work_agent_core.recall.sync import version_family_key
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            filler = "低空经济发展的政策依据与产业现状，涉及空域管理、适航审定和基础设施建设多个方面。"
+            shared = [f"共享段落{n}：{filler}" for n in range(8)]
+            old = self._write_doc(base, "17号可研报告.md", shared)
+            index, sync = fresh()
+            sync.index_directory(base)
+            newer = self._write_doc(base, "20号可研报告.md", shared)
+            import os
+            os.utime(newer, (1_800_000_000, 1_800_000_000))
+            sync.index_file(newer)
+
+            first = index.reconcile_version_families(version_family_key)
+            self.assertGreaterEqual(first["superseded"], 1)
+            second = index.reconcile_version_families(version_family_key)
+            self.assertEqual(second["superseded"], first["superseded"])
+
+            # 新版文件被删后重算，旧版恢复可见
+            old_key = f"doc:{old.relative_to(sync.workspace_root or base).as_posix()}"
+            index.forget_source(
+                f"doc:{newer.relative_to(sync.workspace_root or base).as_posix()}"
+            )
+            index.reconcile_version_families(version_family_key)
+            info = index.superseded_info([old_key])
+            self.assertEqual(info[old_key]["superseded_by"], "")
 
 
 class PoisonedLogTests(unittest.TestCase):

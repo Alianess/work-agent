@@ -11,6 +11,7 @@ import time
 
 SESSION_SCHEMA_VERSION = 2
 DEFAULT_SESSION_DIR = Path("meet_files/conversation_history/sessions")
+TURN_RUNTIME_CONTEXT_PREFIX = "当前轮 runtime context："
 
 
 @dataclass
@@ -184,10 +185,21 @@ class SessionStore:
             exclude_last_user=exclude_last_user,
         )
 
-    def append_user_message(self, session: ConversationSession, content: str) -> None:
+    def append_user_message(
+        self,
+        session: ConversationSession,
+        content: str,
+        *,
+        runtime_context: str = "",
+    ) -> None:
         text = str(content or "").strip()
         if not text:
             raise ValueError("user message content is required")
+        context = str(runtime_context or "").strip()
+        if context:
+            if not context.startswith(TURN_RUNTIME_CONTEXT_PREFIX):
+                raise ValueError("runtime_context must use the turn runtime context prefix")
+            session.messages.append({"role": "system", "content": context})
         session.messages.append({"role": "user", "content": text})
 
     def rewind_before_user_message(
@@ -216,6 +228,8 @@ class SessionStore:
             seen_users += 1
         if cut_index is None:
             raise ValueError("The selected user message is not present in the backend session.")
+        while cut_index > 0 and is_turn_runtime_context_message(session.messages[cut_index - 1]):
+            cut_index -= 1
         session.messages = session.messages[:cut_index]
         # A summary may cover turns at or after the cut. Rebuilding it lazily is
         # safer than leaking discarded context into the new branch.
@@ -247,15 +261,20 @@ def sanitize_runtime_message(raw_message: Any) -> dict[str, Any]:
     if role == "user":
         content = str(raw_message.get("content") or "").strip()
         return {"role": "user", "content": content} if content else {}
+    if role == "system":
+        content = str(raw_message.get("content") or "").strip()
+        return {"role": "system", "content": content} if content else {}
     if role == "assistant":
         content = str(raw_message.get("content") or "")
         clean: dict[str, Any] = {"role": "assistant", "content": content}
         tool_calls = sanitize_tool_calls(raw_message.get("tool_calls"))
         if tool_calls:
             clean["tool_calls"] = tool_calls
-            reasoning_content = str(raw_message.get("reasoning_content") or "")
-            if reasoning_content:
-                clean["reasoning_content"] = reasoning_content
+        reasoning_content = str(
+            raw_message.get("reasoning_content") or raw_message.get("reasoning") or ""
+        )
+        if reasoning_content:
+            clean["reasoning_content"] = reasoning_content
         if content or tool_calls:
             return clean
         return {}
@@ -272,6 +291,14 @@ def sanitize_runtime_message(raw_message: Any) -> dict[str, Any]:
     return {}
 
 
+def is_turn_runtime_context_message(message: Any) -> bool:
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "system"
+        and str(message.get("content") or "").startswith(TURN_RUNTIME_CONTEXT_PREFIX)
+    )
+
+
 def sanitize_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
     if not isinstance(raw_tool_calls, list):
         return []
@@ -284,8 +311,21 @@ def sanitize_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
         if not name:
             continue
         arguments = function.get("arguments", raw_call.get("arguments", "{}"))
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+        if isinstance(arguments, str):
+            try:
+                parsed_arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                # Never let a malformed historical tool call poison every
+                # later request.  Its paired tool result is preserved below by
+                # ``repair_runtime_message_sequence`` as an orphan history
+                # note, while the original trace/session-log remains available
+                # for diagnosis.
+                continue
+        else:
+            parsed_arguments = arguments if arguments is not None else {}
+        if not isinstance(parsed_arguments, dict):
+            continue
+        arguments = json.dumps(parsed_arguments, ensure_ascii=False)
         cleaned.append(
             {
                 "id": str(raw_call.get("id") or f"call_{index}"),
@@ -310,6 +350,11 @@ def repair_runtime_message_sequence(messages: list[dict[str, Any]]) -> list[dict
     so the content is preserved without violating the OpenAI message schema.
     """
 
+    messages = [
+        message
+        for message in (sanitize_runtime_message(item) for item in messages)
+        if message
+    ]
     repaired: list[dict[str, Any]] = []
     index = 0
     while index < len(messages):

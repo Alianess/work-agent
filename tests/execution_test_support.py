@@ -32,6 +32,7 @@ def trusted_shell_tools_for_test(
     return ShellExecutionTools(
         root,
         execution_orchestrator=runner,
+        sandbox_auto_allow=False,
         account_id=account_id,
         turn_id=turn_id,
         conversation_id=conversation_id,

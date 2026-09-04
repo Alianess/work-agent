@@ -1,0 +1,281 @@
+{
+  "description": "recall 层检索评测集（u1 账户真实语料）。query 一律用改写/口语问法，不抄原文措辞，测的是语义与词法混合管线的真实召回能力。期望命中按 text_hash（内容级）与 source_id（来源级）双重判定；md/docx 同内容不同渲染 hash 不同，故多个 hash 均可接受。",
+  "cases": [
+    {
+      "id": "jingjiagong-equipment-count",
+      "query": "精加工平台的设备一共有多少台",
+      "note": "数字事实查询，出处：0730精加工平台会议纪要",
+      "expected": {
+        "text_hashes": [
+          "595b25e369a8ad285076da2e51ce6a5d",
+          "ae50d611923656ee0335558a590e9f4d"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md",
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/0730精加工平台运营及具身智能合作沟通会会议纪要.docx"
+        ]
+      },
+      "evidence_patterns": [
+        "五十三类七十台"
+      ]
+    },
+    {
+      "id": "jingjiagong-fee-first-year",
+      "query": "设备使用费第一年打算怎么收",
+      "note": "决定类查询：半年试运行期、首年减半",
+      "expected": {
+        "text_hashes": [
+          "595b25e369a8ad285076da2e51ce6a5d",
+          "ae50d611923656ee0335558a590e9f4d"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md",
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/0730精加工平台运营及具身智能合作沟通会会议纪要.docx"
+        ]
+      },
+      "evidence_patterns": [
+        "半年试运行期后再正式收费",
+        "首年按减半标准收取"
+      ]
+    },
+    {
+      "id": "jingjiagong-wuzhou-repair",
+      "query": "五轴加工中心当时出了什么问题",
+      "note": "改写幅度大：原文是'两台五轴加工中心技术偏差已完成返厂维修'",
+      "expected": {
+        "text_hashes": [
+          "595b25e369a8ad285076da2e51ce6a5d",
+          "ae50d611923656ee0335558a590e9f4d",
+          "12bc4118b6da1ba1432db1a36235ac7d"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md",
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/0730精加工平台运营及具身智能合作沟通会会议纪要.docx"
+        ]
+      },
+      "evidence_patterns": [
+        "两台五轴加工中心技术偏差已完成返厂维修",
+        "五轴加工中心"
+      ]
+    },
+    {
+      "id": "jingjiagong-acceptance-month",
+      "query": "竣工验收安排在几月份做",
+      "note": "时间事实：八至九月",
+      "expected": {
+        "text_hashes": [
+          "595b25e369a8ad285076da2e51ce6a5d",
+          "ae50d611923656ee0335558a590e9f4d",
+          "12bc4118b6da1ba1432db1a36235ac7d"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md",
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/0730精加工平台运营及具身智能合作沟通会会议纪要.docx"
+        ]
+      },
+      "evidence_patterns": [
+        "八至九月组织正式竣工验收"
+      ]
+    },
+    {
+      "id": "jingjiagong-pilot-platform-mode",
+      "query": "试运营效果不好之后运营模式打算怎么调",
+      "note": "改写幅度大：原文'整合为中试平台，或调整为科研设备支持'",
+      "expected": {
+        "text_hashes": [
+          "cbebb0d3ba510449bb62b91008adeb41",
+          "595b25e369a8ad285076da2e51ce6a5d",
+          "ae50d611923656ee0335558a590e9f4d"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md",
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/0730精加工平台运营及具身智能合作沟通会会议纪要.docx"
+        ]
+      },
+      "evidence_patterns": [
+        "整合为中试平台",
+        "试运营阶段投入较大"
+      ]
+    },
+    {
+      "id": "innovation-center-agreement",
+      "query": "具身智能创新中心是跟哪家单位签的协议",
+      "note": "主体事实：中国科大与省工信厅",
+      "expected": {
+        "text_hashes": [
+          "342f355a6b2b73c530d33f04ba152a30",
+          "13ee048b7ffba3de036bba0f38749b84",
+          "49e73f26dd28e6ab8574236688362ad8"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md",
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/0730精加工平台运营及具身智能合作沟通会会议纪要.docx"
+        ]
+      },
+      "evidence_patterns": [
+        "中国科大与省工业和信息化厅已签订"
+      ]
+    },
+    {
+      "id": "innovation-center-directions",
+      "query": "创新中心落地以后打算围绕哪些方向干活",
+      "note": "同段换一种问法，测语义泛化",
+      "expected": {
+        "text_hashes": [
+          "342f355a6b2b73c530d33f04ba152a30",
+          "13ee048b7ffba3de036bba0f38749b84",
+          "49e73f26dd28e6ab8574236688362ad8"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议纪要_工作提交版.md",
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/0730精加工平台运营及具身智能合作沟通会会议纪要.docx"
+        ]
+      },
+      "evidence_patterns": [
+        "高水平平台、基础研究、成果转化与场景开发"
+      ]
+    },
+    {
+      "id": "didong-special-bond",
+      "query": "低空经济专项债的盘子有多大",
+      "note": "数字事实：18.6亿，出处：内部留档版",
+      "expected": {
+        "text_hashes": [
+          "0aa19da9b7321a6eab24db9c371ed746"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议沟通内容整理_内部留档版.md"
+        ]
+      },
+      "evidence_patterns": [
+        "低空专项债 18.6 亿"
+      ]
+    },
+    {
+      "id": "suwei-criticism",
+      "query": "苏伟主任当时提了哪几条意见",
+      "note": "口语化问法，原文是'四条批评'",
+      "expected": {
+        "text_hashes": [
+          "0aa19da9b7321a6eab24db9c371ed746",
+          "cb821e3d1ba07fbd9b6fb0522f7d1e9a"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议沟通内容整理_内部留档版.md"
+        ]
+      },
+      "evidence_patterns": [
+        "苏伟主任四条批评"
+      ]
+    },
+    {
+      "id": "baohe-base-plan",
+      "query": "包河区那边下一步想建什么东西",
+      "note": "改写幅度大：原文'包河…拟建零部件加工基地'",
+      "expected": {
+        "text_hashes": [
+          "0aa19da9b7321a6eab24db9c371ed746"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/精加工平台运营及具身智能合作沟通会/精加工平台运营及具身智能合作沟通会_会议沟通内容整理_内部留档版.md"
+        ]
+      },
+      "evidence_patterns": [
+        "拟建零部件加工基地"
+      ]
+    },
+    {
+      "id": "shengu-kangyang-robot",
+      "query": "中科深谷的康养机器人准备怎么落地",
+      "note": "场景细节：按摩艾灸机器人进写字楼试点",
+      "expected": {
+        "text_hashes": [
+          "dae0be82fbb2781aa8454aae78d8424e",
+          "be2efd4b702cf006d57cfa774be0dddd",
+          "c694e231b91e65a19caf9837f4a8d7e9"
+        ],
+        "source_ids": [
+          "doc:meet_files/会议项目/中科深谷会谈/中科深谷会谈_会议纪要_工作提交版.md",
+          "doc:meet_files/会议项目/中科深谷会谈/0807中科深谷会谈会议纪要.docx"
+        ]
+      },
+      "evidence_patterns": [
+        "按摩、艾灸类康养机器人",
+        "康养机器人"
+      ]
+    },
+    {
+      "id": "longcanguan-review",
+      "query": "龙餐馆那部电影观众评价怎么样",
+      "note": "闲聊内容也要能找到：豆瓣评分段",
+      "expected": {
+        "text_hashes": [
+          "b4b9790c5c4f0b7769f903e35b8a2790",
+          "67a42041ca025fabb00f3e8f6eec2125"
+        ],
+        "source_ids": [
+          "chat:friday-main"
+        ]
+      },
+      "evidence_patterns": [
+        "豆瓣",
+        "龙餐馆"
+      ]
+    },
+    {
+      "id": "longcanguan-boxoffice",
+      "query": "龙餐馆上映后票房表现如何",
+      "note": "同来源另一事实：票房破10亿",
+      "expected": {
+        "text_hashes": [
+          "b4b9790c5c4f0b7769f903e35b8a2790",
+          "67a42041ca025fabb00f3e8f6eec2125"
+        ],
+        "source_ids": [
+          "chat:friday-main"
+        ]
+      },
+      "evidence_patterns": [
+        "票房破10亿",
+        "龙餐馆"
+      ]
+    },
+    {
+      "id": "dianziting-trainees",
+      "query": "跟上海电子厅的合作要培养多少人",
+      "note": "口语转写原文（ASR 噪音多）：'培养六十个人'",
+      "expected": {
+        "text_hashes": [
+          "56468916fc25951d99d26ad282f9f46d"
+        ],
+        "source_ids": [
+          "doc:meet_files/asr_full/20260720-164147-新录音 9/qwen3/20260720-164147-新录音 9.meeting_ready/qwen3-asr-mlx8-vad-chunked/items/chunk_0059/transcript.md",
+          "doc:meet_files/asr_full/20260720-164147-新录音 9/qwen3/20260720-164147-新录音 9.meeting_ready/qwen3-asr-mlx8-vad-chunked/transcript.md",
+          "doc:meet_files/文字稿/20260720-164147-新录音 9_会议沟通内容整理_ASR转写稿_Qwen3.txt"
+        ]
+      },
+      "evidence_patterns": [
+        "上海电子厅的助理",
+        "培养六十个人"
+      ]
+    },
+    {
+      "id": "zhongke-shenggu",
+      "query": "中科声谷这家公司是干什么的",
+      "note": "口语转写：'天天死磕教育，也没做起来'",
+      "expected": {
+        "text_hashes": [
+          "5ed875ca505176d933da9a7dbc60a6dc",
+          "ad01228db71bf1af430934faffc46754"
+        ],
+        "source_ids": [
+          "doc:meet_files/asr_full/20260731-071556-新录音 20/qwen3/20260731-071556-新录音 20.meeting_ready/qwen3-asr-mlx8-vad-chunked/transcript.txt",
+          "doc:meet_files/文字稿/20260731-071556-新录音 20_会议沟通内容整理_ASR转写稿_Qwen3.txt"
+        ]
+      },
+      "evidence_patterns": [
+        "中科声谷"
+      ]
+    }
+  ]
+}

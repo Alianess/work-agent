@@ -91,7 +91,11 @@ class RecallArchiveTests(unittest.TestCase):
                 "name": "shell_exec",
                 "content": "line 1\nline 2\nline 3\n/Users/example/work_agent/work_agent_core/history_recall.py",
             },
-            {"role": "assistant", "content": "索引版本已更新。"},
+            {
+                "role": "assistant",
+                "content": "索引版本已更新。",
+                "reasoning_content": "provider-final-private-token-stream",
+            },
         ]
 
         episode = build_recall_episodes(messages)[0]
@@ -103,6 +107,7 @@ class RecallArchiveTests(unittest.TestCase):
         self.assertNotIn("line 1", rendered)
         self.assertEqual(compacted[1]["content"], path_note)
         self.assertNotIn("reasoning_content", compacted[1])
+        self.assertNotIn("reasoning_content", compacted[3])
         self.assertIn(
             "history_recall.py",
             compacted[1]["tool_calls"][0]["function"]["arguments"],

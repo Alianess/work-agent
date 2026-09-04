@@ -85,13 +85,10 @@ dates still missing a daily report.
   `collect_work_report_evidence(report_type='daily', target_date='YYYY-MM-DD')`
   as the primary lookup. It is the authoritative date-indexed, account-level
   route and returns the existing saved report plus projected work evidence.
-- Do not use `recall_chat_history(scope='compressed')` to find work from a
-  date or another chat. `compressed` searches only summarized-away messages in
-  the current conversation, so a miss says nothing about other conversations.
-- Use `recall_chat_history` only after the evidence collector when one concrete
-  name, number, quotation, correction, or file path still needs verification.
-  Use account/project scope appropriate to the cited source; never describe a
-  current-chat compressed miss as an account-wide miss.
+- Use the core `recall` tool only after the evidence collector when one
+  concrete name, number, quotation, correction, or file path still needs
+  verification. Use account/project scope appropriate to the cited source;
+  never describe a current-chat miss as an account-wide miss.
 - Prefer Markdown/text artifacts returned by the evidence collector. Never pass
   `.docx`, `.xlsx`, `.pptx`, `.pdf`, audio, or other binary files to
   `read_file`; open those through their document/media skill only when the

@@ -73,6 +73,72 @@ class NotificationStoreTests(unittest.TestCase):
             self.assertTrue(store.mark_delivered(item["id"]))
             self.assertEqual(store.due_conversations(), [])
 
+    def test_derived_reminders_are_updated_without_becoming_unread_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStore(Path(directory) / "notifications.json")
+            first = store.sync_reminders(
+                source="attention",
+                reminders=[
+                    {
+                        "key": "recording-1",
+                        "title": "待整理录音",
+                        "body": "录音尚未整理。",
+                        "conversation_id": "friday-main",
+                    }
+                ],
+            )
+            notification_id = first["created"][0]["id"]
+            store.mark_read(notification_id)
+
+            second = store.sync_reminders(
+                source="attention",
+                reminders=[
+                    {
+                        "key": "recording-1",
+                        "title": "待整理录音",
+                        "body": "录音尚未整理，可以现在处理。",
+                        "conversation_id": "friday-main",
+                    }
+                ],
+            )
+            self.assertEqual(second["created"], [])
+            self.assertEqual(second["unread_count"], 0)
+            self.assertEqual(second["items"][0]["body"], "录音尚未整理，可以现在处理。")
+
+    def test_resolved_derived_reminder_disappears_and_can_return_later(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStore(Path(directory) / "notifications.json")
+            created = store.sync_reminders(
+                source="attention",
+                reminders=[{"key": "recording-1", "title": "待整理录音", "body": "待处理。"}],
+            )
+            first_id = created["created"][0]["id"]
+            self.assertEqual(store.sync_reminders(source="attention", reminders=[])["items"], [])
+            returned = store.sync_reminders(
+                source="attention",
+                reminders=[{"key": "recording-1", "title": "待整理录音", "body": "再次待处理。"}],
+            )
+            self.assertNotEqual(returned["created"][0]["id"], first_id)
+            self.assertEqual(returned["unread_count"], 1)
+
+    def test_deleting_an_active_derived_reminder_dismisses_it_until_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStore(Path(directory) / "notifications.json")
+            payload = store.sync_reminders(
+                source="attention",
+                reminders=[{"key": "recording-1", "title": "待整理录音", "body": "待处理。"}],
+            )
+            notification_id = payload["created"][0]["id"]
+            self.assertTrue(store.delete(notification_id))
+            self.assertEqual(store.payload()["items"], [])
+
+            repeated = store.sync_reminders(
+                source="attention",
+                reminders=[{"key": "recording-1", "title": "待整理录音", "body": "仍待处理。"}],
+            )
+            self.assertEqual(repeated["created"], [])
+            self.assertEqual(repeated["items"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

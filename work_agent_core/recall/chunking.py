@@ -466,7 +466,13 @@ def build_chat_tree(
             content = str(message.get("content") or "").strip()
             if not content:
                 continue
-            speaker = {"user": "用户", "assistant": "助手"}.get(role, role or "系统")
+            speaker = {"user": "用户", "assistant": "助手", "tool": "工具结果"}.get(
+                role, role or "系统"
+            )
+            # 工具结果的节点 title 固定为"工具结果"——这是给向量补算看的
+            # 排除标记（leaves_without_vectors 跳过它们）：词法要能找回命令
+            # 回显和报错原文，语义索引收它只会稀释真正的对话。
+            node_title = "工具结果" if role == "tool" else f"{speaker}发言"
             for passage in split_passages(content):
                 ordinal += 1
                 passage_node = tree.add(
@@ -476,7 +482,7 @@ def build_chat_tree(
                         source_kind=source_kind,
                         parent_id=turn_node.id,
                         path=path,
-                        title=f"{speaker}发言",
+                        title=node_title,
                         text=f"{speaker}：{passage.text}",
                         occurred_at=occurred_at,
                         is_leaf=False,
@@ -492,6 +498,7 @@ def build_chat_tree(
                             source_kind=source_kind,
                             parent_id=passage_node.id,
                             path=path,
+                            title=node_title,
                             text=f"{speaker}：{window.text}",
                             occurred_at=occurred_at,
                             is_leaf=True,

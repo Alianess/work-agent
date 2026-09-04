@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 
+from .approval_rules import find_remembered_approval
 from .execution import (
     CapabilitySet,
     CommandSpec,
@@ -21,6 +22,7 @@ from .execution import (
     ExecutionOrchestrator,
     ExecutionRequest,
 )
+from .execution.policy import capability_template
 from .execution.events import ExecutionEvent
 from .execution.workspace import DEFAULT_EXCLUDED_NAMES
 from .progress import current_tool_cancel_check, emit_tool_progress
@@ -124,8 +126,10 @@ class ShellExecutionTools:
         turn_id: str = "",
         conversation_id: str = "",
         project_id: str = "",
-        sandbox_auto_allow: bool = False,
+        sandbox_auto_allow: bool = True,
         sandbox_in_place: bool = True,
+        extra_read_roots: tuple[Path, ...] = (),
+        approval_rules_path: str | Path | None = None,
     ) -> None:
         self.sandbox_in_place = bool(sandbox_in_place)
         # When the command will run under an OS-enforced sandbox that already
@@ -134,12 +138,16 @@ class ShellExecutionTools:
         # adds no boundary — it only adds a click. Auto-allow keeps the fixed
         # circuit breakers and lets everything the sandbox contains just run.
         self.sandbox_auto_allow = bool(sandbox_auto_allow)
-        self.workspace = WorkspaceFiles(workspace_root)
+        # 记住的审批：用户点过「确认并记住」的命令，下一次原样出现时自动放行。
+        # 只做精确命令匹配，DELETE/SYSTEM 永远不进这份名单。
+        self.approval_rules_path = Path(approval_rules_path) if approval_rules_path else None
+        self.workspace = WorkspaceFiles(workspace_root, extra_read_roots=extra_read_roots)
         self.workspace_root = self.workspace.workspace_root
         self.runtime_workspace_root = Path(runtime_workspace_root or self.workspace_root).resolve()
         self.execution_orchestrator = execution_orchestrator or ExecutionOrchestrator(
             workspace_root=self.workspace_root,
             runtime_workspace_root=self.runtime_workspace_root,
+            extra_read_roots=extra_read_roots,
         )
         self.account_id = str(account_id or "local")
         self.turn_id = str(turn_id or "")
@@ -172,6 +180,14 @@ class ShellExecutionTools:
         decision = self._decide_pipeline(stages, cwd)
         if self.sandbox_auto_allow:
             decision = self._sandbox_auto_allowed_pipeline(stages, decision)
+        if decision.status == "ask" and self.approval_rules_path is not None:
+            remembered = find_remembered_approval(self.approval_rules_path, command_text)
+            if remembered is not None:
+                decision = ShellDecision(
+                    "allow",
+                    f"此命令你此前已确认并记住（{remembered.get('risk_category')}），本次自动放行。",
+                    str(remembered.get("risk_category") or decision.risk_category),
+                )
         isolation_note = snapshot_isolation_note(command_text, cwd)
         action_id = approval_action_id(
             command=command_text,
@@ -218,7 +234,7 @@ class ShellExecutionTools:
                         risk_category=decision.risk_category,
                         reason=decision.reason,
                     ),
-                    "next_step": "由独立审查智能体或用户确认当前精确动作后，系统使用内部审批凭证重试。",
+                    "next_step": "由无工具安全策略分类器或用户确认当前精确动作后，系统使用内部审批凭证重试。",
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -231,7 +247,14 @@ class ShellExecutionTools:
             f"toolcall:{self.turn_id or self.conversation_id or 'standalone'}:{execution_id_seed}"
         )
         managed_argv = self._shell_argv(command_text, stages)
-        default_capabilities = CapabilitySet()
+        # Network is never inferred from the command. Only the narrow package
+        # manager grammar can request the dependency capability; the execution
+        # policy still requires its broker and fixed-deny checks.
+        default_capabilities = (
+            capability_template("project_dependencies")
+            if any(is_dependency_install_command(stage) for stage in stages)
+            else CapabilitySet()
+        )
         execution = self.execution_orchestrator.submit(
             ExecutionRequest(
                 request_id=f"shell_{execution_identity}",
@@ -249,11 +272,12 @@ class ShellExecutionTools:
                     cwd=".",
                     env={"WORK_AGENT_RUNTIME": "isolated"},
                 ),
-                requested_capabilities=CapabilitySet(
+                requested_capabilities=replace(
+                    default_capabilities,
                     resources=replace(
                         default_capabilities.resources,
                         wall_timeout_seconds=timeout_seconds,
-                    )
+                    ),
                 ),
                 delivery_mode=(
                     "discard_changes"
@@ -295,6 +319,7 @@ class ShellExecutionTools:
                 **({"isolated_workspace_note": isolation_note} if isolation_note else {}),
                 "permission": decision.status,
                 "risk_category": decision.risk_category,
+                "policy_reason": decision.reason,
                 "command": command_text,
                 "cwd": str(cwd),
                 "returncode": execution.process.exit_code if execution.process else None,
@@ -546,6 +571,8 @@ class ShellExecutionTools:
         executable = Path(argv[0]).name
         if decision.risk_category in {"DELETE", "SYSTEM"}:
             return decision
+        if is_dependency_install_command(argv):
+            return decision
         if executable in NEVER_SANDBOX_AUTO_ALLOWED:
             return decision
         return ShellDecision(
@@ -766,7 +793,9 @@ def register_shell_tools(
     turn_id: str = "",
     conversation_id: str = "",
     project_id: str = "",
-    sandbox_auto_allow: bool = False,
+    sandbox_auto_allow: bool = True,
+    extra_read_roots: tuple[Path, ...] = (),
+    approval_rules_path: str | Path | None = None,
 ) -> None:
     shell = ShellExecutionTools(
         workspace_root,
@@ -777,45 +806,33 @@ def register_shell_tools(
         conversation_id=conversation_id,
         project_id=project_id,
         sandbox_auto_allow=sandbox_auto_allow,
+        extra_read_roots=extra_read_roots,
+        approval_rules_path=approval_rules_path,
     )
     registry.register(
         Tool(
             name="shell_exec",
             description=(
-                "Run a controlled terminal command inside a private macOS Seatbelt workspace. The response includes a risk_category: "
-                "READ, MODIFY, EXECUTE, NETWORK, DELETE, or SYSTEM. Safe read-only commands "
-                "(pwd/ls/find/rg/cat/head/tail/wc/file/stat/du and read-only git subcommands) run automatically. "
-                "Commands that may write files, delete a specific workspace target, run scripts, install packages, use the network, "
-                "or take a long time return approval_required with a preview. Broad deletion, sensitive access, and boundary escapes "
-                "are denied by fixed policy. "
-                "The command runs in the real workspace, so user data under meet_files/ is visible; the sandbox denies network "
-                "access and every write outside the workspace. "
-                "Do not use this tool to read, concatenate, create, or edit text/Markdown files; use the dedicated workspace file tools. "
-                "Prefer an existing core file tool or a skill tool whenever one can do the job; reach for this tool only when a "
-                "terminal is genuinely required. When approval is needed, call the tool and let it return approval_required — never "
-                "ask the user in prose to reply with 确认 or 允许执行, never simulate an approval in a content-only message, never "
-                "describe a command you have not actually issued as pending approval, and never claim or retry around an approval "
-                "decision. A denied command stays denied. If the isolation backend is unavailable, do not request approval for a "
-                "terminal action that is certain to fail; if a file tool can deliver the same result, switch to it and continue. "
-                "Pipes, redirection, && / || / ; chains and globs are supported and run through a real shell; every stage is "
-                "checked against the same policy and a redirect target outside the workspace is refused. Command substitution "
-                "$(...) and backticks are refused because the program they reach is only decided at run time. "
-                "stdout is capped at 20000 chars and stderr at 12000; when a stream is cut, the full text is written to a "
-                "workspace file and its path is returned as stdout_full_path / stderr_full_path — read that file when you need "
-                "the part that was cut. "
-                "A nonzero returncode is a failed command; do not report "
-                "a verification suite as fully passed unless every required check succeeded. If native isolation is unavailable, "
-                "the command fails closed and never silently runs on the host."
+                "Run a terminal command when no dedicated core or skill tool fits. "
+                "Prefer workspace file tools for reading or editing files."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "A shell command line. Pipes, redirection, && / || / ; chains and globs work. Command substitution $(...) and backticks are refused. Treat any nonzero returncode as a failed check.",
+                        "description": "The shell command line to run.",
                     },
-                    "cwd": {"type": "string", "default": "."},
-                    "timeout_seconds": {"type": "integer", "default": 120},
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory, relative to the workspace.",
+                        "default": ".",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Maximum runtime in seconds.",
+                        "default": 120,
+                    },
                 },
                 "required": ["command"],
             },
@@ -935,13 +952,52 @@ def risk_category_for_executable(executable: str) -> str:
     return "EXECUTE"
 
 
+def is_dependency_install_command(argv: list[str]) -> bool:
+    """Recognize installs that may use only the project dependency broker."""
+    if not argv:
+        return False
+    executable = Path(argv[0]).name
+    args = argv[1:]
+    if executable in {"pip", "pip3"}:
+        return bool(args and args[0] in {"install", "download"})
+    if executable in {"python", "python3"}:
+        return len(args) >= 3 and args[:2] == ["-m", "pip"] and args[2] in {"install", "download"}
+    if executable in {"npm", "pnpm"}:
+        return bool(args and args[0] in {"install", "i", "ci", "add"})
+    return False
+
+
+def dependency_install_is_scoped(argv: list[str]) -> bool:
+    """Reject alternate registries, URLs, git sources and credential flags."""
+    if not is_dependency_install_command(argv):
+        return False
+    forbidden = ("http://", "https://", "git+", "git://", "ssh://", "--index-url", "--extra-index-url", "--registry", "--proxy")
+    sensitive_flags = {
+        "--token",
+        "--password",
+        "--username",
+        "--auth-type",
+        "--_authtoken",
+        "--trusted-host",
+        "--cert",
+        "--client-cert",
+    }
+    lowered = [item.lower() for item in argv]
+    return not any(
+        any(marker in item for marker in forbidden)
+        or item in sensitive_flags
+        or any(item.startswith(flag + "=") for flag in sensitive_flags)
+        for item in lowered
+    )
+
+
 def is_auto_approvable_command(argv: list[str], decision: ShellDecision) -> bool:
     """Return whether the optional approval delegate may approve this command.
 
     This is deliberately narrower than the ordinary ``ask`` bucket.  The
-    delegate can approve local, workspace-confined artifact operations and a
-    small set of verification commands, but never package installation,
-    networking, git mutation, unknown programs, or general-purpose scripts.
+    sandbox can directly contain ordinary artifact operations and a small set
+    of verification commands. Dependency installation is intentionally outside
+    this free path and goes to the semantic reviewer with a scoped capability.
     """
     if decision.status != "ask" or not argv:
         return False
@@ -968,7 +1024,7 @@ def is_auto_approvable_command(argv: list[str], decision: ShellDecision) -> bool
 REVIEWABLE_PROJECT_RUNTIMES = frozenset({"python", "python3", "node"})
 # Installers persist state on purpose, so the sandbox containing them is not the
 # same as the change being wanted.
-NEVER_SANDBOX_AUTO_ALLOWED = frozenset({"pip", "pip3", "conda", "npm", "pnpm", "npx", "rm", "rmdir"})
+NEVER_SANDBOX_AUTO_ALLOWED = frozenset({"pip", "pip3", "conda", "npx", "rm", "rmdir"})
 NEVER_REVIEWABLE_EXECUTABLES = frozenset({"pip", "pip3", "conda", "npm", "pnpm", "npx"})
 
 
@@ -977,21 +1033,22 @@ def is_model_reviewable_command(argv: list[str], decision: ShellDecision) -> boo
 
     ``ask`` means the user may approve an exact action; it does not mean a
     model reviewer may. The reviewer additionally gets workspace-confined
-    scripts under the project's own interpreters, because refusing those made
-    "review for me" unable to clear the ordinary work it exists for. Package
-    installation, networking, deletion and unknown binaries stay outside: those
-    are the cases where a wrong call is not recoverable by discarding changes.
+    scripts under the project's own interpreters and scoped dependency
+    installation. Deletion, privilege escalation and unknown binaries stay
+    outside the reviewer boundary.
     """
 
     if is_auto_approvable_command(argv, decision):
         return True
     if decision.status != "ask" or not argv:
         return False
-    if decision.risk_category in {"DELETE", "SYSTEM", "NETWORK"}:
+    if decision.risk_category in {"SYSTEM", "DELETE"}:
         return False
     executable = Path(argv[0]).name
-    if executable in NEVER_REVIEWABLE_EXECUTABLES:
+    if executable in NEVER_REVIEWABLE_EXECUTABLES and not dependency_install_is_scoped(argv):
         return False
+    if is_dependency_install_command(argv):
+        return dependency_install_is_scoped(argv)
     return executable in REVIEWABLE_PROJECT_RUNTIMES
 
 
@@ -1020,11 +1077,11 @@ def decide_find(argv: list[str], cwd: Path, workspace_root: Path) -> ShellDecisi
 
 
 def decide_rm(argv: list[str], cwd: Path, workspace_root: Path) -> ShellDecision:
-    """Require an explicit user approval for every bounded deletion.
+    """Validate deletion scope; authorization happens upstream.
 
-    The shell tool cannot prove that the user asked to remove this exact file.
-    It therefore only validates scope here; it never silently authorizes the
-    deletion and never delegates DELETE approval to a model reviewer.
+    This only checks scope: recursive/wildcard/root/parent/out-of-workspace and
+    directory targets are hard-denied here and never reach a reviewer. A bounded
+    single-file deletion returns ``ask`` and remains an explicit human boundary.
     """
     if len(argv) < 2:
         return ShellDecision("deny", "rm 没有明确删除目标。", "DELETE")

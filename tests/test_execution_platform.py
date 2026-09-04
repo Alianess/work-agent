@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 from unittest.mock import patch
 import subprocess
 import tempfile
@@ -85,7 +86,7 @@ class ExecutionPlatformTests(unittest.TestCase):
         self.assertTrue(result.change_set_id)
         self.assertTrue((self.execution_root / "receipts").exists() or self.orchestrator.store.receipt(result.execution_id))
 
-    def test_domain_permission_is_recorded_then_fails_closed_without_a_network_broker(self) -> None:
+    def test_domain_permission_is_recorded_and_never_falls_back_to_host_network(self) -> None:
         orchestrator = ExecutionOrchestrator(
             workspace_root=self.root,
             execution_root=self.execution_root,
@@ -116,10 +117,32 @@ class ExecutionPlatformTests(unittest.TestCase):
             source_root=self.root,
         )
 
-        self.assertEqual(resumed.status, ExecutionStatus.FAILED)
-        self.assertEqual(resumed.error.code, "NETWORK_BROKER_UNAVAILABLE")
+        self.assertIn(resumed.status, {ExecutionStatus.FAILED, ExecutionStatus.PARTIAL})
+        self.assertNotEqual(resumed.error.code if resumed.error else "", "NETWORK_BROKER_UNAVAILABLE")
         stored_permission = orchestrator.store.permission(permission["permission_request_id"])
         self.assertEqual(stored_permission["status"], "allowed")
+
+    def test_reviewer_gated_project_dependency_does_not_create_second_user_prompt(self) -> None:
+        request = self.request(
+            key="reviewed-dependency",
+            command=CommandSpec(argv=("npm", "install")),
+            capabilities=CapabilitySet(
+                network=NetworkScope(
+                    mode="domain_allowlist",
+                    allowed_domains=("registry.npmjs.org",),
+                )
+            ),
+        )
+        request = replace(request, tool_name="shell_exec")
+        result = self.orchestrator.submit(request, source_root=self.root)
+
+        self.assertNotEqual(result.status, ExecutionStatus.WAITING_PERMISSION)
+        self.assertFalse(
+            any(
+                event["type"] == "permission.requested"
+                for event in self.orchestrator.store.events(result.execution_id)
+            )
+        )
 
     def test_apply_conflict_never_overwrites_newer_source_file(self) -> None:
         (self.root / "source.txt").write_text("before\n", encoding="utf-8")
@@ -237,6 +260,19 @@ class ExecutionPlatformTests(unittest.TestCase):
         self.assertIn('(subpath "/Users/example/workspace/snapshot")', profile)
         self.assertIn('(subpath "/Users/example/runtime")', profile)
         self.assertIn("(deny appleevent-send)", profile)
+
+    def test_seatbelt_dependency_profile_only_connects_to_ephemeral_broker(self) -> None:
+        profile = SeatbeltBackend._profile(
+            Path("/Users/example/workspace/snapshot"),
+            (Path("/Users/example/runtime"),),
+            network_broker_port=43123,
+            dependency_write_root=Path("/Users/example/runtime/.venv"),
+        )
+
+        self.assertIn("(deny network*)", profile)
+        self.assertIn('(allow network-outbound (remote ip "localhost:43123"))', profile)
+        self.assertIn('(subpath "/Users/example/runtime/.venv")', profile)
+        self.assertNotIn('(remote ip "*:443")', profile)
 
 
 if __name__ == "__main__":
