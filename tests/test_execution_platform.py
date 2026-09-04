@@ -117,7 +117,12 @@ class ExecutionPlatformTests(unittest.TestCase):
             source_root=self.root,
         )
 
-        self.assertIn(resumed.status, {ExecutionStatus.FAILED, ExecutionStatus.PARTIAL})
+        self.assertEqual(resumed.status, ExecutionStatus.SUCCEEDED)
+        # 批准后命令不再以失败体现网络隔离：profile 全拒网络，仅放行本地代理
+        # 端口，能否出网由 NetworkBroker 的域白名单决定，宿主网络仍然不可达。
+        profile = (self.execution_root / "logs" / waiting.execution_id / "seatbelt.sb").read_text(encoding="utf-8")
+        self.assertIn("(deny network*)", profile)
+        self.assertIn('(allow network-outbound (remote ip "localhost:', profile)
         self.assertNotEqual(resumed.error.code if resumed.error else "", "NETWORK_BROKER_UNAVAILABLE")
         stored_permission = orchestrator.store.permission(permission["permission_request_id"])
         self.assertEqual(stored_permission["status"], "allowed")
