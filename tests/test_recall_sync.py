@@ -357,7 +357,7 @@ class ProjectScopeTests(unittest.TestCase):
             all(item["source_id"] == "chat:c-in" for item in outcome["results"])
         )
 
-    def test_recall_tool_scope_project_requires_a_project(self) -> None:
+    def test_recall_tool_scope_project_degrades_without_a_project(self) -> None:
         from work_agent_core.recall.tools import register_recall_tools
         from work_agent_core.tools import ToolRegistry
 
@@ -367,8 +367,11 @@ class ProjectScopeTests(unittest.TestCase):
 
             tool = registry.get("recall")
             self.assertEqual(tool.parameters["properties"]["scope"]["enum"], ["all"])
-            with self.assertRaises(ValueError):
+            # 会话不在项目里时 scope=project 不再报错：降级为账户级并说明原因。
+            outcome = json.loads(
                 registry.get("recall").handler({"query": "中试基地", "scope": "project"})
+            )
+            self.assertEqual(outcome["scope_note"], "当前会话不在任何项目里，scope=project 已自动降级为 scope=all。")
 
     def test_recall_excludes_the_fully_replayed_current_conversation_and_bounds_text(self) -> None:
         from work_agent_core.recall.tools import recall_index_for, register_recall_tools

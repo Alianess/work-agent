@@ -363,6 +363,90 @@ def is_transport_failure(error: BaseException | None) -> bool:
     return bool(retryable_status(error))
 
 
+def chat_tools_stream_with_fallback(
+    client: "OpenAICompatibleClient",
+    messages: list[Message],
+    *,
+    profile: ModelProfile,
+    fallback_profiles: tuple[ModelProfile, ...] = (),
+    **kwargs: Any,
+) -> tuple["LLMResponse", ModelProfile]:
+    """按声明顺序尝试主 profile 与备用 profile。
+
+    切换只发生在"一个字的模型输出都没有"的传输故障上——拒连、DNS、超时。
+    模型已经开始说话后的中断走同端点恢复，换模型等于让另一个人接着说半句话。
+    切换本身通过 ``fallback_started`` 状态块通知上层，前端据此展示。
+    """
+
+    candidates: tuple[ModelProfile, ...] = (profile, *fallback_profiles)
+    on_delta = kwargs.get("on_delta")
+    cancel_event = kwargs.get("cancel_event")
+    last_error: BaseException | None = None
+    for index, candidate in enumerate(candidates):
+        produced_output = False
+
+        def counting_on_delta(chunk: Any, *, _inner: Any | None = on_delta) -> None:
+            nonlocal produced_output
+            if any(
+                str(getattr(chunk, field, "") or "")
+                for field in ("content", "reasoning", "tool_name", "tool_arguments")
+            ):
+                produced_output = True
+            if _inner is not None:
+                _inner(chunk)
+
+        try:
+            response = client.chat_tools_stream(
+                messages,
+                profile=candidate,
+                on_delta=counting_on_delta,
+                **{key: value for key, value in kwargs.items() if key != "on_delta"},
+            )
+            return response, candidate
+        except Exception as error:  # noqa: BLE001 - 交给 is_transport_failure 判定
+            last_error = error
+            if produced_output or not is_transport_failure(error):
+                raise
+            if cancel_event is not None and cancel_event.is_set():
+                raise
+            if index + 1 >= len(candidates):
+                raise
+            if on_delta is not None:
+                on_delta(
+                    LLMStreamChunk(
+                        status="fallback_started",
+                        status_detail=(
+                            f"{candidate.display_endpoint_label} 连不上，改用备用模型 "
+                            f"{candidates[index + 1].display_endpoint_label}"
+                        ),
+                    )
+                )
+    raise last_error if last_error else RuntimeError("LLM request failed")
+
+
+def chat_with_fallback(
+    client: "OpenAICompatibleClient",
+    messages: list[Message],
+    *,
+    profile: ModelProfile,
+    fallback_profiles: tuple[ModelProfile, ...] = (),
+    **kwargs: Any,
+) -> tuple["LLMResponse", ModelProfile]:
+    """非流式请求的备用链。压缩、审查这类后台调用也得能在端点故障下活下来。"""
+
+    candidates: tuple[ModelProfile, ...] = (profile, *fallback_profiles)
+    last_error: BaseException | None = None
+    for index, candidate in enumerate(candidates):
+        try:
+            response = client.chat(messages, profile=candidate, **kwargs)
+            return response, candidate
+        except Exception as error:  # noqa: BLE001 - 交给 is_transport_failure 判定
+            last_error = error
+            if not is_transport_failure(error) or index + 1 >= len(candidates):
+                raise
+    raise last_error if last_error else RuntimeError("LLM request failed")
+
+
 class OpenAICompatibleClient:
     """Minimal OpenAI-compatible chat completions client.
 

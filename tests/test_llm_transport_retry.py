@@ -1,7 +1,8 @@
-"""连不上端点时，重试同一个端点——绝不换端点。
+"""连不上端点时，重试同一个端点；重试耗尽后走 profile 显式声明的备用链。
 
-换端点等于悄悄换模型：同一份材料换个 endpoint 写出来不是同一份东西，
-而用户不会知道换过。所以传输故障只做同端点退避重试。
+换端点等于换模型：同一份材料换个 endpoint 写出来不是同一份东西。所以传输
+故障先做同端点退避重试；链上的备用 profile 必须由用户在配置里逐个声明，
+且每次切换都通过 fallback_started 状态显式宣布，绝不静默换端点。
 """
 
 from __future__ import annotations
@@ -219,6 +220,172 @@ class RecoveryRetryBudgetTests(unittest.TestCase):
         self.assertIsNotNone(failure)
         self.assertIn("正在限流", str(failure))
         self.assertNotIn("提额", str(failure))
+
+
+class _FakeFallbackClient:
+    """备用链包装层的假客户端；真客户端内部的退避重试由既有测试覆盖。"""
+
+    def __init__(self) -> None:
+        self.chat_plan: list[str] = []
+        self.stream_plan: list[str] = []
+        self.chat_calls: list[str] = []
+        self.stream_calls: list[str] = []
+
+    def chat(self, _messages, *, profile, **_kwargs):
+        self.chat_calls.append(profile.name)
+        action = self.chat_plan.pop(0)
+        if action == "refuse":
+            raise ConnectionError(61, "Connection refused")
+        if action == "reject":
+            raise RuntimeError("LLM request failed with HTTP 400: bad request")
+        return llm_module.LLMResponse(content="ok", raw={})
+
+    def chat_tools_stream(self, _messages, *, profile, on_delta=None, **_kwargs):
+        self.stream_calls.append(profile.name)
+        action = self.stream_plan.pop(0)
+        if action == "refuse":
+            raise ConnectionError(61, "Connection refused")
+        if action == "reject":
+            raise RuntimeError("LLM request failed with HTTP 400: bad request")
+        if action == "emit_then_refuse":
+            if on_delta is not None:
+                on_delta(llm_module.LLMStreamChunk(content="先说了半句"))
+            raise ConnectionError(61, "Connection refused")
+        return llm_module.LLMResponse(content="ok", raw={})
+
+
+class FallbackChainTests(unittest.TestCase):
+    def _profiles(self) -> tuple[ModelProfile, ModelProfile]:
+        primary = ModelProfile(
+            name="primary",
+            provider="openai-compatible",
+            base_url="https://primary.invalid/v1",
+            model="m",
+            api_key_env="UNUSED",
+            fallback_profiles=("backup",),
+        )
+        backup = ModelProfile(
+            name="backup",
+            provider="openai-compatible",
+            base_url="https://backup.invalid/v1",
+            model="m2",
+            api_key_env="UNUSED",
+        )
+        return primary, backup
+
+    def test_stream_fallback_engages_when_no_model_output_yet(self) -> None:
+        client = _FakeFallbackClient()
+        client.stream_plan = ["refuse", "ok"]
+        seen: list[llm_module.LLMStreamChunk] = []
+        primary, backup = self._profiles()
+
+        _response, used = llm_module.chat_tools_stream_with_fallback(
+            client,
+            [],
+            profile=primary,
+            fallback_profiles=(backup,),
+            on_delta=seen.append,
+        )
+
+        self.assertEqual(used.name, "backup")
+        self.assertEqual(client.stream_calls, ["primary", "backup"])
+        self.assertTrue(any(chunk.status == "fallback_started" for chunk in seen))
+
+    def test_stream_fallback_never_switches_after_model_output_started(self) -> None:
+        client = _FakeFallbackClient()
+        client.stream_plan = ["emit_then_refuse"]
+        primary, backup = self._profiles()
+
+        with self.assertRaises(ConnectionError):
+            llm_module.chat_tools_stream_with_fallback(
+                client, [], profile=primary, fallback_profiles=(backup,)
+            )
+
+        self.assertEqual(client.stream_calls, ["primary"])
+
+    def test_non_transport_failure_does_not_switch_profile(self) -> None:
+        client = _FakeFallbackClient()
+        client.stream_plan = ["reject"]
+        primary, backup = self._profiles()
+
+        with self.assertRaises(RuntimeError):
+            llm_module.chat_tools_stream_with_fallback(
+                client, [], profile=primary, fallback_profiles=(backup,)
+            )
+
+        self.assertEqual(client.stream_calls, ["primary"])
+
+    def test_exhausted_chain_raises_the_last_error(self) -> None:
+        client = _FakeFallbackClient()
+        client.stream_plan = ["refuse", "refuse"]
+        primary, backup = self._profiles()
+
+        with self.assertRaises(ConnectionError):
+            llm_module.chat_tools_stream_with_fallback(
+                client, [], profile=primary, fallback_profiles=(backup,)
+            )
+
+        self.assertEqual(client.stream_calls, ["primary", "backup"])
+
+    def test_nonstream_chat_fallback_walks_the_declared_chain(self) -> None:
+        client = _FakeFallbackClient()
+        client.chat_plan = ["refuse", "ok"]
+        primary, backup = self._profiles()
+
+        response, used = llm_module.chat_with_fallback(
+            client, [], profile=primary, fallback_profiles=(backup,)
+        )
+
+        self.assertEqual(response.content, "ok")
+        self.assertEqual(used.name, "backup")
+        self.assertEqual(client.chat_calls, ["primary", "backup"])
+
+    def test_registry_resolves_chain_skipping_self_missing_and_cycles(self) -> None:
+        from work_agent_core.config import ModelRegistry
+
+        primary, backup = self._profiles()
+        loop = ModelProfile(
+            name="loop",
+            provider="openai-compatible",
+            base_url="https://loop.invalid/v1",
+            model="m3",
+            api_key_env="UNUSED",
+            fallback_profiles=("primary", "missing"),
+        )
+        # 真环：a -> b -> a。b 的备用 a 已在链上，跳过，不能死循环。
+        profile_a = ModelProfile(
+            name="cycle-a",
+            provider="openai-compatible",
+            base_url="https://a.invalid/v1",
+            model="ma",
+            api_key_env="UNUSED",
+            fallback_profiles=("cycle-b",),
+        )
+        profile_b = ModelProfile(
+            name="cycle-b",
+            provider="openai-compatible",
+            base_url="https://b.invalid/v1",
+            model="mb",
+            api_key_env="UNUSED",
+            fallback_profiles=("cycle-a",),
+        )
+
+        registry = ModelRegistry(
+            {
+                "primary": primary,
+                "backup": backup,
+                "loop": loop,
+                "cycle-a": profile_a,
+                "cycle-b": profile_b,
+            },
+            "primary",
+        )
+        # loop -> primary -> backup 是合法的传递链；missing 缺失，跳过。
+        self.assertEqual(
+            [p.name for p in registry.fallback_chain(loop)],
+            ["primary", "backup"],
+        )
+        self.assertEqual([p.name for p in registry.fallback_chain(profile_a)], ["cycle-b"])
 
 
 if __name__ == "__main__":

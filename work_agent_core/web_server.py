@@ -94,6 +94,7 @@ from .message_channel import ChannelMessage, ChannelReply
 from .notifications import NotificationStore
 from .conversation_repository import ConversationRepository
 from .host_services.apple_pim import ApplePimService
+from .host_services.desktop_notify import notify as desktop_notify
 from .office_preview import OFFICE_TO_PDF_EXTENSIONS, convert_office_to_pdf
 from .office_workspace import merge_pdfs, relative_workspace_path, save_pdf_input
 from .session_log import (
@@ -665,11 +666,19 @@ def friday_scheduler_loop() -> None:
                 if audit.get("notify"):
                     schedule_automatic_daily_reports(user, audit)
                 notification_store.claim_due(kind="reminder")
+                desktop_notifications_on = bool(load_agent_settings().get("desktop_notifications", True))
                 for item in notification_store.due_conversations():
                     append_friday_proactive_message(
                         str(item.get("body") or ""),
                         message_id=str(item.get("id") or ""),
                     )
+                    if desktop_notifications_on:
+                        # 主动性要长在系统上，不能只活在没人盯着的页面里。
+                        desktop_notify(
+                            str(item.get("title") or "Friday"),
+                            str(item.get("body") or ""),
+                            subtitle="Friday",
+                        )
                     notification_store.mark_delivered(str(item.get("id") or ""))
                 run_attention_pass(user)
                 run_recall_maintenance(user)
@@ -794,6 +803,13 @@ def run_attention_pass(user: AuthUser) -> None:
         if isinstance(item, dict)
     }
     newly_visible = [item for item in current if item.dedup_key() in created_keys]
+    if load_agent_settings().get("desktop_notifications", True):
+        for observation in newly_visible[:3]:
+            desktop_notify(
+                ATTENTION_NOTIFICATION_TITLES.get(observation.source, "Friday 提醒"),
+                observation.summary,
+                subtitle="Friday",
+            )
     message = compose_message(select_observations(newly_visible))
     if message:
         append_friday_proactive_message(message)
@@ -2494,6 +2510,20 @@ def validate_registration_invite(payload: dict[str, Any]) -> None:
 
 def load_registry() -> ModelRegistry:
     return ModelRegistry.load(WORKSPACE_ROOT / CONFIG_PATH)
+
+
+def profile_fallback_chain(profile: ModelProfile) -> tuple[ModelProfile, ...]:
+    """主端点连不上时按序尝试的备用模型，来自 profile 声明的 fallback_profiles。
+
+    配置损坏最多意味着"没有备用"，不能让一轮对话因此启动失败。
+    """
+
+    if not getattr(profile, "fallback_profiles", ()):
+        return ()
+    try:
+        return load_registry().fallback_chain(profile)
+    except Exception:
+        return ()
 
 
 def profile_payload(profile: ModelProfile, default_profile: str) -> dict[str, Any]:
@@ -7170,6 +7200,7 @@ def run_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
     agent = ReActAgent(
         client=client,
         profile=profile,
+        fallback_profiles=profile_fallback_chain(profile),
         tools=tools,
         workspace_root=account_workspace_root(),
         max_steps=max_steps,
@@ -7434,6 +7465,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 session,
                 reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
                 force=True,
+                fallback_profiles=profile_fallback_chain(profile),
             )
         except ContextCompactionError as error:
             debug_trace.emit("explicit_compaction_failed", error=str(error))
@@ -7490,6 +7522,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             profile,
             session,
             reserved_tokens=profile.max_tokens + CHAT_RUNTIME_OVERHEAD_RESERVE_TOKENS,
+            fallback_profiles=profile_fallback_chain(profile),
         )
     except ContextCompactionError as error:
         repository.checkpoint(session)
@@ -7604,6 +7637,7 @@ def run_agent_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
     agent = ReActAgent(
         client=client,
         profile=profile,
+        fallback_profiles=profile_fallback_chain(profile),
         tools=tools,
         workspace_root=account_workspace_root(),
         max_steps=max_steps,
@@ -7857,6 +7891,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 force=True,
                 inspection=memory_inspection,
                 cancel_check=turn_runtime.cancelled,
+                fallback_profiles=profile_fallback_chain(profile),
             )
         except ContextCompactionCancelled:
             debug_trace.emit("explicit_stream_compaction_cancelled")
@@ -7976,6 +8011,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
             reserved_tokens=reserved_tokens,
             inspection=memory_inspection,
             cancel_check=turn_runtime.cancelled,
+            fallback_profiles=profile_fallback_chain(profile),
         )
     except ContextCompactionCancelled:
         debug_trace.emit("automatic_stream_compaction_cancelled")
@@ -8118,6 +8154,7 @@ def _run_agent_chat_events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     agent = ReActAgent(
         client=client,
         profile=profile,
+        fallback_profiles=profile_fallback_chain(profile),
         tools=tools,
         workspace_root=account_workspace_root(),
         max_steps=max_steps,
@@ -8473,6 +8510,7 @@ def approve_turn_events(turn_id: str, payload: dict[str, Any]) -> Iterable[dict[
     agent = ReActAgent(
         client=client,
         profile=profile,
+        fallback_profiles=profile_fallback_chain(profile),
         tools=tools,
         workspace_root=account_workspace_root(),
         max_steps=max(1, min(int(pending_approval.get("max_steps") or DEFAULT_MAX_STEPS), 60)),

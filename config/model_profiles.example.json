@@ -10,7 +10,8 @@
       "temperature": 0.6,
       "max_tokens": 16384,
       "timeout_seconds": 120,
-      "supports_vision": false
+      "supports_vision": false,
+      "fallback_profiles": ["dots3-note"]
     },
     {
       "name": "dots3-note",

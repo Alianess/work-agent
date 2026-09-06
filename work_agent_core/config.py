@@ -183,6 +183,13 @@ class ModelProfile:
     endpoint_label: str = ""
     """端点在界面里显示的名称，如 Opencode Go。"""
 
+    fallback_profiles: tuple[str, ...] = ()
+    """本端点连不上时按序尝试的备用 profile 名。
+
+    只在"一个字都没返回"的传输故障（拒连、DNS、超时）时启用；已经开始返回
+    内容的流中断走同端点恢复，不换模型。空表示没有备用，行为与从前一致。
+    """
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelProfile":
         return cls(
@@ -200,6 +207,11 @@ class ModelProfile:
             stream_idle_timeout_seconds=int(data.get("stream_idle_timeout_seconds") or 0),
             endpoint_id=str(data.get("endpoint_id") or "").strip(),
             endpoint_label=str(data.get("endpoint_label") or "").strip(),
+            fallback_profiles=tuple(
+                str(name).strip()
+                for name in (data.get("fallback_profiles") or [])
+                if str(name).strip()
+            ),
             supports_vision=(
                 bool(data["supports_vision"])
                 if isinstance(data.get("supports_vision"), bool)
@@ -286,3 +298,25 @@ class ModelRegistry:
                 )
             )
         return "\n".join(lines)
+
+    def fallback_chain(self, profile: ModelProfile, *, max_depth: int = 3) -> tuple[ModelProfile, ...]:
+        """把 profile 声明的备用名解析成 profile 序列。
+
+        自引用、环、缺失的名字都跳过——配置写错最多意味着"没有备用"，
+        不能变成死循环或启动失败。
+        """
+
+        chain: list[ModelProfile] = []
+        seen = {profile.name}
+        frontier = list(profile.fallback_profiles)
+        while frontier and len(chain) < max_depth:
+            name = frontier.pop(0)
+            if name in seen:
+                continue
+            candidate = self._profiles.get(name)
+            if candidate is None:
+                continue
+            seen.add(name)
+            chain.append(candidate)
+            frontier = [*candidate.fallback_profiles, *frontier]
+        return tuple(chain)

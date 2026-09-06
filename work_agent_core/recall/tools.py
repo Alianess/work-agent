@@ -133,8 +133,12 @@ def register_recall_tools(
         if not query:
             raise ValueError("query 不能为空。")
         scope = str(args.get("scope") or "all").strip()
+        scope_note = ""
         if scope == "project" and not project_id:
-            raise ValueError("当前会话不在任何项目里，scope=project 不可用；请用 scope=all。")
+            # 08-25~28 连续踩了 11 次：会话不在项目里时 scope=project 直接报错，
+            # 模型每轮都要重选。降级到账户级并在结果里说明，比抛错有用。
+            scope = "all"
+            scope_note = "当前会话不在任何项目里，scope=project 已自动降级为 scope=all。"
         kinds = args.get("source_kinds") or []
         filters = NodeFilter(
             source_kinds=tuple(str(item) for item in kinds if str(item or "").strip()),
@@ -156,6 +160,8 @@ def register_recall_tools(
         )
         if scope == "project":
             outcome["scope"] = f"project:{project_id}"
+        if scope_note:
+            outcome["scope_note"] = scope_note
         # 核心记忆跟原文一起给：模型既然主动检索了，相关的记忆条目就不该
         # 再等它另开一问。账户级始终在场；scope=project 时叠加项目级。
         if session_store is not None:
@@ -211,7 +217,7 @@ def register_recall_tools(
                         "description": (
                             "project=current project; all=account."
                             if project_id
-                            else "This conversation has no project; use all."
+                            else "This conversation has no project; scope=project is auto-downgraded to all."
                         ),
                     },
                     "include_superseded": {

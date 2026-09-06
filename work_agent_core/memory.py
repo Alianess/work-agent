@@ -10,7 +10,12 @@ import threading
 import time
 
 from .config import ModelProfile
-from .llm import OpenAICompatibleClient
+from .llm import (
+    OpenAICompatibleClient,
+    chat_tools_stream_with_fallback,
+    chat_with_fallback,
+    is_transport_failure,
+)
 from .recall_archive import (
     RECALL_ARCHIVE_VERSION,
     build_recall_episodes,
@@ -341,6 +346,7 @@ def prepare_session_memory(
     force: bool = False,
     inspection: SessionMemoryInspection | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    fallback_profiles: tuple[ModelProfile, ...] = (),
 ) -> PreparedSessionMemory:
     inspected = inspection or inspect_session_memory(
         session,
@@ -417,6 +423,7 @@ def prepare_session_memory(
         session.summary,
         completed_messages,
         cancel_check=cancel_check,
+        fallback_profiles=fallback_profiles,
     )
 
     next_covered_count = covered_count + len(completed_messages)
@@ -504,6 +511,31 @@ def render_summary_system_context(summary: str) -> str:
     )
 
 
+def truncate_serialized_messages(serialized: str, budget_chars: int) -> str:
+    """保头保尾地截断序列化消息，供压缩降级重试使用。
+
+    第一块通常是用户的原始目标，必须完整保留；其余块从最新往回保留到预算。
+    被截掉的中段仍在持久会话日志里——降级的代价是"摘要里暂时少了中段"，
+    换来的是长任务不断头。
+    """
+
+    if len(serialized) <= budget_chars:
+        return serialized
+    blocks = serialized.split("\n\n")
+    head = blocks[0]
+    marker = "[……中段因超长被截断，仅保留目标与最近路径……]"
+    kept: list[str] = []
+    used = len(head) + len(marker)
+    for block in reversed(blocks[1:]):
+        if used + len(block) + 2 > budget_chars:
+            break
+        kept.insert(0, block)
+        used += len(block) + 2
+    if not kept:
+        return head
+    return head + "\n\n" + marker + "\n\n" + "\n\n".join(kept)
+
+
 def summarize_session_messages(
     client: OpenAICompatibleClient,
     profile: ModelProfile,
@@ -511,61 +543,67 @@ def summarize_session_messages(
     older_messages: list[dict[str, Any]],
     *,
     cancel_check: Callable[[], bool] | None = None,
+    fallback_profiles: tuple[ModelProfile, ...] = (),
 ) -> str:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是项目经理助理的高保真“当前任务断点续作”压缩器。你的唯一任务是把"
-                "已有工作摘要与本次已完成的 messages 滚动合并，使上下文被截断后仍能"
-                "从当前进度继续工作，而不必从头开始。这不是长期记忆、用户画像、人物库、"
-                "项目档案或跨会话知识整理；不得为了未来可能有用而扩写。只能记录输入中"
-                "与当前任务延续有关的事实，不得推断或补充。\n\n"
-                "保真规则：\n"
-                "1. 所有会影响后续行动的目标、决定、承诺、纠正、未完成项都必须保留；"
-                "不要为了简短合并掉不同事项。\n"
-                "2. 人名、公司名、项目名、日期、时间、金额、数量、版本、状态、路径、URL、"
-                "错误文本和责任边界应尽量原样保留。\n"
-                "3. 已有摘要中的信息，只有在新增 messages 明确否定、纠正或取代它时才能"
-                "删除；发生冲突时同时写明旧说法、新说法和当前采用版本。\n"
-                "4. 工具调用不必逐字复制参数，但必须保留工具名、关键输入范围、成功结果、"
-                "失败原因、部分完成状态、生成文件、待审批动作和仍可复用的中间结果。\n"
-                "5. 区分已确认事实、模型建议和待核实信息；不要把建议写成既成事实。\n"
-                "6. 每个栏目可以有任意数量条目，以信息完整为先；确实没有内容才写“无”。\n"
-                "7. 最近两轮的完整 ReAct 工具链也在输入中；把其中会影响续作的信息并入"
-                "摘要，不要因为运行时还会展示最近两轮最终回答而省略工具证据。\n"
-                "8. 附件图像的像素会在本次压缩后移出模型上下文。只有当当前任务后续"
-                "明确需要重新打开某张图时，才在摘要中保留其精确路径及用途；"
-                "与续作无关的图片路径应删除，不得用 OCR 文本冒充已保留原图。\n"
-                "9. 使用紧凑 Markdown 条目，不写寒暄、修辞、思维链或重复内容。\n\n"
-                "必须严格使用以下八个二级标题，保持顺序：\n"
-                + "\n".join(f"## {section}" for section in CHAT_SUMMARY_SECTIONS)
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "已有摘要：\n"
-                f"{existing_summary or '（无）'}\n\n"
-                "本次需要并入工作摘要的完整已完成 messages：\n"
-                f"{serialize_runtime_messages_for_summary(older_messages)}"
-            ),
-        },
-    ]
-    try:
+    system_content = (
+        "你是项目经理助理的高保真“当前任务断点续作”压缩器。你的唯一任务是把"
+        "已有工作摘要与本次已完成的 messages 滚动合并，使上下文被截断后仍能"
+        "从当前进度继续工作，而不必从头开始。这不是长期记忆、用户画像、人物库、"
+        "项目档案或跨会话知识整理；不得为了未来可能有用而扩写。只能记录输入中"
+        "与当前任务延续有关的事实，不得推断或补充。\n\n"
+        "保真规则：\n"
+        "1. 所有会影响后续行动的目标、决定、承诺、纠正、未完成项都必须保留；"
+        "不要为了简短合并掉不同事项。\n"
+        "2. 人名、公司名、项目名、日期、时间、金额、数量、版本、状态、路径、URL、"
+        "错误文本和责任边界应尽量原样保留。\n"
+        "3. 已有摘要中的信息，只有在新增 messages 明确否定、纠正或取代它时才能"
+        "删除；发生冲突时同时写明旧说法、新说法和当前采用版本。\n"
+        "4. 工具调用不必逐字复制参数，但必须保留工具名、关键输入范围、成功结果、"
+        "失败原因、部分完成状态、生成文件、待审批动作和仍可复用的中间结果。\n"
+        "5. 区分已确认事实、模型建议和待核实信息；不要把建议写成既成事实。\n"
+        "6. 每个栏目可以有任意数量条目，以信息完整为先；确实没有内容才写“无”。\n"
+        "7. 最近两轮的完整 ReAct 工具链也在输入中；把其中会影响续作的信息并入"
+        "摘要，不要因为运行时还会展示最近两轮最终回答而省略工具证据。\n"
+        "8. 附件图像的像素会在本次压缩后移出模型上下文。只有当当前任务后续"
+        "明确需要重新打开某张图时，才在摘要中保留其精确路径及用途；"
+        "与续作无关的图片路径应删除，不得用 OCR 文本冒充已保留原图。\n"
+        "9. 使用紧凑 Markdown 条目，不写寒暄、修辞、思维链或重复内容。\n\n"
+        "必须严格使用以下八个二级标题，保持顺序：\n"
+        + "\n".join(f"## {section}" for section in CHAT_SUMMARY_SECTIONS)
+    )
+
+    def _attempt(serialized: str, *, degraded: bool) -> tuple[str, Any]:
+        if cancel_check is not None and cancel_check():
+            raise ContextCompactionCancelled("用户停止了上下文压缩。")
+        user_content = (
+            "已有摘要：\n"
+            f"{existing_summary or '（无）'}\n\n"
+            "本次需要并入工作摘要的完整已完成 messages：\n"
+            f"{serialized}"
+        )
+        if degraded:
+            user_content += (
+                "\n\n（注：为让压缩在模型窗口内完成，上文中段已被截断，"
+                "只保留了最早的输入与最近的已完成路径；被截断部分仍在持久会话日志中。）"
+            )
+        payload_messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
+        max_tokens = min(
+            CHAT_SUMMARY_MAX_TOKENS,
+            compaction_output_token_budget(profile),
+        )
         if cancel_check is None or not hasattr(client, "chat_tools_stream"):
-            response = client.chat(
-                messages,
+            response, _used = chat_with_fallback(
+                client,
+                payload_messages,
                 profile=profile,
-                max_tokens=min(
-                    CHAT_SUMMARY_MAX_TOKENS,
-                    compaction_output_token_budget(profile),
-                ),
+                fallback_profiles=fallback_profiles,
+                max_tokens=max_tokens,
                 reasoning_effort="light",
             )
         else:
-            if cancel_check():
-                raise ContextCompactionCancelled("用户停止了上下文压缩。")
             cancel_event = threading.Event()
             watcher_finished = threading.Event()
 
@@ -585,13 +623,12 @@ def summarize_session_messages(
             )
             watcher.start()
             try:
-                response = client.chat_tools_stream(
-                    messages,
+                response, _used = chat_tools_stream_with_fallback(
+                    client,
+                    payload_messages,
                     profile=profile,
-                    max_tokens=min(
-                        CHAT_SUMMARY_MAX_TOKENS,
-                        compaction_output_token_budget(profile),
-                    ),
+                    fallback_profiles=fallback_profiles,
+                    max_tokens=max_tokens,
                     reasoning_effort="light",
                     cancel_event=cancel_event,
                 )
@@ -599,20 +636,38 @@ def summarize_session_messages(
                 watcher_finished.set()
             if cancel_event.is_set() or cancel_check():
                 raise ContextCompactionCancelled("用户停止了上下文压缩。")
-    except ContextCompactionCancelled:
-        raise
-    except Exception as error:
-        if cancel_check is not None and cancel_check():
-            raise ContextCompactionCancelled("用户停止了上下文压缩。") from error
-        raise ContextCompactionError(
-            f"当前模型压缩会话失败：{type(error).__name__}: {error}。原始会话未改写，也不会自动切换或重试模型。"
-        ) from error
-    summary = str(response.content or "").strip()
-    if not summary:
-        raise ContextCompactionError(
-            "当前模型没有返回可用的会话摘要。原始会话未改写，也不会自动切换或重试模型。"
+        return str(response.content or "").strip(), response
+
+    # 逐级降级：全量输入拿不到摘要（多为 finish_reason=length 的空返回，或
+    # 上游对超长输入直接 400）时，用保头保尾的截断输入再试。传输故障除外——
+    # 整条备用链都连不上时换更小的输入没有意义。
+    serialized_older = serialize_runtime_messages_for_summary(older_messages)
+    last_failure: Exception | None = None
+    for budget in (0, 48000, 16000):
+        serialized = serialized_older if budget == 0 else truncate_serialized_messages(serialized_older, budget)
+        try:
+            summary, response = _attempt(serialized, degraded=budget > 0)
+        except ContextCompactionCancelled:
+            raise
+        except Exception as error:
+            if is_transport_failure(error):
+                raise ContextCompactionError(
+                    f"当前模型压缩会话失败：{type(error).__name__}: {error}。原始会话未改写。"
+                ) from error
+            last_failure = error
+            continue
+        if summary:
+            return summary
+        last_failure = ContextCompactionError(
+            "当前模型没有返回可用的会话摘要。"
+            + empty_checkpoint_response_diagnostics(getattr(response, "raw", None))
         )
-    return summary
+    if isinstance(last_failure, ContextCompactionError):
+        raise last_failure
+    raise ContextCompactionError(
+        f"当前模型压缩会话失败：{type(last_failure).__name__}: {last_failure}。"
+        "原始会话未改写，也不会自动切换或重试模型。"
+    ) from last_failure
 
 
 def summarize_active_react_checkpoint(
@@ -621,67 +676,87 @@ def summarize_active_react_checkpoint(
     active_messages: list[dict[str, Any]],
     *,
     task_plan: list[dict[str, Any]] | None = None,
+    fallback_profiles: tuple[ModelProfile, ...] = (),
 ) -> str:
     """Compress a still-running ReAct turn into a continuation checkpoint.
 
     This is deliberately separate from the rolling conversation summary.  It
     is allowed to replace bulky, already-completed tool exchanges in the next
     model request, while the durable session and turn trace keep the originals.
+
+    空返回（实测多为 finish_reason=length：转写稿一类的超长输入把推理预算耗尽）
+    或上游对超长输入直接 400 时，用保头保尾的截断输入逐级重试；整条备用链都
+    连不上的传输故障不重试——换更小的输入救不了网络。
     """
 
+    system_content = (
+        "你是单智能体长任务的高保真执行检查点压缩器。输入是一项尚未完成的任务中，"
+        "已经走过的 ReAct 实施路径。请生成可直接交给同一智能体继续执行的检查点，"
+        "而不是总结文章、长期记忆或最终答复。\n\n"
+        "必须保留：用户当前目标与约束；模型已经公开写出的路线判断和关键修正；"
+        "当前计划及每步状态；已经调用的工具及其关键输入范围；每项操作的成功、失败、"
+        "部分完成和验证证据；精确文件路径、URL、命令目的、错误文本、待审批动作；"
+        "已经改变的代码/材料及仍未完成的下一动作。实施路径应按原发生顺序组织，"
+        "公开工作说明尽量保留原文。\n"
+        "可以删除：终端逐行回显、重复进度心跳、大段可再生文件内容、重复参数和不影响"
+        "下一步的机械细节。不得删除整条实施路径，不得把建议写成已完成，不得编造结果。\n\n"
+        "严格使用以下标题：\n"
+        "## 当前目标与完成条件\n"
+        "## 当前计划与进度\n"
+        "## 已走过的实施路径（按顺序）\n"
+        "## 已修改内容与关键证据\n"
+        "## 错误、风险与待确认事项\n"
+        "## 下一步准确动作"
+    )
     plan_text = json.dumps(task_plan or [], ensure_ascii=False, indent=2)
-    try:
-        response = client.chat(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "你是单智能体长任务的高保真执行检查点压缩器。输入是一项尚未完成的任务中，"
-                    "已经走过的 ReAct 实施路径。请生成可直接交给同一智能体继续执行的检查点，"
-                    "而不是总结文章、长期记忆或最终答复。\n\n"
-                    "必须保留：用户当前目标与约束；模型已经公开写出的路线判断和关键修正；"
-                    "当前计划及每步状态；已经调用的工具及其关键输入范围；每项操作的成功、失败、"
-                    "部分完成和验证证据；精确文件路径、URL、命令目的、错误文本、待审批动作；"
-                    "已经改变的代码/材料及仍未完成的下一动作。实施路径应按原发生顺序组织，"
-                    "公开工作说明尽量保留原文。\n"
-                    "可以删除：终端逐行回显、重复进度心跳、大段可再生文件内容、重复参数和不影响"
-                    "下一步的机械细节。不得删除整条实施路径，不得把建议写成已完成，不得编造结果。\n\n"
-                    "严格使用以下标题：\n"
-                    "## 当前目标与完成条件\n"
-                    "## 当前计划与进度\n"
-                    "## 已走过的实施路径（按顺序）\n"
-                    "## 已修改内容与关键证据\n"
-                    "## 错误、风险与待确认事项\n"
-                    "## 下一步准确动作"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"当前活计划：\n{plan_text}\n\n"
-                    "本轮尚未完成的完整 ReAct messages：\n"
-                    f"{serialize_runtime_messages_for_summary(active_messages)}"
-                ),
-            },
-        ],
-            profile=profile,
-            max_tokens=min(
-                ACTIVE_REACT_CHECKPOINT_MAX_TOKENS,
-                compaction_output_token_budget(profile),
-            ),
-            reasoning_effort="light",
+    serialized = serialize_runtime_messages_for_summary(active_messages)
+    last_failure: Exception | None = None
+    for budget in (0, 48000, 16000):
+        serialized_variant = serialized if budget == 0 else truncate_serialized_messages(serialized, budget)
+        user_content = (
+            f"当前活计划：\n{plan_text}\n\n"
+            "本轮尚未完成的完整 ReAct messages：\n"
+            f"{serialized_variant}"
         )
-    except Exception as error:
-        raise ContextCompactionError(
-            f"当前模型压缩运行检查点失败：{type(error).__name__}: {error}。"
-        ) from error
-    checkpoint = str(response.content or "").strip()
-    if not checkpoint:
-        raise ContextCompactionError(
+        if budget:
+            user_content += (
+                "\n\n（注：为让压缩在模型窗口内完成，上文中段已被截断，"
+                "只保留目标与最近的实施路径；被截断部分仍在持久会话日志中。）"
+            )
+        try:
+            response, _used = chat_with_fallback(
+                client,
+                [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": user_content},
+                ],
+                profile=profile,
+                fallback_profiles=fallback_profiles,
+                max_tokens=min(
+                    ACTIVE_REACT_CHECKPOINT_MAX_TOKENS,
+                    compaction_output_token_budget(profile),
+                ),
+                reasoning_effort="light",
+            )
+        except Exception as error:
+            if is_transport_failure(error):
+                raise ContextCompactionError(
+                    f"当前模型压缩运行检查点失败：{type(error).__name__}: {error}。"
+                ) from error
+            last_failure = error
+            continue
+        checkpoint = str(response.content or "").strip()
+        if checkpoint:
+            return checkpoint
+        last_failure = ContextCompactionError(
             "当前模型没有返回可用的运行检查点，不能安全继续本轮长任务。"
             + empty_checkpoint_response_diagnostics(getattr(response, "raw", None))
         )
-    return checkpoint
+    if isinstance(last_failure, ContextCompactionError):
+        raise last_failure
+    raise ContextCompactionError(
+        f"当前模型压缩运行检查点失败：{type(last_failure).__name__}: {last_failure}。"
+    ) from last_failure
 
 
 def empty_checkpoint_response_diagnostics(raw: Any) -> str:

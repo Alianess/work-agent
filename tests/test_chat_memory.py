@@ -19,6 +19,7 @@ from work_agent_core.memory import (
     profile_context_trigger_tokens,
     provider_usage_baseline_payload,
     summarize_active_react_checkpoint,
+    summarize_session_messages,
     strip_compacted_attachment_block,
 )
 from work_agent_core.session_store import ConversationSession
@@ -555,6 +556,81 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertEqual(client.reasoning_effort, "light")
         self.assertEqual(client.max_tokens, 131_072)
         self.assertIn("继续任务", checkpoint)
+
+    def test_active_checkpoint_degrades_when_length_cuts_reasoning(self) -> None:
+        class LengthLimitedClient:
+            def __init__(self) -> None:
+                self.input_lengths: list[int] = []
+
+            def chat(self, messages, **_kwargs):
+                user_content = str(messages[1]["content"])
+                self.input_lengths.append(len(user_content))
+                if "（注：为让压缩在模型窗口内完成" in user_content:
+                    return SimpleNamespace(content="## 当前目标与完成条件\n- 截断后拿到检查点")
+                return SimpleNamespace(
+                    content="",
+                    raw={"choices": [{"finish_reason": "length", "message": {"content": ""}}]},
+                )
+
+        # ~80KB 的工具回显：全量输入必然撞 length，48K 截断后应能拿到检查点。
+        active_messages = [{"role": "user", "content": "整理这份材料并生成报告"}] + [
+            {"role": "tool", "name": "shell_exec", "content": "x" * 4000} for _ in range(20)
+        ]
+        client = LengthLimitedClient()
+        checkpoint = summarize_active_react_checkpoint(client, self.profile, active_messages)
+
+        self.assertIn("截断后拿到检查点", checkpoint)
+        self.assertEqual(len(client.input_lengths), 2)
+        self.assertLess(client.input_lengths[1], client.input_lengths[0])
+
+    def test_rolling_summary_degrades_on_empty_response(self) -> None:
+        class LengthLimitedClient:
+            def chat(self, messages, **_kwargs):
+                user_content = str(messages[1]["content"])
+                if "（注：为让压缩在模型窗口内完成" in user_content:
+                    return SimpleNamespace(content="## 当前目标与完成条件\n- 摘要降级成功")
+                return SimpleNamespace(
+                    content="",
+                    raw={"choices": [{"finish_reason": "length", "message": {"content": ""}}]},
+                )
+
+        older_messages = [
+            {"role": "user", "content": "目标"},
+            *[
+                {"role": "tool", "name": "read_file", "content": "y" * 4000}
+                for _ in range(20)
+            ],
+        ]
+        summary = summarize_session_messages(
+            LengthLimitedClient(),
+            self.profile,
+            "",
+            older_messages,
+        )
+
+        self.assertIn("摘要降级成功", summary)
+
+    def test_transport_failure_across_chain_skips_the_degrade_ladder(self) -> None:
+        class DeadEndpointClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, *_args, **_kwargs):
+                self.calls += 1
+                raise ConnectionError(61, "Connection refused")
+
+        client = DeadEndpointClient()
+        with self.assertRaises(ContextCompactionError) as captured:
+            summarize_session_messages(
+                client,
+                self.profile,
+                "",
+                [{"role": "user", "content": "目标"}, {"role": "tool", "content": "y" * 80000}],
+            )
+
+        # 端点全死时换更小的输入没有意义：只许试一次，立刻报正本未动。
+        self.assertEqual(client.calls, 1)
+        self.assertIn("原始会话未改写", str(captured.exception))
 
     def test_compaction_can_cancel_the_streaming_model_request(self) -> None:
         class CancelableClient:

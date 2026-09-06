@@ -19,6 +19,7 @@ from .llm import (
     Message,
     OpenAICompatibleClient,
     build_chat_tools_payload,
+    chat_tools_stream_with_fallback,
     normalize_reasoning_effort,
     recovery_request_timeout_seconds,
     stream_start_timeout_seconds,
@@ -243,9 +244,14 @@ class ReActAgent:
         usage_callback: Callable[[dict[str, Any], list[Message]], None] | None = None,
         initial_task_plan: list[dict[str, str]] | None = None,
         late_task_plan_context: bool = True,
+        fallback_profiles: tuple[ModelProfile, ...] = (),
     ) -> None:
         self.client = client
         self.profile = profile
+        self.fallback_profiles = fallback_profiles
+        # 主端点故障切换成功后，本轮剩余步骤直接以备用开头；下一轮换新 agent，
+        # 自然回到主 profile 再试。
+        self._turn_profile_override: ModelProfile | None = None
         self.tools = tools
         self.max_steps = max_steps
         self.extra_system_context = (extra_system_context or "").strip()
@@ -1469,6 +1475,23 @@ class ReActAgent:
         except Exception:
             return False
 
+    def _turn_candidates(self) -> tuple[ModelProfile, tuple[ModelProfile, ...]]:
+        """本步骤的 (主候选, 备用链)。
+
+        主端点在早前步骤切换成功后，剩余步骤直接以备用开头，不再每步重付
+        主端点的退避重试；下一轮由新 agent 实例自然回到主 profile。
+        """
+
+        override = self._turn_profile_override
+        if override is None:
+            return self.profile, self.fallback_profiles
+        rest = tuple(
+            candidate
+            for candidate in (self.profile, *self.fallback_profiles)
+            if candidate.name != override.name
+        )
+        return override, rest
+
     def _raise_if_cancelled(self) -> None:
         if self._cancel_requested():
             self._trace("agent_cancel_requested")
@@ -1730,6 +1753,7 @@ class ReActAgent:
             self.profile,
             active_messages,
             task_plan=self.task_plan,
+            fallback_profiles=self.fallback_profiles,
         )
         if not checkpoint:
             return None
@@ -2049,7 +2073,7 @@ class ReActAgent:
                     last_stream_at = time.monotonic()
                     status = str(getattr(chunk, "status", "") or "")
                     status_detail = str(getattr(chunk, "status_detail", "") or "")
-                    if status in {"recovery_started", "network_retry"}:
+                    if status in {"recovery_started", "network_retry", "fallback_started"}:
                         recovery_started_at = last_stream_at
                         recovery_last_stream_at = None
                     elif status == "recovery_streaming":
@@ -2072,9 +2096,12 @@ class ReActAgent:
                     else:
                         last_heartbeat_at = time.monotonic()
 
-                response = self.client.chat_tools_stream(
+                primary, fallbacks = self._turn_candidates()
+                response, used_profile = chat_tools_stream_with_fallback(
+                    self.client,
                     messages,
-                    profile=self.profile,
+                    profile=primary,
+                    fallback_profiles=fallbacks,
                     reasoning_effort=self.reasoning_effort,
                     tools=tool_schemas,
                     tool_choice="auto",
@@ -2082,6 +2109,15 @@ class ReActAgent:
                     cancel_event=request_cancel_event,
                     on_heartbeat=on_heartbeat,
                 )
+                if used_profile.name != self.profile.name and self._turn_profile_override is None:
+                    self._turn_profile_override = used_profile
+                    self._trace(
+                        "llm_fallback_used",
+                        step=step,
+                        request_id=request_id,
+                        primary_profile=self.profile.name,
+                        fallback_profile=used_profile.name,
+                    )
                 result_queue.put((True, response))
             except Exception as error:
                 self._trace(
@@ -2137,7 +2173,7 @@ class ReActAgent:
                 except queue.Empty:
                     break
                 delta_status = delta.get("status") or ""
-                if delta_status in {"recovery_started", "network_retry"}:
+                if delta_status in {"recovery_started", "network_retry", "fallback_started"}:
                     if draft_content_chars:
                         yield {"event": "draft_reset", "content": draft_prefix, "step": step}
                     content_buffer = ""
@@ -2350,7 +2386,7 @@ class ReActAgent:
                 except queue.Empty:
                     break
                 delta_status = delta.get("status") or ""
-                if delta_status in {"recovery_started", "network_retry"}:
+                if delta_status in {"recovery_started", "network_retry", "fallback_started"}:
                     if draft_content_chars:
                         yield {"event": "draft_reset", "content": draft_prefix, "step": step}
                     content_buffer = ""
@@ -2511,6 +2547,8 @@ def model_stream_preview(
         headline = f"[{elapsed_seconds}s] 主流已结束，正在启动流式恢复。"
     elif status == "recovery_streaming":
         headline = f"[{elapsed_seconds}s] 恢复流正在返回。"
+    elif status == "fallback_started":
+        headline = f"[{elapsed_seconds}s] 主端点连不上，正在切换备用模型。"
     else:
         headline = f"[{elapsed_seconds}s] 模型正在流式返回。"
     lines = [headline]
@@ -2518,6 +2556,11 @@ def model_stream_preview(
         # Never silently switch endpoints: a different route is a different
         # model, and the user asked for this one.
         lines.append("连接失败通常是短暂的，正在退避后重试同一模型端点；不会更换模型。")
+        if status_detail:
+            lines.append(status_detail)
+    elif status == "fallback_started":
+        # 切换发生在同端点退避重试全部失败之后，且是显式宣布的，不是静默换端点。
+        lines.append("该 profile 声明的备用链已启用；本轮后续步骤将优先使用备用模型。")
         if status_detail:
             lines.append(status_detail)
     elif status in {"recovery_started", "recovery_streaming"}:
